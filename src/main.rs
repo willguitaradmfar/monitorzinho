@@ -65,7 +65,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 break;
             }
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => match app.focus {
+                // A fullscreened table's search box swallows every letter, including
+                // 'q' — so Esc is its only way out, and it first clears an active
+                // query rather than leaving fullscreen outright.
+                KeyCode::Esc => match &app.focus {
+                    Focus::None => break,
+                    Focus::Table(tf) if !tf.query.is_empty() => app.clear_search(),
+                    _ => app.exit_focus(),
+                },
+                KeyCode::Char('q') if !matches!(app.focus, Focus::Table(_)) => match app.focus {
                     Focus::None => break,
                     _ => app.exit_focus(),
                 },
@@ -74,8 +82,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 }
                 KeyCode::Up if matches!(app.focus, Focus::Table(_)) => app.move_selection(-1),
                 KeyCode::Down if matches!(app.focus, Focus::Table(_)) => app.move_selection(1),
-                KeyCode::Char('x' | 'X') if matches!(app.focus, Focus::Table(_)) => {
-                    app.kill_selected();
+                KeyCode::Delete if matches!(app.focus, Focus::Table(_)) => app.kill_selected(),
+                KeyCode::Backspace if matches!(app.focus, Focus::Table(_)) => {
+                    app.search_backspace();
+                }
+                // Anything else typed while a table is fullscreened is search input —
+                // no separate search mode to enter first.
+                KeyCode::Char(c) if matches!(app.focus, Focus::Table(_)) => {
+                    app.search_push(c);
                 }
                 _ => {}
             }

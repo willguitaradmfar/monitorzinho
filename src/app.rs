@@ -5,8 +5,8 @@ use crate::monitor::{self, Monitor, SystemState, TableMonitor, TableRow};
 
 const SAVE_EVERY_N_TICKS: u32 = 5;
 
-/// a-z minus 'q' (quit) and 'x' (kill, inside a fullscreened table) — those two stay
-/// reserved everywhere so they always mean the same thing regardless of focus.
+/// a-z minus 'q' (always quits/exits) and 'x' (left free in case it's ever needed
+/// again — a fullscreened table's search box swallows every other letter it's given).
 const SHORTCUT_LETTERS: &[char] = &[
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'r', 's', 't',
     'u', 'v', 'w', 'y', 'z',
@@ -56,6 +56,27 @@ pub struct TableFocus {
     pub table_index: usize,
     pub rows: Vec<TableRow>,
     pub selected: usize,
+    /// Free-text filter typed directly (no separate search mode to enter) — only rows
+    /// with a cell matching this, case-insensitively, are shown/selectable.
+    pub query: String,
+}
+
+impl TableFocus {
+    /// Indices into `rows` that pass the active search filter — every row when
+    /// `query` is empty. `selected` indexes into *this* list, not `rows` directly, so
+    /// navigation and kill only ever touch what's actually visible.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        if self.query.is_empty() {
+            return (0..self.rows.len()).collect();
+        }
+        let needle = self.query.to_lowercase();
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.cells.iter().any(|c| c.to_lowercase().contains(&needle)))
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 pub enum Focus {
@@ -195,6 +216,7 @@ impl App {
                     table_index: idx,
                     rows,
                     selected: 0,
+                    query: String::new(),
                 })
             }
         };
@@ -204,33 +226,69 @@ impl App {
         self.focus = Focus::None;
     }
 
-    /// Moves the selection in a fullscreened, frozen table by `delta` rows, wrapping
-    /// around. No-op outside `Focus::Table`.
+    /// Moves the selection among the search-filtered rows of a fullscreened table by
+    /// `delta`, wrapping around. No-op outside `Focus::Table`.
     pub fn move_selection(&mut self, delta: i32) {
         if let Focus::Table(tf) = &mut self.focus {
-            if tf.rows.is_empty() {
+            let indices = tf.visible_indices();
+            if indices.is_empty() {
                 return;
             }
-            let len = tf.rows.len() as i32;
+            let len = indices.len() as i32;
             tf.selected = (tf.selected as i32 + delta).rem_euclid(len) as usize;
         }
     }
 
-    /// Sends SIGKILL to the currently selected process in a fullscreened table, then
-    /// drops it from the frozen snapshot. No-op outside `Focus::Table`.
+    /// Sends SIGKILL to the currently selected (search-filtered) process in a
+    /// fullscreened table, then drops it from the frozen snapshot. No-op outside
+    /// `Focus::Table`.
     pub fn kill_selected(&mut self) {
         let Focus::Table(tf) = &mut self.focus else {
             return;
         };
-        let Some(row) = tf.rows.get(tf.selected) else {
+        let indices = tf.visible_indices();
+        let Some(&row_idx) = indices.get(tf.selected) else {
+            return;
+        };
+        let Some(row) = tf.rows.get(row_idx) else {
             return;
         };
         if let Some(process) = self.state.sys.process(Pid::from_u32(row.pid)) {
             process.kill_with(Signal::Kill);
         }
-        tf.rows.remove(tf.selected);
-        if !tf.rows.is_empty() {
-            tf.selected = tf.selected.min(tf.rows.len() - 1);
+        tf.rows.remove(row_idx);
+        let indices = tf.visible_indices();
+        tf.selected = if indices.is_empty() {
+            0
+        } else {
+            tf.selected.min(indices.len() - 1)
+        };
+    }
+
+    /// Appends a typed character to the active fullscreen table's search box,
+    /// re-filtering and jumping the selection back to the first match. No-op outside
+    /// `Focus::Table`.
+    pub fn search_push(&mut self, c: char) {
+        if let Focus::Table(tf) = &mut self.focus {
+            tf.query.push(c);
+            tf.selected = 0;
+        }
+    }
+
+    /// Removes the last character from the active search box. No-op outside
+    /// `Focus::Table`.
+    pub fn search_backspace(&mut self) {
+        if let Focus::Table(tf) = &mut self.focus {
+            tf.query.pop();
+            tf.selected = 0;
+        }
+    }
+
+    /// Clears the active search box. No-op outside `Focus::Table`.
+    pub fn clear_search(&mut self) {
+        if let Focus::Table(tf) = &mut self.focus {
+            tf.query.clear();
+            tf.selected = 0;
         }
     }
 

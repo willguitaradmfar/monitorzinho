@@ -424,20 +424,30 @@ fn render_fullscreen_table(
     headers: &[&str],
     table_focus: &TableFocus,
 ) {
+    let title = if table_focus.query.is_empty() {
+        format!(" {} ", title)
+    } else {
+        format!(" {} — busca: {} ", title, table_focus.query)
+    };
     let mut block = Block::default()
-        .title(format!(" {} ", title))
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN));
-    block = block.title_bottom(hint_line("↑/↓ navegar · x matar (SIGKILL) · Esc/q voltar"));
+    let hint = if table_focus.query.is_empty() {
+        "↑/↓ navegar · Del matar (SIGKILL) · digite p/ buscar · Esc voltar"
+    } else {
+        "↑/↓ navegar · Del matar (SIGKILL) · digite p/ buscar · Esc limpar busca"
+    };
+    block = block.title_bottom(hint_line(hint));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let header = UiRow::new(headers.iter().map(|h| Cell::from(*h)).collect::<Vec<_>>())
         .style(Style::default().add_modifier(Modifier::BOLD));
     let body: Vec<UiRow> = table_focus
-        .rows
-        .iter()
-        .map(|r| UiRow::new(r.cells.clone()))
+        .visible_indices()
+        .into_iter()
+        .map(|i| UiRow::new(table_focus.rows[i].cells.clone()))
         .collect();
 
     let table = Table::new(body, table_col_widths(headers))
