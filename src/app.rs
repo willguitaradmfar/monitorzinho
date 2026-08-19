@@ -1,4 +1,4 @@
-use crate::history::{self, History, CAPACITY};
+use crate::history::{self, CAPACITY, History};
 use crate::monitor::{self, Monitor, SystemState, TableMonitor, TableRow};
 
 const SAVE_EVERY_N_TICKS: u32 = 5;

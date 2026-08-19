@@ -1,8 +1,8 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as UiRow, Sparkline, Table};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::format;
@@ -108,10 +108,7 @@ fn render_numeric_bar(frame: &mut Frame, area: Rect, app: &App, indices: &[usize
     let mut spans = vec![Span::raw(" ")];
     for (n, &idx) in indices.iter().enumerate() {
         if n > 0 {
-            spans.push(Span::styled(
-                "   │   ",
-                Style::default().fg(palette::DIM),
-            ));
+            spans.push(Span::styled("   │   ", Style::default().fg(palette::DIM)));
         }
 
         let monitor = app.monitors[idx].as_ref();
@@ -151,7 +148,10 @@ fn build_chart_rows(app: &App) -> Vec<Vec<usize>> {
         }
     }
 
-    let flat: Vec<usize> = groups.into_iter().flat_map(|(_, indices)| indices).collect();
+    let flat: Vec<usize> = groups
+        .into_iter()
+        .flat_map(|(_, indices)| indices)
+        .collect();
     flat.chunks(COLS).map(<[usize]>::to_vec).collect()
 }
 
@@ -171,8 +171,9 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &App) {
         // Always split into a fixed `COLS`-wide grid — even a row with fewer panels
         // than `COLS` gets full-width column slots, leaving the rest blank, so the
         // grid reads as a consistent 3-column layout instead of stretching to fill.
-        let col_constraints: Vec<Constraint> =
-            (0..COLS).map(|_| Constraint::Ratio(1, COLS as u32)).collect();
+        let col_constraints: Vec<Constraint> = (0..COLS)
+            .map(|_| Constraint::Ratio(1, COLS as u32))
+            .collect();
         let col_areas = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(col_constraints)
@@ -243,7 +244,9 @@ fn render_panel(
     // Scale bars against the metric's real ceiling (e.g. 100%) rather than the max of
     // the current window — otherwise a value that's merely the local max renders as a
     // full bar even when it's nowhere near the actual limit.
-    let mut sparkline = Sparkline::default().data(&data).style(Style::default().fg(color));
+    let mut sparkline = Sparkline::default()
+        .data(&data)
+        .style(Style::default().fg(color));
     if let Some(limit) = monitor.limit() {
         sparkline = sparkline.max(limit.round().max(0.0) as u64);
     }
