@@ -15,7 +15,7 @@ mod history;
 mod monitor;
 mod ui;
 
-use app::App;
+use app::{App, Focus};
 
 const TICK_RATE: Duration = Duration::from_secs(1);
 
@@ -61,11 +61,23 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         if event::poll(timeout)?
             && let Event::Key(key) = event::read()?
         {
-            let quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                || (key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL));
-            if quit {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 break;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => match app.focus {
+                    Focus::None => break,
+                    _ => app.exit_focus(),
+                },
+                KeyCode::Char(c @ '1'..='9') if matches!(app.focus, Focus::None) => {
+                    app.activate_shortcut(c as u8 - b'0');
+                }
+                KeyCode::Up if matches!(app.focus, Focus::Table(_)) => app.move_selection(-1),
+                KeyCode::Down if matches!(app.focus, Focus::Table(_)) => app.move_selection(1),
+                KeyCode::Char('x' | 'X') if matches!(app.focus, Focus::Table(_)) => {
+                    app.kill_selected();
+                }
+                _ => {}
             }
         }
 

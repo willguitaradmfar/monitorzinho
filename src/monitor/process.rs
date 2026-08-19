@@ -3,7 +3,6 @@ use sysinfo::Process;
 use super::{SystemState, TableMonitor, TableRow};
 use crate::format;
 
-const TOP_N: usize = 10;
 const HEADERS: [&str; 3] = ["Command", "Time", "Usage"];
 
 /// `System::processes()` includes threads (Linux exposes each thread under its own
@@ -39,19 +38,20 @@ impl TableMonitor for TopCpuMonitor {
         &HEADERS
     }
 
-    fn sample(&mut self, state: &SystemState) -> Vec<TableRow> {
+    fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
         let mut procs: Vec<_> = state.sys.processes().values().filter(is_process).collect();
         procs.sort_by(|a, b| b.cpu_usage().total_cmp(&a.cpu_usage()));
 
         procs
             .into_iter()
-            .take(TOP_N)
+            .take(limit.unwrap_or(usize::MAX))
             .map(|p| TableRow {
                 cells: vec![
                     command_of(p),
                     format::human_duration(p.run_time()),
                     format!("{:.1}%", p.cpu_usage()),
                 ],
+                pid: p.pid().as_u32(),
             })
             .collect()
     }
@@ -68,19 +68,20 @@ impl TableMonitor for TopMemMonitor {
         &HEADERS
     }
 
-    fn sample(&mut self, state: &SystemState) -> Vec<TableRow> {
+    fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
         let mut procs: Vec<_> = state.sys.processes().values().filter(is_process).collect();
         procs.sort_by_key(|p| std::cmp::Reverse(p.memory()));
 
         procs
             .into_iter()
-            .take(TOP_N)
+            .take(limit.unwrap_or(usize::MAX))
             .map(|p| TableRow {
                 cells: vec![
                     command_of(p),
                     format::human_duration(p.run_time()),
                     format::human_bytes(p.memory() as f64),
                 ],
+                pid: p.pid().as_u32(),
             })
             .collect()
     }

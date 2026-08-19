@@ -1,7 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
-pub const CAPACITY: usize = 120;
+// Sized to still fill a wide fullscreened panel (each sample is one column) rather than
+// just the overview grid's narrower one-of-three-columns panels.
+pub const CAPACITY: usize = 300;
 
 pub type HistoryMap = HashMap<String, Vec<f64>>;
 

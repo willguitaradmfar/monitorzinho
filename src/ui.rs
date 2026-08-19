@@ -1,10 +1,14 @@
+use std::collections::HashMap;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as UiRow, Sparkline, Table};
+use ratatui::widgets::{
+    Block, Borders, Cell, Paragraph, RenderDirection, Row as UiRow, Sparkline, Table, TableState,
+};
 
-use crate::app::App;
+use crate::app::{App, Focus, ShortcutTarget, TableFocus};
 use crate::format;
 use crate::history::History;
 use crate::monitor::{Monitor, TableRow};
@@ -28,8 +32,76 @@ mod palette {
     pub const DIM: Color = Color::Rgb(0x5C, 0x63, 0x70);
 }
 
+/// Builds the digit-key badges shown per panel: which chart/table index maps to which
+/// number, mirroring `App::shortcut_targets()`'s 1-indexed order.
+struct ShortcutMap {
+    chart: HashMap<usize, u8>,
+    table: HashMap<usize, u8>,
+}
+
+impl ShortcutMap {
+    fn build(app: &App) -> Self {
+        let mut chart = HashMap::new();
+        let mut table = HashMap::new();
+        for (i, target) in app.shortcut_targets().into_iter().enumerate() {
+            let digit = (i + 1) as u8;
+            match target {
+                ShortcutTarget::Chart(idx) => {
+                    chart.insert(idx, digit);
+                }
+                ShortcutTarget::Table(idx) => {
+                    table.insert(idx, digit);
+                }
+            }
+        }
+        Self { chart, table }
+    }
+}
+
+/// Right-aligned top-border badge showing a panel's digit-key shortcut, e.g. `[3]`.
+fn shortcut_badge(digit: Option<u8>) -> Option<Line<'static>> {
+    digit.map(|n| {
+        Line::styled(
+            format!(" [{}] ", n),
+            Style::default()
+                .fg(palette::DIM)
+                .add_modifier(Modifier::BOLD),
+        )
+        .right_aligned()
+    })
+}
+
+/// Bottom-border hint shown only in fullscreen (e.g. "Esc/q voltar").
+fn hint_line(text: &str) -> Line<'static> {
+    Line::styled(format!(" {} ", text), Style::default().fg(palette::DIM)).right_aligned()
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+
+    match &app.focus {
+        Focus::Chart(idx) => {
+            render_panel(
+                frame,
+                area,
+                app.monitors[*idx].as_ref(),
+                &app.histories[*idx],
+                app.extras[*idx].as_deref(),
+                app.capacities[*idx],
+                PanelChrome {
+                    shortcut: None,
+                    hint: Some("Esc/q voltar"),
+                },
+            );
+            return;
+        }
+        Focus::Table(table_focus) => {
+            let monitor = app.table_monitors[table_focus.table_index].as_ref();
+            render_fullscreen_table(frame, area, monitor.title(), monitor.headers(), table_focus);
+            return;
+        }
+        Focus::None => {}
+    }
 
     let numeric_indices: Vec<usize> = app
         .monitors
@@ -53,15 +125,17 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints(constraints)
         .split(area);
 
+    let shortcuts = ShortcutMap::build(app);
+
     let mut cursor = 0;
     if !numeric_indices.is_empty() {
         render_numeric_bar(frame, sections[cursor], app, &numeric_indices);
         cursor += 1;
     }
-    render_charts(frame, sections[cursor], app);
+    render_charts(frame, sections[cursor], app, &shortcuts);
     cursor += 1;
     if !app.table_monitors.is_empty() {
-        render_tables(frame, sections[cursor], app);
+        render_tables(frame, sections[cursor], app, &shortcuts);
     }
 }
 
@@ -131,31 +205,17 @@ fn render_numeric_bar(frame: &mut Frame, area: Rect, app: &App, indices: &[usize
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
-/// Orders chart-worthy monitors by `Monitor::group()` (so related panels like Net
-/// down/up still stay close together in the flow), then packs them into a strict grid
-/// of `COLS` panels per row — a row is topped up with the next group's panels instead
-/// of leaving a gap.
+/// Packs `App::chart_monitor_order()` (already grouped so related panels like Net
+/// down/up stay together) into a strict grid of `COLS` panels per row — a row is
+/// topped up with the next group's panels instead of leaving a gap.
 fn build_chart_rows(app: &App) -> Vec<Vec<usize>> {
-    let mut groups: Vec<(&'static str, Vec<usize>)> = Vec::new();
-    for (i, m) in app.monitors.iter().enumerate() {
-        if m.numeric_only() {
-            continue;
-        }
-        let g = m.group();
-        match groups.iter_mut().find(|(name, _)| *name == g) {
-            Some(entry) => entry.1.push(i),
-            None => groups.push((g, vec![i])),
-        }
-    }
-
-    let flat: Vec<usize> = groups
-        .into_iter()
-        .flat_map(|(_, indices)| indices)
-        .collect();
-    flat.chunks(COLS).map(<[usize]>::to_vec).collect()
+    app.chart_monitor_order()
+        .chunks(COLS)
+        .map(<[usize]>::to_vec)
+        .collect()
 }
 
-fn render_charts(frame: &mut Frame, area: Rect, app: &App) {
+fn render_charts(frame: &mut Frame, area: Rect, app: &App, shortcuts: &ShortcutMap) {
     let rows = build_chart_rows(app);
     if rows.is_empty() {
         return;
@@ -187,9 +247,21 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &App) {
                 &app.histories[idx],
                 app.extras[idx].as_deref(),
                 app.capacities[idx],
+                PanelChrome {
+                    shortcut: shortcuts.chart.get(&idx).copied(),
+                    hint: None,
+                },
             );
         }
     }
+}
+
+/// Panel-header extras that only apply outside the plain overview grid: a digit-key
+/// badge, and/or a fullscreen-only footer hint.
+#[derive(Default, Clone, Copy)]
+struct PanelChrome<'a> {
+    shortcut: Option<u8>,
+    hint: Option<&'a str>,
 }
 
 fn render_panel(
@@ -199,6 +271,7 @@ fn render_panel(
     history: &History,
     extra: Option<&str>,
     capacity: Option<f64>,
+    chrome: PanelChrome,
 ) {
     let last = history.last().unwrap_or(0.0);
     let color = signal_color(monitor, last);
@@ -232,20 +305,38 @@ fn render_panel(
         None => format!(" {} ", monitor.title()),
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color));
+    if let Some(badge) = shortcut_badge(chrome.shortcut) {
+        block = block.title_top(badge);
+    }
+    if let Some(text) = chrome.hint {
+        block = block.title_bottom(hint_line(text));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let values = history.values();
-    let data: Vec<u64> = values.iter().map(|v| v.round().max(0.0) as u64).collect();
+    // `Sparkline` always draws its data starting at the render-direction's leading
+    // edge, taking however many of the *first* items in the slice fit — it never skips
+    // ahead to show the tail. So to keep the newest sample pinned to the right edge
+    // (and only ever show blank space on the *left*, before history began, rather than
+    // on the right when the panel is wider than our retained history) we reverse the
+    // window to newest-first and render right-to-left.
+    let data: Vec<u64> = history
+        .values()
+        .iter()
+        .rev()
+        .take(inner.width as usize)
+        .map(|v| v.round().max(0.0) as u64)
+        .collect();
     // Scale bars against the metric's real ceiling (e.g. 100%) rather than the max of
     // the current window — otherwise a value that's merely the local max renders as a
     // full bar even when it's nowhere near the actual limit.
     let mut sparkline = Sparkline::default()
         .data(&data)
+        .direction(RenderDirection::RightToLeft)
         .style(Style::default().fg(color));
     if let Some(limit) = monitor.limit() {
         sparkline = sparkline.max(limit.round().max(0.0) as u64);
@@ -253,7 +344,14 @@ fn render_panel(
     frame.render_widget(sparkline, inner);
 }
 
-fn render_tables(frame: &mut Frame, area: Rect, app: &App) {
+// Command gets the leftover space; Time/Usage are short and fixed-width.
+const TABLE_COL_WIDTHS: [Constraint; 3] = [
+    Constraint::Fill(1),
+    Constraint::Length(8),
+    Constraint::Length(10),
+];
+
+fn render_tables(frame: &mut Frame, area: Rect, app: &App, shortcuts: &ShortcutMap) {
     let n = app.table_monitors.len();
     if n == 0 {
         return;
@@ -272,6 +370,7 @@ fn render_tables(frame: &mut Frame, area: Rect, app: &App) {
             monitor.title(),
             monitor.headers(),
             &app.table_rows[i],
+            shortcuts.table.get(&i).copied(),
         );
     }
 }
@@ -282,11 +381,15 @@ fn render_table_panel(
     title: &str,
     headers: &[&str],
     rows: &[TableRow],
+    shortcut: Option<u8>,
 ) {
-    let block = Block::default()
+    let mut block = Block::default()
         .title(format!(" {} ", title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN));
+    if let Some(badge) = shortcut_badge(shortcut) {
+        block = block.title_top(badge);
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -294,15 +397,43 @@ fn render_table_panel(
         .style(Style::default().add_modifier(Modifier::BOLD));
     let body: Vec<UiRow> = rows.iter().map(|r| UiRow::new(r.cells.clone())).collect();
 
-    // Command gets the leftover space; Time/Usage are short and fixed-width.
-    let table = Table::new(
-        body,
-        [
-            Constraint::Fill(1),
-            Constraint::Length(8),
-            Constraint::Length(10),
-        ],
-    )
-    .header(header);
+    let table = Table::new(body, TABLE_COL_WIDTHS).header(header);
     frame.render_widget(table, inner);
+}
+
+/// Fullscreen view of a frozen table: same columns as the overview panel, plus a
+/// selectable/highlighted row and a footer hint for navigate/kill/back.
+fn render_fullscreen_table(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    headers: &[&str],
+    table_focus: &TableFocus,
+) {
+    let mut block = Block::default()
+        .title(format!(" {} ", title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::CYAN));
+    block = block.title_bottom(hint_line("↑/↓ navegar · x matar (SIGKILL) · Esc/q voltar"));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let header = UiRow::new(headers.iter().map(|h| Cell::from(*h)).collect::<Vec<_>>())
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    let body: Vec<UiRow> = table_focus
+        .rows
+        .iter()
+        .map(|r| UiRow::new(r.cells.clone()))
+        .collect();
+
+    let table = Table::new(body, TABLE_COL_WIDTHS)
+        .header(header)
+        .row_highlight_style(
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = TableState::default().with_selected(Some(table_focus.selected));
+    frame.render_stateful_widget(table, inner, &mut state);
 }

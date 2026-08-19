@@ -100,8 +100,12 @@ pub fn all_monitors() -> Vec<Box<dyn Monitor>> {
     monitors
 }
 
+#[derive(Clone)]
 pub struct TableRow {
     pub cells: Vec<String>,
+    /// PID of the process this row represents — kept alongside the formatted cells so
+    /// a frozen, fullscreened snapshot can still target the right process (e.g. kill).
+    pub pid: u32,
 }
 
 /// One "monitorzinho" that shows a ranked snapshot list instead of a time series
@@ -110,7 +114,9 @@ pub trait TableMonitor: Send {
     fn title(&self) -> &'static str;
     /// Column headers; each `TableRow::cells` must have the same length as this.
     fn headers(&self) -> &'static [&'static str];
-    fn sample(&mut self, state: &SystemState) -> Vec<TableRow>;
+    /// Ranked rows, capped to `limit` entries — or every ranked entry when `None`
+    /// (used for the fullscreen view, where there's room, and reason, to see it all).
+    fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow>;
 }
 
 pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {
