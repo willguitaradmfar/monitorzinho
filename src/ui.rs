@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -205,6 +205,13 @@ fn render_numeric_bar(frame: &mut Frame, area: Rect, app: &App, indices: &[usize
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+
+    let version = Paragraph::new(Line::styled(
+        format!("v{} ", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(palette::DIM),
+    ))
+    .alignment(Alignment::Right);
+    frame.render_widget(version, inner);
 }
 
 /// Packs `App::chart_monitor_order()` (already grouped so related panels like Net
