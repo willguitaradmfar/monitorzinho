@@ -15,7 +15,7 @@ fn is_process(p: &&Process) -> bool {
 /// Full command line (falls back to the process name if `cmd()` is unavailable, e.g.
 /// a kernel thread or a process we don't have permission to read `/proc/<pid>/cmdline`
 /// for). Left untruncated — the table widget clips it to the column width on render.
-fn command_of(p: &Process) -> String {
+pub(super) fn command_of(p: &Process) -> String {
     let cmd = p.cmd();
     if cmd.is_empty() {
         p.name().to_string_lossy().into_owned()

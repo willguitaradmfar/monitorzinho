@@ -69,8 +69,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     Focus::None => break,
                     _ => app.exit_focus(),
                 },
-                KeyCode::Char(c @ '1'..='9') if matches!(app.focus, Focus::None) => {
-                    app.activate_shortcut(c as u8 - b'0');
+                KeyCode::Char(c) if matches!(app.focus, Focus::None) => {
+                    app.activate_shortcut(c);
                 }
                 KeyCode::Up if matches!(app.focus, Focus::Table(_)) => app.move_selection(-1),
                 KeyCode::Down if matches!(app.focus, Focus::Table(_)) => app.move_selection(1),

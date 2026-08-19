@@ -4,15 +4,45 @@ use crate::history::{self, CAPACITY, History};
 use crate::monitor::{self, Monitor, SystemState, TableMonitor, TableRow};
 
 const SAVE_EVERY_N_TICKS: u32 = 5;
-/// Digit keys '1'..='9' are the only shortcuts wired up, so only the first 9 panels
-/// (charts first, then tables) get a number.
-pub const MAX_SHORTCUTS: usize = 9;
+
+/// a-z minus 'q' (quit) and 'x' (kill, inside a fullscreened table) — those two stay
+/// reserved everywhere so they always mean the same thing regardless of focus.
+const SHORTCUT_LETTERS: &[char] = &[
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'r', 's', 't',
+    'u', 'v', 'w', 'y', 'z',
+];
+/// Shortcut keys are '1'..='9' then `SHORTCUT_LETTERS`, in that order — so only the
+/// first `MAX_SHORTCUTS` panels (charts first, then tables) get one.
+pub const MAX_SHORTCUTS: usize = 9 + SHORTCUT_LETTERS.len();
+
+/// The key that activates the panel at `index` (0-indexed), in `shortcut_targets()`
+/// order — mirrored by `ui::ShortcutMap` to label each panel with the same key.
+pub fn shortcut_key(index: usize) -> Option<char> {
+    if index < 9 {
+        Some((b'1' + index as u8) as char)
+    } else {
+        SHORTCUT_LETTERS.get(index - 9).copied()
+    }
+}
+
+/// Inverse of `shortcut_key`: which panel index a pressed key activates, if any.
+fn shortcut_index(key: char) -> Option<usize> {
+    if key.is_ascii_digit() && key != '0' {
+        Some((key as u8 - b'1') as usize)
+    } else {
+        SHORTCUT_LETTERS
+            .iter()
+            .position(|&l| l == key)
+            .map(|p| p + 9)
+    }
+}
+
 /// Row cap for a table panel's compact, in-grid rendering. Fullscreening it takes a
 /// fresh, uncapped sample instead — see `App::activate_shortcut`.
 const OVERVIEW_TABLE_ROWS: usize = 10;
 
-/// What a digit-key shortcut points at, in the flattened order shown in the UI:
-/// chart panels first (same order as the chart grid), then table panels.
+/// What a shortcut key points at, in the flattened order shown in the UI: chart
+/// panels first (same order as the chart grid), then table panels.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutTarget {
     Chart(usize),
@@ -132,8 +162,8 @@ impl App {
             .collect()
     }
 
-    /// Shortcut-able panels in display order: charts first, then tables. Digit key `n`
-    /// (1-indexed) activates `shortcut_targets()[n - 1]`.
+    /// Shortcut-able panels in display order: charts first, then tables. The key
+    /// returned by `shortcut_key(i)` activates `shortcut_targets()[i]`.
     pub fn shortcut_targets(&self) -> Vec<ShortcutTarget> {
         let mut targets: Vec<ShortcutTarget> = self
             .chart_monitor_order()
@@ -145,13 +175,13 @@ impl App {
         targets
     }
 
-    /// Enter fullscreen for the panel bound to digit `n` (1-indexed), if any.
-    pub fn activate_shortcut(&mut self, digit: u8) {
-        if digit == 0 {
+    /// Enter fullscreen for the panel bound to `key`, if any.
+    pub fn activate_shortcut(&mut self, key: char) {
+        let Some(index) = shortcut_index(key) else {
             return;
-        }
+        };
         let targets = self.shortcut_targets();
-        let Some(&target) = targets.get(digit as usize - 1) else {
+        let Some(&target) = targets.get(index) else {
             return;
         };
         self.focus = match target {

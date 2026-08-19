@@ -32,11 +32,11 @@ mod palette {
     pub const DIM: Color = Color::Rgb(0x5C, 0x63, 0x70);
 }
 
-/// Builds the digit-key badges shown per panel: which chart/table index maps to which
-/// number, mirroring `App::shortcut_targets()`'s 1-indexed order.
+/// Builds the shortcut-key badges shown per panel: which chart/table index maps to
+/// which key, mirroring `App::shortcut_targets()`'s order (see `app::shortcut_key`).
 struct ShortcutMap {
-    chart: HashMap<usize, u8>,
-    table: HashMap<usize, u8>,
+    chart: HashMap<usize, char>,
+    table: HashMap<usize, char>,
 }
 
 impl ShortcutMap {
@@ -44,13 +44,15 @@ impl ShortcutMap {
         let mut chart = HashMap::new();
         let mut table = HashMap::new();
         for (i, target) in app.shortcut_targets().into_iter().enumerate() {
-            let digit = (i + 1) as u8;
+            let Some(key) = crate::app::shortcut_key(i) else {
+                continue;
+            };
             match target {
                 ShortcutTarget::Chart(idx) => {
-                    chart.insert(idx, digit);
+                    chart.insert(idx, key);
                 }
                 ShortcutTarget::Table(idx) => {
-                    table.insert(idx, digit);
+                    table.insert(idx, key);
                 }
             }
         }
@@ -58,11 +60,11 @@ impl ShortcutMap {
     }
 }
 
-/// Right-aligned top-border badge showing a panel's digit-key shortcut, e.g. `[3]`.
-fn shortcut_badge(digit: Option<u8>) -> Option<Line<'static>> {
-    digit.map(|n| {
+/// Right-aligned top-border badge showing a panel's shortcut key, e.g. `[3]` or `[a]`.
+fn shortcut_badge(key: Option<char>) -> Option<Line<'static>> {
+    key.map(|k| {
         Line::styled(
-            format!(" [{}] ", n),
+            format!(" [{}] ", k),
             Style::default()
                 .fg(palette::DIM)
                 .add_modifier(Modifier::BOLD),
@@ -256,11 +258,11 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &App, shortcuts: &ShortcutM
     }
 }
 
-/// Panel-header extras that only apply outside the plain overview grid: a digit-key
+/// Panel-header extras that only apply outside the plain overview grid: a shortcut-key
 /// badge, and/or a fullscreen-only footer hint.
 #[derive(Default, Clone, Copy)]
 struct PanelChrome<'a> {
-    shortcut: Option<u8>,
+    shortcut: Option<char>,
     hint: Option<&'a str>,
 }
 
@@ -344,12 +346,24 @@ fn render_panel(
     frame.render_widget(sparkline, inner);
 }
 
-// Command gets the leftover space; Time/Usage are short and fixed-width.
-const TABLE_COL_WIDTHS: [Constraint; 3] = [
-    Constraint::Fill(1),
-    Constraint::Length(8),
-    Constraint::Length(10),
-];
+/// Column widths for a table panel, keyed off its exact headers: the process tables
+/// (Command/Time/Usage) want Command to take the leftover space with Time/Usage
+/// fixed-width, while the ports table (Proto/Port/Process) wants Proto/Port fixed and
+/// Process filling the rest.
+fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
+    match headers {
+        ["Proto", "Port", "Process"] => vec![
+            Constraint::Length(5),
+            Constraint::Length(7),
+            Constraint::Fill(1),
+        ],
+        _ => vec![
+            Constraint::Fill(1),
+            Constraint::Length(8),
+            Constraint::Length(10),
+        ],
+    }
+}
 
 fn render_tables(frame: &mut Frame, area: Rect, app: &App, shortcuts: &ShortcutMap) {
     let n = app.table_monitors.len();
@@ -381,7 +395,7 @@ fn render_table_panel(
     title: &str,
     headers: &[&str],
     rows: &[TableRow],
-    shortcut: Option<u8>,
+    shortcut: Option<char>,
 ) {
     let mut block = Block::default()
         .title(format!(" {} ", title))
@@ -397,7 +411,7 @@ fn render_table_panel(
         .style(Style::default().add_modifier(Modifier::BOLD));
     let body: Vec<UiRow> = rows.iter().map(|r| UiRow::new(r.cells.clone())).collect();
 
-    let table = Table::new(body, TABLE_COL_WIDTHS).header(header);
+    let table = Table::new(body, table_col_widths(headers)).header(header);
     frame.render_widget(table, inner);
 }
 
@@ -426,7 +440,7 @@ fn render_fullscreen_table(
         .map(|r| UiRow::new(r.cells.clone()))
         .collect();
 
-    let table = Table::new(body, TABLE_COL_WIDTHS)
+    let table = Table::new(body, table_col_widths(headers))
         .header(header)
         .row_highlight_style(
             Style::default()

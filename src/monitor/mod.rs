@@ -5,6 +5,7 @@ pub mod disk;
 pub mod gpu;
 pub mod memory;
 pub mod network;
+pub mod ports;
 pub mod process;
 
 /// Shared, refreshed-once-per-tick system state passed to every monitor's `sample`.
@@ -121,6 +122,7 @@ pub trait TableMonitor: Send {
 
 pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {
     vec![
+        Box::new(ports::PortsMonitor),
         Box::new(process::TopCpuMonitor),
         Box::new(process::TopMemMonitor),
     ]
