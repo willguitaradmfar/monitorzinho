@@ -26,4 +26,8 @@ impl Monitor for CpuMonitor {
     fn group(&self) -> &'static str {
         "System"
     }
+
+    fn extra(&self, state: &SystemState) -> Option<String> {
+        Some(format!("{} cores", state.sys.cpus().len()))
+    }
 }
