@@ -124,6 +124,11 @@ pub struct TableRow {
     /// Every pid in this row's subtree (not including its own pid) — used for
     /// cascading kill, valid even while some descendants are collapsed/hidden.
     pub descendant_pids: Vec<u32>,
+    /// Opaque identity a monitor can use to re-match this row against a fresh sample
+    /// in `TableMonitor::refresh_values`, for tables where `pid` alone isn't unique
+    /// enough (e.g. Connections: several sockets can share one owning process). Empty
+    /// and unused by monitors that don't need it — they match by `pid` directly.
+    pub key: String,
 }
 
 impl TableRow {
@@ -137,6 +142,7 @@ impl TableRow {
             guides: Vec::new(),
             child_count: 0,
             descendant_pids: Vec::new(),
+            key: String::new(),
         }
     }
 }
@@ -150,18 +156,21 @@ pub trait TableMonitor: Send {
     /// Ranked rows, capped to `limit` entries — or every ranked entry when `None`
     /// (used for the fullscreen view, where there's room, and reason, to see it all).
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow>;
-    /// Refreshes already-fetched `rows` in place (by pid) instead of re-sampling —
-    /// called every tick for a fullscreened table instead of `sample`, so its Time/
-    /// Usage-style live values keep moving without re-ranking or reshaping the rows
-    /// out from under whatever the user is reading, searching, or has expanded. The
-    /// default no-op fits monitors with nothing that changes tick to tick (e.g. Ports).
-    fn refresh_values(&self, _state: &SystemState, _rows: &mut [TableRow]) {}
+    /// Refreshes already-fetched `rows` in place (matched by `pid`, or by `key` for
+    /// monitors where `pid` isn't a unique row identity) instead of re-sampling —
+    /// called every tick for a fullscreened table instead of `sample`, so live values
+    /// (age, CPU/memory usage, throughput, ...) keep moving without re-ranking or
+    /// reshaping the rows out from under whatever the user is reading, searching, or
+    /// has expanded. `&mut self` because some monitors track state between calls to
+    /// compute a rate (e.g. Connections' download/upload throughput). The default
+    /// no-op fits monitors with nothing that changes tick to tick.
+    fn refresh_values(&mut self, _state: &SystemState, _rows: &mut [TableRow]) {}
 }
 
 pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {
     vec![
         Box::new(ports::PortsMonitor),
-        Box::new(connections::ConnectionsMonitor),
+        Box::new(connections::ConnectionsMonitor::new()),
         Box::new(process::TopCpuMonitor),
         Box::new(process::TopMemMonitor),
     ]

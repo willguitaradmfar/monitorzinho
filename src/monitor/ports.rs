@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
-use sysinfo::Pid;
-
-use super::process::command_of;
+use super::process::describe_owner;
 use super::{SystemState, TableMonitor, TableRow};
 
 /// TCP_LISTEN, per include/net/tcp_states.h — shared by /proc/net/tcp{,6}.
@@ -12,7 +10,7 @@ const TCP_LISTEN: &str = "0A";
 /// (UDP has no real LISTEN state) — /proc/net/udp{,6}.
 const UDP_UNCONN: &str = "07";
 
-const HEADERS: [&str; 3] = ["Proto", "Port", "Process"];
+const HEADERS: [&str; 4] = ["Proto", "Port", "Process", "Age"];
 
 struct PortEntry {
     port: u16,
@@ -110,12 +108,8 @@ fn sample_ports(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
     rows.into_iter()
         .take(limit.unwrap_or(usize::MAX))
         .map(|(proto, port, pid)| {
-            let process = state
-                .sys
-                .process(Pid::from_u32(pid))
-                .map(command_of)
-                .unwrap_or_else(|| "?".to_string());
-            TableRow::leaf(vec![proto.to_string(), port.to_string(), process], pid)
+            let (process, age) = describe_owner(state, pid);
+            TableRow::leaf(vec![proto.to_string(), port.to_string(), process, age], pid)
         })
         .collect()
 }
@@ -133,5 +127,17 @@ impl TableMonitor for PortsMonitor {
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
         sample_ports(state, limit)
+    }
+
+    fn refresh_values(&mut self, state: &SystemState, rows: &mut [TableRow]) {
+        for row in rows.iter_mut() {
+            let (process, age) = describe_owner(state, row.pid);
+            if let Some(cell) = row.cells.get_mut(2) {
+                *cell = process;
+            }
+            if let Some(cell) = row.cells.get_mut(3) {
+                *cell = age;
+            }
+        }
     }
 }

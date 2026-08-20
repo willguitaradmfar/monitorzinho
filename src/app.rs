@@ -303,7 +303,7 @@ impl App {
                     _ => None,
                 };
                 if let Some(idx) = frozen_idx {
-                    let monitor = self.table_monitors[idx].as_ref();
+                    let monitor = self.table_monitors[idx].as_mut();
                     if let Focus::Table(tf) = &mut self.focus {
                         monitor.refresh_values(&self.state, &mut tf.rows);
                     }

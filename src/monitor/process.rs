@@ -30,6 +30,18 @@ pub(super) fn command_of(p: &Process) -> String {
     }
 }
 
+/// Command and age (`human_duration(run_time())`) for `pid`, or `("?", "-")` if it's
+/// not a currently-running process (e.g. a port/connection whose owner we couldn't
+/// resolve, or that's since exited). Shared by every table that attributes a row to a
+/// process it only knows the pid of (Ports, Connections) rather than owning it
+/// directly (Top CPU/Memory, which already hold a `&Process` at row-build time).
+pub(super) fn describe_owner(state: &SystemState, pid: u32) -> (String, String) {
+    match state.sys.process(Pid::from_u32(pid)) {
+        Some(p) => (command_of(p), format::human_duration(p.run_time())),
+        None => ("?".to_string(), "-".to_string()),
+    }
+}
+
 /// Flat top-`limit` processes ranked by their own `metric` — no hierarchy. Used for the
 /// compact panel: a tree's top row is ranked by its *subtree's* combined usage, so an
 /// idle root sitting above a busy child would show a misleadingly blank Usage column
@@ -131,6 +143,7 @@ fn flatten(
         guides: guides.clone(),
         child_count: kids.len(),
         descendant_pids: descendants.get(&pid).cloned().unwrap_or_default(),
+        key: String::new(),
     });
 
     let n = kids.len();
@@ -257,7 +270,7 @@ impl TableMonitor for TopCpuMonitor {
         })
     }
 
-    fn refresh_values(&self, state: &SystemState, rows: &mut [TableRow]) {
+    fn refresh_values(&mut self, state: &SystemState, rows: &mut [TableRow]) {
         refresh_rows(state, rows, &|p| format!("{:.1}%", p.cpu_usage()));
     }
 }
@@ -279,7 +292,7 @@ impl TableMonitor for TopMemMonitor {
         })
     }
 
-    fn refresh_values(&self, state: &SystemState, rows: &mut [TableRow]) {
+    fn refresh_values(&mut self, state: &SystemState, rows: &mut [TableRow]) {
         refresh_rows(state, rows, &|p| format::human_bytes(p.memory() as f64));
     }
 }

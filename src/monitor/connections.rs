@@ -1,13 +1,13 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-
-use sysinfo::Pid;
+use std::time::Instant;
 
 use super::ports::inode_to_pid;
-use super::process::command_of;
+use super::process::describe_owner;
 use super::{SystemState, TableMonitor, TableRow};
 use crate::format;
 
-const HEADERS: [&str; 4] = ["Proto", "Process", "Connection", "Traffic"];
+const HEADERS: [&str; 6] = ["Proto", "Process", "Connection", "Age", "Traffic", "Rate"];
 
 // --- raw netlink INET_DIAG plumbing -------------------------------------------------
 //
@@ -190,7 +190,10 @@ struct RawConn {
     protocol: u8,
     local: String,
     remote: String,
-    traffic: u64,
+    /// Cumulative bytes we've sent-and-had-acked / received on this socket since it
+    /// opened — 0/0 for UDP, which the kernel doesn't track this way for.
+    bytes_acked: u64,
+    bytes_received: u64,
     inode: u32,
 }
 
@@ -219,7 +222,8 @@ fn parse_dump(data: &[u8], protocol: u8, out: &mut Vec<RawConn>) -> bool {
             let remote_ip = format_ip(family, &sockid[20..36]);
             let inode = u32::from_ne_bytes(msg[68..72].try_into().unwrap());
 
-            let mut traffic = 0u64;
+            let mut bytes_acked = 0u64;
+            let mut bytes_received = 0u64;
             let mut apos = 72; // rtattrs start right after the fixed inet_diag_msg
             while apos + 4 <= msg.len() {
                 let rta_len = u16::from_ne_bytes(msg[apos..apos + 2].try_into().unwrap()) as usize;
@@ -230,17 +234,16 @@ fn parse_dump(data: &[u8], protocol: u8, out: &mut Vec<RawConn>) -> bool {
                 if rta_type == INET_DIAG_INFO {
                     let payload = &msg[apos + 4..apos + rta_len];
                     if payload.len() >= TCPI_BYTES_RECEIVED_OFFSET + 8 {
-                        let acked = u64::from_ne_bytes(
+                        bytes_acked = u64::from_ne_bytes(
                             payload[TCPI_BYTES_ACKED_OFFSET..TCPI_BYTES_ACKED_OFFSET + 8]
                                 .try_into()
                                 .unwrap(),
                         );
-                        let received = u64::from_ne_bytes(
+                        bytes_received = u64::from_ne_bytes(
                             payload[TCPI_BYTES_RECEIVED_OFFSET..TCPI_BYTES_RECEIVED_OFFSET + 8]
                                 .try_into()
                                 .unwrap(),
                         );
-                        traffic = acked + received;
                     }
                 }
                 apos += align4(rta_len);
@@ -250,7 +253,8 @@ fn parse_dump(data: &[u8], protocol: u8, out: &mut Vec<RawConn>) -> bool {
                 protocol,
                 local: format!("{}:{}", local_ip, local_port),
                 remote: format!("{}:{}", remote_ip, remote_port),
-                traffic,
+                bytes_acked,
+                bytes_received,
                 inode,
             });
         }
@@ -281,45 +285,108 @@ fn query(protocol: u8, states: u32) -> Vec<RawConn> {
     out
 }
 
-/// Connections in either direction — we're the server (someone connected to a port we
-/// have listening) or the client (we connected out) — excluding plain listening/
-/// unconnected sockets, which the Ports panel already covers. Ranked by total traffic
-/// (bytes acked + bytes received) since the connection opened, heaviest first; UDP
-/// carries no such counter in the kernel, so its connections report zero and sort last.
-fn sample_connections(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
-    let mut raw = query(IPPROTO_TCP, TCP_OPEN_STATES);
-    raw.extend(query(IPPROTO_UDP, 1u32 << TCP_ESTABLISHED));
-    raw.sort_by_key(|c| std::cmp::Reverse(c.traffic));
-
-    let owners = inode_to_pid();
-    raw.into_iter()
-        .take(limit.unwrap_or(usize::MAX))
-        .map(|c| {
-            let pid = owners.get(&(c.inode as u64)).copied().unwrap_or(0);
-            let process = state
-                .sys
-                .process(Pid::from_u32(pid))
-                .map(command_of)
-                .unwrap_or_else(|| "?".to_string());
-            let proto = if c.protocol == IPPROTO_TCP {
-                "TCP"
-            } else {
-                "UDP"
-            };
-            TableRow::leaf(
-                vec![
-                    proto.to_string(),
-                    process,
-                    format!("{} → {}", c.local, c.remote),
-                    format::human_bytes(c.traffic as f64),
-                ],
-                pid,
-            )
-        })
-        .collect()
+/// Identifies one connection across successive dumps (its 4-tuple doesn't change for
+/// its lifetime), so tick-to-tick byte deltas — and a fullscreened row — can be matched
+/// back up to the right entry.
+fn conn_key(protocol: u8, local: &str, remote: &str) -> String {
+    format!("{protocol}|{local}|{remote}")
 }
 
-pub struct ConnectionsMonitor;
+fn format_rate(down_per_sec: f64, up_per_sec: f64) -> String {
+    format!(
+        "↓{} ↑{}",
+        format::human_bytes_per_sec(down_per_sec),
+        format::human_bytes_per_sec(up_per_sec)
+    )
+}
+
+/// Connections in either direction — we're the server (someone connected to a port we
+/// have listening) or the client (we connected out) — excluding plain listening/
+/// unconnected sockets, which the Ports panel already covers. UDP carries no byte
+/// counter in the kernel, so its connections always report zero traffic/rate.
+pub struct ConnectionsMonitor {
+    /// Last-seen (bytes_acked, bytes_received, when) per connection, keyed by
+    /// `conn_key` — diffed against the next sample to turn cumulative counters into a
+    /// throughput. Rebuilt every sample so a closed connection's entry just drops out
+    /// instead of accumulating forever.
+    history: HashMap<String, (u64, u64, Instant)>,
+}
+
+impl ConnectionsMonitor {
+    pub fn new() -> Self {
+        Self {
+            history: HashMap::new(),
+        }
+    }
+
+    /// Fetches a fresh netlink dump and turns it into `(RawConn, download/s, upload/s)`
+    /// triples keyed by `conn_key`, updating `self.history` for the next call in the
+    /// same motion. Shared by `sample` (fresh rows, possibly capped) and
+    /// `refresh_values` (update existing rows in place, matched by their stored `key`).
+    fn refresh_snapshot(&mut self) -> HashMap<String, (RawConn, f64, f64)> {
+        let mut raw = query(IPPROTO_TCP, TCP_OPEN_STATES);
+        raw.extend(query(IPPROTO_UDP, 1u32 << TCP_ESTABLISHED));
+
+        let now = Instant::now();
+        let mut next_history = HashMap::with_capacity(raw.len());
+        let mut snapshot = HashMap::with_capacity(raw.len());
+        for c in raw {
+            let key = conn_key(c.protocol, &c.local, &c.remote);
+            let (down, up) = match self.history.get(&key) {
+                Some(&(prev_acked, prev_received, prev_time)) => {
+                    let dt = now.duration_since(prev_time).as_secs_f64().max(0.001);
+                    (
+                        c.bytes_received.saturating_sub(prev_received) as f64 / dt,
+                        c.bytes_acked.saturating_sub(prev_acked) as f64 / dt,
+                    )
+                }
+                // First time we've seen it — no prior sample to diff against yet.
+                None => (0.0, 0.0),
+            };
+            next_history.insert(key.clone(), (c.bytes_acked, c.bytes_received, now));
+            snapshot.insert(key, (c, down, up));
+        }
+        self.history = next_history;
+        snapshot
+    }
+}
+
+impl Default for ConnectionsMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builds a `TableRow` for one connection, resolving its owning process (name + age)
+/// by pid and formatting its traffic total and current download/upload rate.
+fn build_row(
+    state: &SystemState,
+    owners: &HashMap<u64, u32>,
+    c: &RawConn,
+    down: f64,
+    up: f64,
+) -> TableRow {
+    let pid = owners.get(&(c.inode as u64)).copied().unwrap_or(0);
+    let (process, age) = describe_owner(state, pid);
+    let proto = if c.protocol == IPPROTO_TCP {
+        "TCP"
+    } else {
+        "UDP"
+    };
+    let mut row = TableRow::leaf(
+        vec![
+            proto.to_string(),
+            process,
+            format!("{} → {}", c.local, c.remote),
+            age,
+            format::human_bytes((c.bytes_acked + c.bytes_received) as f64),
+            format_rate(down, up),
+        ],
+        pid,
+    );
+    row.key = conn_key(c.protocol, &c.local, &c.remote);
+    row
+}
 
 impl TableMonitor for ConnectionsMonitor {
     fn title(&self) -> &'static str {
@@ -331,6 +398,46 @@ impl TableMonitor for ConnectionsMonitor {
     }
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
-        sample_connections(state, limit)
+        let snapshot = self.refresh_snapshot();
+        let mut entries: Vec<(RawConn, f64, f64)> = snapshot.into_values().collect();
+        // Ranked by current combined throughput, not lifetime total — an SSH session
+        // that moved 50 MB an hour ago and is doing nothing right now shouldn't outrank
+        // a transfer actively saturating the link at 140 KB/s. A connection's very
+        // first tick has no prior sample to diff, so it reports (and sorts as) 0/0
+        // until the next one.
+        entries.sort_by(|(_, ad, au), (_, bd, bu)| (bd + bu).total_cmp(&(ad + au)));
+
+        let owners = inode_to_pid();
+        entries
+            .into_iter()
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|(c, down, up)| build_row(state, &owners, &c, down, up))
+            .collect()
+    }
+
+    fn refresh_values(&mut self, state: &SystemState, rows: &mut [TableRow]) {
+        let snapshot = self.refresh_snapshot();
+        let owners = inode_to_pid();
+        for row in rows.iter_mut() {
+            // A connection that's since closed just keeps showing its last known
+            // values — same "stale beats missing" tradeoff as a dead pid elsewhere.
+            let Some((c, down, up)) = snapshot.get(&row.key) else {
+                continue;
+            };
+            row.pid = owners.get(&(c.inode as u64)).copied().unwrap_or(0);
+            let (process, age) = describe_owner(state, row.pid);
+            if let Some(cell) = row.cells.get_mut(1) {
+                *cell = process;
+            }
+            if let Some(cell) = row.cells.get_mut(3) {
+                *cell = age;
+            }
+            if let Some(cell) = row.cells.get_mut(4) {
+                *cell = format::human_bytes((c.bytes_acked + c.bytes_received) as f64);
+            }
+            if let Some(cell) = row.cells.get_mut(5) {
+                *cell = format_rate(*down, *up);
+            }
+        }
     }
 }

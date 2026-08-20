@@ -373,16 +373,19 @@ fn render_panel(
 /// Process filling the rest.
 fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
     match headers {
-        ["Proto", "Port", "Process"] => vec![
+        ["Proto", "Port", "Process", "Age"] => vec![
             Constraint::Length(5),
             Constraint::Length(7),
             Constraint::Fill(1),
+            Constraint::Length(8),
         ],
-        ["Proto", "Process", "Connection", "Traffic"] => vec![
+        ["Proto", "Process", "Connection", "Age", "Traffic", "Rate"] => vec![
             Constraint::Length(5),
             Constraint::Fill(2),
             Constraint::Fill(1),
-            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(22),
         ],
         _ => vec![
             Constraint::Fill(1),
