@@ -8,13 +8,12 @@ use ratatui::widgets::{
     Block, Borders, Cell, Paragraph, RenderDirection, Row as UiRow, Sparkline, Table, TableState,
 };
 
-use crate::app::{App, Focus, ShortcutTarget, TableFocus};
+use crate::app::{App, Focus, ShortcutTarget, Tab, TableFocus};
 use crate::format;
 use crate::history::History;
 use crate::monitor::{Monitor, TableRow};
 
-const TABLE_SECTION_HEIGHT: u16 = 14;
-const NUMERIC_BAR_HEIGHT: u16 = 2;
+const TAB_BAR_HEIGHT: u16 = 2;
 const COLS: usize = 3;
 
 /// A muted, low-saturation palette (One Dark-inspired) instead of the harsh basic
@@ -29,7 +28,10 @@ mod palette {
     pub const ORANGE: Color = Color::Rgb(0xD1, 0x9A, 0x66);
     pub const YELLOW: Color = Color::Rgb(0xE5, 0xC0, 0x7B);
     pub const RED: Color = Color::Rgb(0xE0, 0x6C, 0x75);
-    pub const DIM: Color = Color::Rgb(0x5C, 0x63, 0x70);
+    /// Muted but still legible on a dark terminal — GitHub Dark's secondary-text gray.
+    /// The original One Dark comment gray (`#5C6370`) was tuned for that theme's own
+    /// background and read as barely-visible on plainer dark terminals.
+    pub const DIM: Color = Color::Rgb(0x8B, 0x94, 0x9E);
 }
 
 /// Builds the shortcut-key badges shown per panel: which chart/table index maps to
@@ -105,39 +107,94 @@ pub fn render(frame: &mut Frame, app: &App) {
         Focus::None => {}
     }
 
-    let numeric_indices: Vec<usize> = app
-        .monitors
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.numeric_only())
-        .map(|(i, _)| i)
-        .collect();
-
-    let mut constraints = Vec::new();
-    if !numeric_indices.is_empty() {
-        constraints.push(Constraint::Length(NUMERIC_BAR_HEIGHT));
-    }
-    constraints.push(Constraint::Min(0));
-    if !app.table_monitors.is_empty() {
-        constraints.push(Constraint::Length(TABLE_SECTION_HEIGHT));
-    }
-
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints([Constraint::Length(TAB_BAR_HEIGHT), Constraint::Min(0)])
         .split(area);
+    render_tab_bar(frame, sections[0], app);
+
+    match app.tab {
+        Tab::Overview => render_overview_tab(frame, sections[1], app),
+        Tab::Processes => render_processes_tab(frame, sections[1], app),
+    }
+}
+
+/// Slim header showing the two tabs (the active one highlighted), plus the app
+/// version and switch-tab hint on the right — always visible, on either tab.
+fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(palette::DIM));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut spans = vec![Span::raw(" ")];
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let style = if *tab == app.tab {
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(palette::DIM)
+        };
+        spans.push(Span::styled(format!(" {} ", tab.title()), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+
+    let hint = Paragraph::new(Line::styled(
+        format!(
+            " v{} · Tab/Shift+Tab alternar aba ",
+            env!("CARGO_PKG_VERSION")
+        ),
+        Style::default().fg(palette::DIM),
+    ))
+    .alignment(Alignment::Right);
+    frame.render_widget(hint, inner);
+}
+
+/// Overview tab: just the sparkline grid, grouped by `Monitor::group()` (e.g. Disk
+/// occupancy sits with its read/write throughput panels).
+fn render_overview_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let shortcuts = ShortcutMap::build(app);
+    render_charts(frame, area, app, &shortcuts);
+}
+
+/// Processes tab: Ports and Connections side by side on top (both are per-socket
+/// listings, easiest to compare against each other), Top CPU and Top Memory stacked
+/// full-width below — matches `monitor::all_table_monitors()`'s order.
+fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
+    if app.table_monitors.len() < 4 {
+        return;
+    }
 
     let shortcuts = ShortcutMap::build(app);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+    let top_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(rows[0]);
 
-    let mut cursor = 0;
-    if !numeric_indices.is_empty() {
-        render_numeric_bar(frame, sections[cursor], app, &numeric_indices);
-        cursor += 1;
-    }
-    render_charts(frame, sections[cursor], app, &shortcuts);
-    cursor += 1;
-    if !app.table_monitors.is_empty() {
-        render_tables(frame, sections[cursor], app, &shortcuts);
+    let panels = [top_row[0], top_row[1], rows[1], rows[2]];
+    for (i, &panel_area) in panels.iter().enumerate() {
+        let monitor = app.table_monitors[i].as_ref();
+        render_table_panel(
+            frame,
+            panel_area,
+            monitor.title(),
+            monitor.headers(),
+            &app.table_rows[i],
+            shortcuts.table.get(&i).copied(),
+        );
     }
 }
 
@@ -169,49 +226,6 @@ fn signal_color(monitor: &dyn Monitor, value: f64) -> Color {
         }
         _ => base,
     }
-}
-
-/// A slim status bar for metrics that change too slowly for a chart to be worth the
-/// space (e.g. disk occupancy) — a single line, entries separated by a thin divider,
-/// with a bottom border to set it apart from the chart sections below.
-fn render_numeric_bar(frame: &mut Frame, area: Rect, app: &App, indices: &[usize]) {
-    let block = Block::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(palette::DIM));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut spans = vec![Span::raw(" ")];
-    for (n, &idx) in indices.iter().enumerate() {
-        if n > 0 {
-            spans.push(Span::styled("   │   ", Style::default().fg(palette::DIM)));
-        }
-
-        let monitor = app.monitors[idx].as_ref();
-        let last = app.histories[idx].last().unwrap_or(0.0);
-        let color = signal_color(monitor, last);
-
-        spans.push(Span::styled(
-            format!("{} ", monitor.title()),
-            Style::default().fg(palette::DIM),
-        ));
-        let value = match app.extras[idx].as_deref() {
-            Some(extra) => format!("{} ({})", monitor.format(last), extra),
-            None => monitor.format(last),
-        };
-        spans.push(Span::styled(
-            value,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
-
-    let version = Paragraph::new(Line::styled(
-        format!("v{} ", env!("CARGO_PKG_VERSION")),
-        Style::default().fg(palette::DIM),
-    ))
-    .alignment(Alignment::Right);
-    frame.render_widget(version, inner);
 }
 
 /// Packs `App::chart_monitor_order()` (already grouped so related panels like Net
@@ -364,6 +378,12 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
             Constraint::Length(7),
             Constraint::Fill(1),
         ],
+        ["Proto", "Process", "Connection", "Traffic"] => vec![
+            Constraint::Length(5),
+            Constraint::Fill(2),
+            Constraint::Fill(1),
+            Constraint::Length(10),
+        ],
         _ => vec![
             Constraint::Fill(1),
             Constraint::Length(8),
@@ -372,28 +392,40 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
     }
 }
 
-fn render_tables(frame: &mut Frame, area: Rect, app: &App, shortcuts: &ShortcutMap) {
-    let n = app.table_monitors.len();
-    if n == 0 {
-        return;
+/// Builds a `TableRow`'s tree indentation prefix — per-ancestor-level guide bars, this
+/// row's own branch connector, and an expand/collapse marker — then prepends it to a
+/// rendering-only copy of the Command cell. Whether the row is "expanded" is inferred
+/// from `next` (the row right after it in whatever list is actually being rendered)
+/// rather than tracked separately: if `next` is one of this row's children (one level
+/// deeper), its children are visibly present, so it reads as expanded. Rows with no
+/// children (`child_count == 0`, e.g. every Ports row) get a blank marker and render
+/// exactly as before.
+fn tree_row(row: &TableRow, next: Option<&TableRow>) -> UiRow<'static> {
+    let mut prefix = String::new();
+    for &last_sibling in &row.guides {
+        prefix.push_str(if last_sibling { "   " } else { "│  " });
     }
-
-    let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
-    let areas = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(area);
-
-    for (i, monitor) in app.table_monitors.iter().enumerate() {
-        render_table_panel(
-            frame,
-            areas[i],
-            monitor.title(),
-            monitor.headers(),
-            &app.table_rows[i],
-            shortcuts.table.get(&i).copied(),
-        );
+    if row.depth > 0 {
+        prefix.push_str(if row.is_last_sibling {
+            "└─"
+        } else {
+            "├─"
+        });
     }
+    prefix.push(if row.child_count == 0 {
+        ' '
+    } else if next.is_some_and(|n| n.depth > row.depth) {
+        '▾'
+    } else {
+        '▸'
+    });
+    prefix.push(' ');
+
+    let mut cells = row.cells.clone();
+    if let Some(first) = cells.first_mut() {
+        *first = format!("{}{}", prefix, first);
+    }
+    UiRow::new(cells)
 }
 
 fn render_table_panel(
@@ -416,7 +448,11 @@ fn render_table_panel(
 
     let header = UiRow::new(headers.iter().map(|h| Cell::from(*h)).collect::<Vec<_>>())
         .style(Style::default().add_modifier(Modifier::BOLD));
-    let body: Vec<UiRow> = rows.iter().map(|r| UiRow::new(r.cells.clone())).collect();
+    let body: Vec<UiRow> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| tree_row(r, rows.get(i + 1)))
+        .collect();
 
     let table = Table::new(body, table_col_widths(headers)).header(header);
     frame.render_widget(table, inner);
@@ -441,9 +477,9 @@ fn render_fullscreen_table(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN));
     let hint = if table_focus.query.is_empty() {
-        "↑/↓ navegar · Del matar (SIGKILL) · digite p/ buscar · Esc voltar"
+        "↑/↓ navegar · ←/→ colapsar/expandir · Del matar (SIGKILL, com filhos) · digite p/ buscar · Esc voltar"
     } else {
-        "↑/↓ navegar · Del matar (SIGKILL) · digite p/ buscar · Esc limpar busca"
+        "↑/↓ ir ao próximo/anterior resultado · ←/→ colapsar/expandir · Del matar (SIGKILL, com filhos) · Esc limpar busca"
     };
     block = block.title_bottom(hint_line(hint));
     let inner = block.inner(area);
@@ -451,10 +487,17 @@ fn render_fullscreen_table(
 
     let header = UiRow::new(headers.iter().map(|h| Cell::from(*h)).collect::<Vec<_>>())
         .style(Style::default().add_modifier(Modifier::BOLD));
-    let body: Vec<UiRow> = table_focus
-        .visible_indices()
-        .into_iter()
-        .map(|i| UiRow::new(table_focus.rows[i].cells.clone()))
+    let visible = table_focus.visible_indices();
+    // Peek at the *next visible* row, not the next row in the underlying full list —
+    // a collapsed node's real children are still present right after it in the full,
+    // unfiltered tree, which would otherwise make every collapsible row look expanded.
+    let body: Vec<UiRow> = visible
+        .iter()
+        .enumerate()
+        .map(|(vi, &i)| {
+            let next = visible.get(vi + 1).map(|&ni| &table_focus.rows[ni]);
+            tree_row(&table_focus.rows[i], next)
+        })
         .collect();
 
     let table = Table::new(body, table_col_widths(headers))

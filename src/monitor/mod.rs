@@ -1,5 +1,6 @@
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+pub mod connections;
 pub mod cpu;
 pub mod disk;
 pub mod gpu;
@@ -24,9 +25,19 @@ impl SystemState {
         }
     }
 
-    pub fn refresh(&mut self) {
+    /// Refreshes what the chart panels (Overview tab) need. Split from
+    /// `refresh_processes` so each tab only pays for the sysinfo work its own
+    /// monitors actually use.
+    pub fn refresh_overview(&mut self) {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
+        self.disks.refresh(true);
+        self.networks.refresh(true);
+    }
+
+    /// Refreshes the process list (Processes tab: ports/top CPU/top memory). This is
+    /// the most expensive part of a tick, so it only runs while that tab is focused.
+    pub fn refresh_processes(&mut self) {
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
@@ -37,8 +48,6 @@ impl SystemState {
                 // of re-reading /proc/<pid>/cmdline for every process on every tick.
                 .with_cmd(UpdateKind::OnlyIfNotSet),
         );
-        self.disks.refresh(true);
-        self.networks.refresh(true);
     }
 }
 
@@ -76,12 +85,6 @@ pub trait Monitor: Send {
     fn capacity(&self, _state: &SystemState) -> Option<f64> {
         None
     }
-    /// When true, the UI shows this metric as a compact numeric line above its group's
-    /// charts instead of its own sparkline panel — for metrics that change too slowly
-    /// for a chart to be useful (e.g. disk occupancy).
-    fn numeric_only(&self) -> bool {
-        false
-    }
 }
 
 pub fn all_monitors() -> Vec<Box<dyn Monitor>> {
@@ -107,6 +110,35 @@ pub struct TableRow {
     /// PID of the process this row represents — kept alongside the formatted cells so
     /// a frozen, fullscreened snapshot can still target the right process (e.g. kill).
     pub pid: u32,
+    /// Tree depth (0 = root / flat row for non-tree tables like Ports).
+    pub depth: usize,
+    /// Whether this row is the last child among its siblings — picks the `└─` vs `├─`
+    /// connector glyph.
+    pub is_last_sibling: bool,
+    /// One entry per ancestor level (0..depth): `true` if that ancestor was the last
+    /// child of its own siblings (draw blank space at that column), `false` if it had
+    /// a later sibling (draw a continuing `│`).
+    pub guides: Vec<bool>,
+    /// Number of direct children. 0 means this row is a leaf.
+    pub child_count: usize,
+    /// Every pid in this row's subtree (not including its own pid) — used for
+    /// cascading kill, valid even while some descendants are collapsed/hidden.
+    pub descendant_pids: Vec<u32>,
+}
+
+impl TableRow {
+    /// A flat row with no tree structure (e.g. Ports) — depth 0, no children.
+    pub fn leaf(cells: Vec<String>, pid: u32) -> Self {
+        Self {
+            cells,
+            pid,
+            depth: 0,
+            is_last_sibling: true,
+            guides: Vec::new(),
+            child_count: 0,
+            descendant_pids: Vec::new(),
+        }
+    }
 }
 
 /// One "monitorzinho" that shows a ranked snapshot list instead of a time series
@@ -118,11 +150,18 @@ pub trait TableMonitor: Send {
     /// Ranked rows, capped to `limit` entries — or every ranked entry when `None`
     /// (used for the fullscreen view, where there's room, and reason, to see it all).
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow>;
+    /// Refreshes already-fetched `rows` in place (by pid) instead of re-sampling —
+    /// called every tick for a fullscreened table instead of `sample`, so its Time/
+    /// Usage-style live values keep moving without re-ranking or reshaping the rows
+    /// out from under whatever the user is reading, searching, or has expanded. The
+    /// default no-op fits monitors with nothing that changes tick to tick (e.g. Ports).
+    fn refresh_values(&self, _state: &SystemState, _rows: &mut [TableRow]) {}
 }
 
 pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {
     vec![
         Box::new(ports::PortsMonitor),
+        Box::new(connections::ConnectionsMonitor),
         Box::new(process::TopCpuMonitor),
         Box::new(process::TopMemMonitor),
     ]

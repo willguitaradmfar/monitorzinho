@@ -77,11 +77,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     Focus::None => break,
                     _ => app.exit_focus(),
                 },
+                KeyCode::Tab if matches!(app.focus, Focus::None) => app.next_tab(),
+                KeyCode::BackTab if matches!(app.focus, Focus::None) => app.prev_tab(),
                 KeyCode::Char(c) if matches!(app.focus, Focus::None) => {
                     app.activate_shortcut(c);
                 }
                 KeyCode::Up if matches!(app.focus, Focus::Table(_)) => app.move_selection(-1),
                 KeyCode::Down if matches!(app.focus, Focus::Table(_)) => app.move_selection(1),
+                KeyCode::Right if matches!(app.focus, Focus::Table(_)) => app.expand_selected(),
+                KeyCode::Left if matches!(app.focus, Focus::Table(_)) => app.collapse_selected(),
                 KeyCode::Delete if matches!(app.focus, Focus::Table(_)) => app.kill_selected(),
                 KeyCode::Backspace if matches!(app.focus, Focus::Table(_)) => {
                     app.search_backspace();

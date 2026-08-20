@@ -60,7 +60,8 @@ fn collect_ports(paths: &[&str], want_state: &str) -> BTreeMap<u16, u64> {
 /// Maps each open socket's inode to the pid holding it open, by scanning every
 /// `/proc/<pid>/fd` for `socket:[<inode>]` symlinks. Processes we don't have
 /// permission to inspect are silently skipped — their ports just show no owner.
-fn inode_to_pid() -> HashMap<u64, u32> {
+/// Shared with `connections`, which needs the same inode→pid mapping.
+pub(super) fn inode_to_pid() -> HashMap<u64, u32> {
     let mut map = HashMap::new();
     let Ok(proc_dir) = fs::read_dir("/proc") else {
         return map;
@@ -114,10 +115,7 @@ fn sample_ports(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
                 .process(Pid::from_u32(pid))
                 .map(command_of)
                 .unwrap_or_else(|| "?".to_string());
-            TableRow {
-                cells: vec![proto.to_string(), port.to_string(), process],
-                pid,
-            }
+            TableRow::leaf(vec![proto.to_string(), port.to_string(), process], pid)
         })
         .collect()
 }

@@ -61,10 +61,6 @@ impl Monitor for DiskMonitor {
             format::human_bytes(total as f64)
         ))
     }
-
-    fn numeric_only(&self) -> bool {
-        true
-    }
 }
 
 pub struct DiskReadMonitor;
