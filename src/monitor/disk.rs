@@ -5,7 +5,7 @@ use sysinfo::Disk;
 use super::{Monitor, SystemState};
 use crate::format;
 
-fn primary_disk(state: &SystemState) -> Option<&Disk> {
+pub(super) fn primary_disk(state: &SystemState) -> Option<&Disk> {
     state
         .disks
         .list()

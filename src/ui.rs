@@ -164,9 +164,11 @@ fn render_overview_tab(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Processes tab: Ports and Connections side by side on top (both are per-socket
 /// listings, easiest to compare against each other), Top CPU and Top Memory stacked
-/// full-width below — matches `monitor::all_table_monitors()`'s order.
+/// full-width below, then SSH Sessions and System Info side by side at the bottom (who's
+/// connected next to what they're connected to) — matches
+/// `monitor::all_table_monitors()`'s order.
 fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
-    if app.table_monitors.len() < 4 {
+    if app.table_monitors.len() < 6 {
         return;
     }
 
@@ -177,14 +179,26 @@ fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
             Constraint::Fill(1),
             Constraint::Fill(1),
             Constraint::Fill(1),
+            Constraint::Fill(1),
         ])
         .split(area);
     let top_row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(rows[0]);
+    let bottom_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(rows[3]);
 
-    let panels = [top_row[0], top_row[1], rows[1], rows[2]];
+    let panels = [
+        top_row[0],
+        top_row[1],
+        rows[1],
+        rows[2],
+        bottom_row[0],
+        bottom_row[1],
+    ];
     for (i, &panel_area) in panels.iter().enumerate() {
         let monitor = app.table_monitors[i].as_ref();
         render_table_panel(
@@ -386,6 +400,15 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
             Constraint::Length(8),
             Constraint::Length(9),
             Constraint::Length(22),
+        ],
+        ["Field", "Value"] => vec![Constraint::Length(10), Constraint::Fill(1)],
+        ["User", "Host", "TTY", "Time", "Folder", "Command"] => vec![
+            Constraint::Length(10),
+            Constraint::Length(16),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
         ],
         _ => vec![
             Constraint::Fill(1),

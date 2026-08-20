@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
 
@@ -73,13 +74,18 @@ struct Timeval {
     tv_usec: i64,
 }
 
+// `bind`/`connect`/`setsockopt` take `*const c_void` here (not the specific struct
+// types below) to match their real POSIX signatures — `summary.rs` declares the same
+// symbols for its own IPv4 socket, and the two declarations must agree exactly or
+// rustc's `clashing_extern_declarations` lint (rightly) complains that one crate is
+// lying about a shared symbol's type.
 unsafe extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
-    fn bind(fd: i32, addr: *const SockaddrNl, len: u32) -> i32;
-    fn connect(fd: i32, addr: *const SockaddrNl, len: u32) -> i32;
+    fn bind(fd: i32, addr: *const c_void, len: u32) -> i32;
+    fn connect(fd: i32, addr: *const c_void, len: u32) -> i32;
     fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
     fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
-    fn setsockopt(fd: i32, level: i32, optname: i32, optval: *const Timeval, optlen: u32) -> i32;
+    fn setsockopt(fd: i32, level: i32, optname: i32, optval: *const c_void, optlen: u32) -> i32;
     fn close(fd: i32) -> i32;
 }
 
@@ -105,7 +111,7 @@ impl NlSocket {
                 fd,
                 SOL_SOCKET,
                 SO_RCVTIMEO,
-                &timeout,
+                (&timeout as *const Timeval).cast(),
                 size_of::<Timeval>() as u32,
             );
         }
@@ -115,10 +121,11 @@ impl NlSocket {
             nl_pid: 0,
             nl_groups: 0,
         };
-        if unsafe { bind(fd, &addr, size_of::<SockaddrNl>() as u32) } < 0 {
+        let addr_ptr = (&addr as *const SockaddrNl).cast();
+        if unsafe { bind(fd, addr_ptr, size_of::<SockaddrNl>() as u32) } < 0 {
             return None;
         }
-        if unsafe { connect(fd, &addr, size_of::<SockaddrNl>() as u32) } < 0 {
+        if unsafe { connect(fd, addr_ptr, size_of::<SockaddrNl>() as u32) } < 0 {
             return None;
         }
         Some(sock)

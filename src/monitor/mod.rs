@@ -8,6 +8,8 @@ pub mod memory;
 pub mod network;
 pub mod ports;
 pub mod process;
+pub mod ssh;
+pub mod summary;
 
 /// Shared, refreshed-once-per-tick system state passed to every monitor's `sample`.
 pub struct SystemState {
@@ -46,7 +48,10 @@ impl SystemState {
                 .with_cpu()
                 // A process' argv never changes, so fetch it once and cache it instead
                 // of re-reading /proc/<pid>/cmdline for every process on every tick.
-                .with_cmd(UpdateKind::OnlyIfNotSet),
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                // Unlike argv, cwd can change over a process' lifetime (e.g. a shell
+                // after `cd`), so this one's refreshed every tick.
+                .with_cwd(UpdateKind::Always),
         );
     }
 }
@@ -173,5 +178,7 @@ pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {
         Box::new(connections::ConnectionsMonitor::new()),
         Box::new(process::TopCpuMonitor),
         Box::new(process::TopMemMonitor),
+        Box::new(ssh::SshSessionsMonitor),
+        Box::new(summary::SummaryMonitor::new()),
     ]
 }
