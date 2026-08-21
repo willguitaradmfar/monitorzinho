@@ -70,11 +70,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 // query rather than leaving fullscreen outright.
                 KeyCode::Esc => match &app.focus {
                     Focus::None => break,
+                    // A detail view goes back to the table it came from, not all the
+                    // way out — that table is the thing it was opened on top of.
+                    Focus::Detail(_) => app.close_detail(),
                     Focus::Table(tf) if !tf.query.is_empty() => app.clear_search(),
                     _ => app.exit_focus(),
                 },
                 KeyCode::Char('q') if !matches!(app.focus, Focus::Table(_)) => match app.focus {
                     Focus::None => break,
+                    Focus::Detail(_) => app.close_detail(),
                     _ => app.exit_focus(),
                 },
                 KeyCode::Tab if matches!(app.focus, Focus::None) => app.next_tab(),
@@ -88,6 +92,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 KeyCode::Char(c) if matches!(app.focus, Focus::None) => {
                     app.activate_shortcut(c);
                 }
+                // Enter opens whatever the selected row's monitor can say about it;
+                // tables with no detail to give simply ignore it.
+                KeyCode::Enter if matches!(app.focus, Focus::Table(_)) => app.open_detail(),
+                KeyCode::Up if matches!(app.focus, Focus::Detail(_)) => app.scroll_detail(-1),
+                KeyCode::Down if matches!(app.focus, Focus::Detail(_)) => app.scroll_detail(1),
+                KeyCode::PageUp if matches!(app.focus, Focus::Detail(_)) => app.scroll_detail(-10),
+                KeyCode::PageDown if matches!(app.focus, Focus::Detail(_)) => app.scroll_detail(10),
                 KeyCode::Up if matches!(app.focus, Focus::Table(_)) => app.move_selection(-1),
                 KeyCode::Down if matches!(app.focus, Focus::Table(_)) => app.move_selection(1),
                 KeyCode::Right if matches!(app.focus, Focus::Table(_)) => app.expand_selected(),

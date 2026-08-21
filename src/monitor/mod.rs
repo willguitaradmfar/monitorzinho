@@ -8,6 +8,7 @@ pub mod memory;
 pub mod network;
 pub mod ports;
 pub mod process;
+pub mod resolve;
 pub mod ssh;
 pub mod summary;
 
@@ -152,6 +153,44 @@ impl TableRow {
     }
 }
 
+/// One labelled group of `field: value` lines in a detail view — e.g. everything about
+/// the owning process, kept visually apart from everything about the wire.
+pub struct DetailSection {
+    pub title: &'static str,
+    pub fields: Vec<(String, String)>,
+}
+
+impl DetailSection {
+    pub fn new(title: &'static str) -> Self {
+        Self {
+            title,
+            fields: Vec::new(),
+        }
+    }
+
+    /// Appends a field. Skips empty values outright, so a section only ever shows what
+    /// we actually managed to read — a `-` placeholder per unreadable field would
+    /// bury the ones that did resolve.
+    pub fn push(&mut self, label: &str, value: impl Into<String>) {
+        let value = value.into();
+        if !value.is_empty() {
+            self.fields.push((label.to_string(), value));
+        }
+    }
+}
+
+/// Everything the fullscreen detail view (Enter on a row) shows about one selected
+/// row. Rebuilt from scratch every tick while the view is open, so its values stay
+/// live without the view having to track what changed.
+pub struct Detail {
+    /// Headline identifying the subject, e.g. `TCP 192.168.0.10:54312 → 142.250.0.1:443`.
+    pub title: String,
+    pub sections: Vec<DetailSection>,
+    /// Current download/upload throughput in bytes/s, when the subject has one — the
+    /// app feeds these into a pair of `History`s so the view can sparkline them.
+    pub rates: Option<(f64, f64)>,
+}
+
 /// One "monitorzinho" that shows a ranked snapshot list instead of a time series
 /// (e.g. top processes). No history/persistence — it's a live snapshot.
 pub trait TableMonitor: Send {
@@ -170,6 +209,20 @@ pub trait TableMonitor: Send {
     /// compute a rate (e.g. Connections' download/upload throughput). The default
     /// no-op fits monitors with nothing that changes tick to tick.
     fn refresh_values(&mut self, _state: &SystemState, _rows: &mut [TableRow]) {}
+    /// Everything known about one selected `row`, for the fullscreen detail view
+    /// opened with Enter — called once on entry and again every tick while it's open.
+    /// `None` means either that this table has no detail view (the default, so Enter
+    /// simply does nothing on it) or that the row's subject has since disappeared, in
+    /// which case the view keeps showing its last known values, flagged as stale.
+    fn detail(&mut self, _state: &SystemState, _row: &TableRow) -> Option<Detail> {
+        None
+    }
+    /// Whether this table has a detail view at all. Only drives the fullscreen footer
+    /// hint — `detail()` is what actually decides — so a table that can't say anything
+    /// about its rows doesn't advertise an Enter that would do nothing.
+    fn has_detail(&self) -> bool {
+        false
+    }
 }
 
 pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {

@@ -8,13 +8,22 @@ use ratatui::widgets::{
     Block, Borders, Cell, Paragraph, RenderDirection, Row as UiRow, Sparkline, Table, TableState,
 };
 
-use crate::app::{App, Focus, ShortcutTarget, Tab, TableFocus};
+use crate::app::{App, DetailFocus, Focus, ShortcutTarget, Tab, TableFocus};
 use crate::format;
 use crate::history::History;
-use crate::monitor::{Monitor, TableRow};
+use crate::monitor::{Detail, Monitor, TableRow};
 
 const TAB_BAR_HEIGHT: u16 = 2;
 const COLS: usize = 3;
+/// Height of the two throughput sparklines at the top of a detail view — one line of
+/// chart between its borders, which is all a rate needs to show its shape.
+const RATE_PANEL_HEIGHT: u16 = 3;
+/// Widest a detail's label column is allowed to get before values stop being aligned
+/// against it. Sized to fit the longest label any monitor currently produces.
+const MAX_LABEL_WIDTH: usize = 26;
+/// Floor for the value column, so a very narrow terminal wraps hard instead of
+/// computing a zero-width column and looping forever.
+const MIN_VALUE_WIDTH: usize = 8;
 
 /// A muted, low-saturation palette (One Dark-inspired) instead of the harsh basic
 /// ANSI 16 colors — easier on the eyes and still clearly distinguishable per group.
@@ -101,7 +110,18 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         Focus::Table(table_focus) => {
             let monitor = app.table_monitors[table_focus.table_index].as_ref();
-            render_fullscreen_table(frame, area, monitor.title(), monitor.headers(), table_focus);
+            render_fullscreen_table(
+                frame,
+                area,
+                monitor.title(),
+                monitor.headers(),
+                monitor.has_detail(),
+                table_focus,
+            );
+            return;
+        }
+        Focus::Detail(detail_focus) => {
+            render_detail(frame, area, detail_focus);
             return;
         }
         Focus::None => {}
@@ -491,6 +511,7 @@ fn render_fullscreen_table(
     area: Rect,
     title: &str,
     headers: &[&str],
+    has_detail: bool,
     table_focus: &TableFocus,
 ) {
     let title = if table_focus.query.is_empty() {
@@ -507,7 +528,13 @@ fn render_fullscreen_table(
     } else {
         "↑/↓ ir ao próximo/anterior resultado · ←/→ colapsar/expandir · Del matar (SIGKILL, com filhos) · Esc limpar busca"
     };
-    block = block.title_bottom(hint_line(hint));
+    // Advertised only where Enter actually leads somewhere — see `TableMonitor::has_detail`.
+    let hint = if has_detail {
+        format!("Enter detalhar · {hint}")
+    } else {
+        hint.to_string()
+    };
+    block = block.title_bottom(hint_line(&hint));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -536,4 +563,189 @@ fn render_fullscreen_table(
         .highlight_symbol("▶ ");
     let mut state = TableState::default().with_selected(Some(table_focus.selected));
     frame.render_stateful_widget(table, inner, &mut state);
+}
+
+/// Greedy word wrap to `width` columns. A single token longer than the whole width (a
+/// deep path, a URL in a command line) is hard-split rather than left to overflow.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0;
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if word_len > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_len = 0;
+            }
+            let chars: Vec<char> = word.chars().collect();
+            for chunk in chars.chunks(width) {
+                lines.push(chunk.iter().collect());
+            }
+            continue;
+        }
+        // +1 for the space this word would need after an existing one.
+        if current_len + word_len + usize::from(!current.is_empty()) > width {
+            lines.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            current_len += 1;
+        }
+        current.push_str(word);
+        current_len += word_len;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Flattens a `Detail` into renderable lines: a highlighted header per section, then
+/// one `label   value` line per field with every value starting at the same column and
+/// long ones wrapped underneath it, so the whole thing reads as two columns however
+/// much any one value overruns.
+fn detail_lines(detail: &Detail, width: usize) -> Vec<Line<'static>> {
+    let label_width = detail
+        .sections
+        .iter()
+        .flat_map(|s| s.fields.iter())
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(MAX_LABEL_WIDTH);
+    // Two leading spaces of indent, two separating the columns.
+    let value_col = 2 + label_width + 2;
+    let value_width = width.saturating_sub(value_col).max(MIN_VALUE_WIDTH);
+
+    let mut lines = Vec::new();
+    for section in &detail.sections {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(
+            section.title.to_string(),
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for (label, value) in &section.fields {
+            for (i, chunk) in wrap(value, value_width).into_iter().enumerate() {
+                let head = if i == 0 {
+                    format!("  {:width$}  ", label, width = label_width)
+                } else {
+                    " ".repeat(value_col)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(head, Style::default().fg(palette::DIM)),
+                    Span::raw(chunk),
+                ]));
+            }
+        }
+    }
+    lines
+}
+
+/// One of the two throughput sparklines above a detail. Unlike the chart panels these
+/// are scaled to the window's own peak (a connection has no natural ceiling), so the
+/// shape is what to read here, not the bar height against a limit.
+fn render_rate(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: f64,
+    history: &History,
+    color: Color,
+) {
+    let title = format!(
+        " {} — {} · máx {} ",
+        label,
+        format::human_bytes_per_sec(value),
+        format::human_bytes_per_sec(history.max().unwrap_or(0.0))
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Newest-first + right-to-left, same as `render_panel`, so the live edge stays
+    // pinned to the right and the blank space sits before history began.
+    let data: Vec<u64> = history
+        .values()
+        .iter()
+        .rev()
+        .take(inner.width as usize)
+        .map(|v| v.round().max(0.0) as u64)
+        .collect();
+    frame.render_widget(
+        Sparkline::default()
+            .data(&data)
+            .direction(RenderDirection::RightToLeft)
+            .style(Style::default().fg(color)),
+        inner,
+    );
+}
+
+/// Fullscreen detail for one selected row (Enter): this single connection's throughput
+/// sparklined on top, and everything its monitor could tell us about it listed below.
+fn render_detail(frame: &mut Frame, area: Rect, focus: &DetailFocus) {
+    // Dimmed and labelled once the subject is gone, rather than emptied — the last
+    // known state of a connection that just closed is usually the interesting one.
+    let (title, color) = if focus.gone {
+        (
+            format!(" {} — encerrada ", focus.detail.title),
+            palette::DIM,
+        )
+    } else {
+        (format!(" {} ", focus.detail.title), palette::CYAN)
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title_bottom(hint_line(
+            "↑/↓ rolar · PgUp/PgDn rolar rápido · Esc voltar à lista",
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let body = match focus.detail.rates {
+        Some((down, up)) => {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(RATE_PANEL_HEIGHT), Constraint::Min(0)])
+                .split(inner);
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                .split(split[0]);
+            render_rate(
+                frame,
+                cols[0],
+                "↓ Recebendo",
+                down,
+                &focus.down,
+                palette::GREEN,
+            );
+            render_rate(frame, cols[1], "↑ Enviando", up, &focus.up, palette::BLUE);
+            split[1]
+        }
+        None => inner,
+    };
+
+    let lines = detail_lines(&focus.detail, body.width as usize);
+    // Fed back so the next keypress can't scroll past the end — see
+    // `DetailFocus::max_scroll`.
+    let max_scroll = (lines.len() as u16).saturating_sub(body.height);
+    focus.max_scroll.set(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((focus.scroll.min(max_scroll), 0)),
+        body,
+    );
 }

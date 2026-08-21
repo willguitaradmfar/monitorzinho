@@ -1,11 +1,15 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Instant;
 
+use sysinfo::Pid;
+
 use super::ports::inode_to_pid;
-use super::process::describe_owner;
-use super::{SystemState, TableMonitor, TableRow};
+use super::process::{command_of, describe_owner};
+use super::resolve::{Lookup, Resolver, Services, user_name};
+use super::{Detail, DetailSection, SystemState, TableMonitor, TableRow};
 use crate::format;
 
 const HEADERS: [&str; 6] = ["Proto", "Process", "Connection", "Age", "Traffic", "Rate"];
@@ -52,13 +56,39 @@ const INET_DIAG_INFO: u16 = 2;
 /// attached to each response — `1 << (INET_DIAG_INFO - 1)`.
 const INET_DIAG_REQ_EXT_INFO: u8 = 1 << (INET_DIAG_INFO - 1);
 
-/// Byte offsets of `tcp_info.tcpi_bytes_acked`/`tcpi_bytes_received` (both `u64`),
-/// confirmed against this system's `<linux/tcp.h>` via `offsetof`. These fields have
-/// only ever been appended to, never reordered, since Linux 4.2, so the offsets are
-/// stable across kernel versions — bounds-checked below regardless, so an ancient
-/// kernel just reports zero traffic instead of misreading unrelated bytes.
-const TCPI_BYTES_ACKED_OFFSET: usize = 120;
-const TCPI_BYTES_RECEIVED_OFFSET: usize = 128;
+/// Byte offsets of every `tcp_info` field we read, confirmed against this system's
+/// `<linux/tcp.h>` via `offsetof`. The struct has only ever been appended to, never
+/// reordered, since Linux 4.2, so these are stable across kernel versions — and every
+/// read is bounds-checked, so a kernel whose `tcp_info` stops short simply reports
+/// zero for the fields it doesn't carry instead of misreading unrelated bytes.
+mod tcpi {
+    pub const RETRANSMITS: usize = 2; // u8
+    pub const PROBES: usize = 3; // u8
+    pub const RTO: usize = 8;
+    pub const ATO: usize = 12;
+    pub const SND_MSS: usize = 16;
+    pub const RCV_MSS: usize = 20;
+    pub const LOST: usize = 32;
+    pub const RETRANS: usize = 36;
+    pub const LAST_DATA_SENT: usize = 44;
+    pub const LAST_DATA_RECV: usize = 52;
+    pub const PMTU: usize = 60;
+    pub const RTT: usize = 68;
+    pub const RTTVAR: usize = 72;
+    pub const SND_CWND: usize = 80;
+    pub const ADVMSS: usize = 84;
+    pub const TOTAL_RETRANS: usize = 100;
+    pub const PACING_RATE: usize = 104; // u64
+    pub const BYTES_ACKED: usize = 120; // u64
+    pub const BYTES_RECEIVED: usize = 128; // u64
+    pub const SEGS_OUT: usize = 136;
+    pub const SEGS_IN: usize = 140;
+    pub const NOTSENT_BYTES: usize = 144;
+    pub const MIN_RTT: usize = 148;
+    pub const DATA_SEGS_IN: usize = 152;
+    pub const DATA_SEGS_OUT: usize = 156;
+    pub const DELIVERY_RATE: usize = 160; // u64
+}
 
 #[repr(C)]
 struct SockaddrNl {
@@ -193,15 +223,189 @@ fn format_ip(family: u8, raw: &[u8]) -> String {
     }
 }
 
-struct RawConn {
-    protocol: u8,
-    local: String,
-    remote: String,
+/// The subset of `tcp_info` worth showing — cumulative counters and the current state
+/// of the sending machinery. All-zero for UDP, which carries no `tcp_info` at all, and
+/// for any field a shorter (older-kernel) payload didn't reach.
+#[derive(Default, Clone, Copy)]
+struct TcpInfo {
+    /// Consecutive retransmits of the segment currently in flight, and keepalive/zero-
+    /// window probes sent — both non-zero only while a connection is actively stuck.
+    retransmits: u8,
+    probes: u8,
+    /// Retransmission and delayed-ACK timeouts, microseconds.
+    rto: u32,
+    ato: u32,
+    /// Maximum segment size we send with / the peer sends with / we advertised.
+    snd_mss: u32,
+    rcv_mss: u32,
+    advmss: u32,
+    /// Segments the sender currently believes are lost, and retransmits outstanding
+    /// right now — as opposed to `total_retrans` over the connection's whole life.
+    lost: u32,
+    retrans: u32,
+    total_retrans: u32,
+    /// Milliseconds since we last sent / last received data. The pair reads as "which
+    /// side has gone quiet, and for how long".
+    last_data_sent: u32,
+    last_data_recv: u32,
+    /// Path MTU as discovered for this connection.
+    pmtu: u32,
+    /// Smoothed round-trip time and its variance, microseconds, plus the lowest RTT
+    /// ever measured — the floor the path is capable of, useful next to `rtt` as a
+    /// "how much of this latency is queueing" reading.
+    rtt: u32,
+    rttvar: u32,
+    min_rtt: u32,
+    /// Congestion window, in segments — multiply by `snd_mss` for the bytes we're
+    /// allowed to have in flight.
+    snd_cwnd: u32,
+    /// Bytes queued in the socket that haven't been put on the wire yet.
+    notsent_bytes: u32,
+    /// What the kernel is pacing us at, and what it measured we actually achieved —
+    /// both bytes/s, and both far more honest about a connection's ceiling than a
+    /// throughput sample taken over one tick.
+    pacing_rate: u64,
+    delivery_rate: u64,
     /// Cumulative bytes we've sent-and-had-acked / received on this socket since it
-    /// opened — 0/0 for UDP, which the kernel doesn't track this way for.
+    /// opened.
     bytes_acked: u64,
     bytes_received: u64,
+    /// Total segments in each direction, and how many of them carried payload — the
+    /// gap between the two is pure ACK/handshake overhead.
+    segs_out: u32,
+    segs_in: u32,
+    data_segs_in: u32,
+    data_segs_out: u32,
+}
+
+fn u8_at(buf: &[u8], offset: usize) -> u8 {
+    buf.get(offset).copied().unwrap_or(0)
+}
+
+fn u32_at(buf: &[u8], offset: usize) -> u32 {
+    buf.get(offset..offset + 4)
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_ne_bytes)
+        .unwrap_or(0)
+}
+
+fn u64_at(buf: &[u8], offset: usize) -> u64 {
+    buf.get(offset..offset + 8)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_ne_bytes)
+        .unwrap_or(0)
+}
+
+fn parse_tcp_info(payload: &[u8]) -> TcpInfo {
+    TcpInfo {
+        retransmits: u8_at(payload, tcpi::RETRANSMITS),
+        probes: u8_at(payload, tcpi::PROBES),
+        rto: u32_at(payload, tcpi::RTO),
+        ato: u32_at(payload, tcpi::ATO),
+        snd_mss: u32_at(payload, tcpi::SND_MSS),
+        rcv_mss: u32_at(payload, tcpi::RCV_MSS),
+        advmss: u32_at(payload, tcpi::ADVMSS),
+        lost: u32_at(payload, tcpi::LOST),
+        retrans: u32_at(payload, tcpi::RETRANS),
+        total_retrans: u32_at(payload, tcpi::TOTAL_RETRANS),
+        last_data_sent: u32_at(payload, tcpi::LAST_DATA_SENT),
+        last_data_recv: u32_at(payload, tcpi::LAST_DATA_RECV),
+        pmtu: u32_at(payload, tcpi::PMTU),
+        rtt: u32_at(payload, tcpi::RTT),
+        rttvar: u32_at(payload, tcpi::RTTVAR),
+        min_rtt: u32_at(payload, tcpi::MIN_RTT),
+        snd_cwnd: u32_at(payload, tcpi::SND_CWND),
+        notsent_bytes: u32_at(payload, tcpi::NOTSENT_BYTES),
+        pacing_rate: u64_at(payload, tcpi::PACING_RATE),
+        delivery_rate: u64_at(payload, tcpi::DELIVERY_RATE),
+        bytes_acked: u64_at(payload, tcpi::BYTES_ACKED),
+        bytes_received: u64_at(payload, tcpi::BYTES_RECEIVED),
+        segs_out: u32_at(payload, tcpi::SEGS_OUT),
+        segs_in: u32_at(payload, tcpi::SEGS_IN),
+        data_segs_in: u32_at(payload, tcpi::DATA_SEGS_IN),
+        data_segs_out: u32_at(payload, tcpi::DATA_SEGS_OUT),
+    }
+}
+
+struct RawConn {
+    protocol: u8,
+    family: u8,
+    /// `enum tcp_state` of the socket, straight from `inet_diag_msg.idiag_state`.
+    state: u8,
+    /// Which kernel timer (if any) is armed on this socket, and how long until it
+    /// fires — see `timer_name`. Zero means no timer, i.e. nothing pending.
+    timer: u8,
+    expires_ms: u32,
+    local_ip: String,
+    local_port: u16,
+    remote_ip: String,
+    remote_port: u16,
+    /// Bytes sitting in the receive/send socket buffers right now — data the
+    /// application hasn't read yet, and data we haven't managed to send yet. Unlike
+    /// `TcpInfo`, these come from `inet_diag_msg` itself, so they're just as valid for
+    /// a UDP socket.
+    rqueue: u32,
+    wqueue: u32,
+    uid: u32,
     inode: u32,
+    info: TcpInfo,
+}
+
+impl RawConn {
+    fn local(&self) -> String {
+        endpoint(&self.local_ip, self.local_port)
+    }
+
+    fn remote(&self) -> String {
+        endpoint(&self.remote_ip, self.remote_port)
+    }
+
+    /// Lifetime bytes in both directions. Always 0 for UDP.
+    fn total_bytes(&self) -> u64 {
+        self.info.bytes_acked + self.info.bytes_received
+    }
+}
+
+/// `ip:port`, bracketing an IPv6 address so its own colons stay visually separate from
+/// the one before the port.
+fn endpoint(ip: &str, port: u16) -> String {
+    if ip.contains(':') {
+        format!("[{ip}]:{port}")
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+/// `enum tcp_state` names, indexed by `idiag_state`. UDP sockets reuse the same enum,
+/// so a connected UDP socket reads as ESTABLISHED here too.
+fn state_name(state: u8) -> &'static str {
+    match state {
+        1 => "ESTABLISHED",
+        2 => "SYN_SENT",
+        3 => "SYN_RECV",
+        4 => "FIN_WAIT1",
+        5 => "FIN_WAIT2",
+        6 => "TIME_WAIT",
+        7 => "CLOSE",
+        8 => "CLOSE_WAIT",
+        9 => "LAST_ACK",
+        10 => "LISTEN",
+        11 => "CLOSING",
+        _ => "?",
+    }
+}
+
+/// `idiag_timer` values, per `inet_diag.h` — which clock is currently running against
+/// the socket. Anything but "none" on a connection that looks idle is the interesting
+/// case: a retransmit timer means we're waiting on an ACK that isn't coming.
+fn timer_name(timer: u8) -> Option<&'static str> {
+    match timer {
+        1 => Some("retransmissão"),
+        2 => Some("keepalive"),
+        3 => Some("timewait"),
+        4 => Some("janela zero"),
+        _ => None,
+    }
 }
 
 /// Parses every complete netlink message in one `recv()`'s worth of `data` (a dump
@@ -227,10 +431,15 @@ fn parse_dump(data: &[u8], protocol: u8, out: &mut Vec<RawConn>) -> bool {
             let remote_port = u16::from_be_bytes(sockid[2..4].try_into().unwrap());
             let local_ip = format_ip(family, &sockid[4..20]);
             let remote_ip = format_ip(family, &sockid[20..36]);
+            // The tail of the fixed inet_diag_msg, after the 48-byte sockid:
+            // idiag_expires, idiag_rqueue, idiag_wqueue, idiag_uid, idiag_inode.
+            let expires_ms = u32::from_ne_bytes(msg[52..56].try_into().unwrap());
+            let rqueue = u32::from_ne_bytes(msg[56..60].try_into().unwrap());
+            let wqueue = u32::from_ne_bytes(msg[60..64].try_into().unwrap());
+            let uid = u32::from_ne_bytes(msg[64..68].try_into().unwrap());
             let inode = u32::from_ne_bytes(msg[68..72].try_into().unwrap());
 
-            let mut bytes_acked = 0u64;
-            let mut bytes_received = 0u64;
+            let mut info = TcpInfo::default();
             let mut apos = 72; // rtattrs start right after the fixed inet_diag_msg
             while apos + 4 <= msg.len() {
                 let rta_len = u16::from_ne_bytes(msg[apos..apos + 2].try_into().unwrap()) as usize;
@@ -239,30 +448,26 @@ fn parse_dump(data: &[u8], protocol: u8, out: &mut Vec<RawConn>) -> bool {
                     break;
                 }
                 if rta_type == INET_DIAG_INFO {
-                    let payload = &msg[apos + 4..apos + rta_len];
-                    if payload.len() >= TCPI_BYTES_RECEIVED_OFFSET + 8 {
-                        bytes_acked = u64::from_ne_bytes(
-                            payload[TCPI_BYTES_ACKED_OFFSET..TCPI_BYTES_ACKED_OFFSET + 8]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        bytes_received = u64::from_ne_bytes(
-                            payload[TCPI_BYTES_RECEIVED_OFFSET..TCPI_BYTES_RECEIVED_OFFSET + 8]
-                                .try_into()
-                                .unwrap(),
-                        );
-                    }
+                    info = parse_tcp_info(&msg[apos + 4..apos + rta_len]);
                 }
                 apos += align4(rta_len);
             }
 
             out.push(RawConn {
                 protocol,
-                local: format!("{}:{}", local_ip, local_port),
-                remote: format!("{}:{}", remote_ip, remote_port),
-                bytes_acked,
-                bytes_received,
+                family,
+                state: msg[1], // inet_diag_msg.idiag_state
+                timer: msg[2], // .idiag_timer
+                expires_ms,
+                local_ip,
+                local_port,
+                remote_ip,
+                remote_port,
+                rqueue,
+                wqueue,
+                uid,
                 inode,
+                info,
             });
         }
         pos += align4(nlmsg_len);
@@ -317,12 +522,20 @@ pub struct ConnectionsMonitor {
     /// throughput. Rebuilt every sample so a closed connection's entry just drops out
     /// instead of accumulating forever.
     history: HashMap<String, (u64, u64, Instant)>,
+    /// Reverse DNS for the detail view only — the table itself never resolves, since
+    /// a hundred rows would mean a hundred lookups a tick for names nobody's reading.
+    resolver: Resolver,
+    /// `/etc/services`, read once at startup: it doesn't change while we're running,
+    /// and re-reading it per detail redraw would be pointless I/O.
+    services: Services,
 }
 
 impl ConnectionsMonitor {
     pub fn new() -> Self {
         Self {
             history: HashMap::new(),
+            resolver: Resolver::new(),
+            services: Services::load(),
         }
     }
 
@@ -338,29 +551,203 @@ impl ConnectionsMonitor {
         let mut next_history = HashMap::with_capacity(raw.len());
         let mut snapshot = HashMap::with_capacity(raw.len());
         for c in raw {
-            let key = conn_key(c.protocol, &c.local, &c.remote);
+            let key = conn_key(c.protocol, &c.local(), &c.remote());
             let (down, up) = match self.history.get(&key) {
                 Some(&(prev_acked, prev_received, prev_time)) => {
                     let dt = now.duration_since(prev_time).as_secs_f64().max(0.001);
                     (
-                        c.bytes_received.saturating_sub(prev_received) as f64 / dt,
-                        c.bytes_acked.saturating_sub(prev_acked) as f64 / dt,
+                        c.info.bytes_received.saturating_sub(prev_received) as f64 / dt,
+                        c.info.bytes_acked.saturating_sub(prev_acked) as f64 / dt,
                     )
                 }
                 // First time we've seen it — no prior sample to diff against yet.
                 None => (0.0, 0.0),
             };
-            next_history.insert(key.clone(), (c.bytes_acked, c.bytes_received, now));
+            next_history.insert(
+                key.clone(),
+                (c.info.bytes_acked, c.info.bytes_received, now),
+            );
             snapshot.insert(key, (c, down, up));
         }
         self.history = next_history;
         snapshot
+    }
+
+    /// Assembles the fullscreen detail for one connection: who it is, who owns it,
+    /// what it has moved, and how the path underneath is behaving. Everything here
+    /// comes from the netlink dump we already take every tick plus `/proc` — no
+    /// packet capture, so it can say who is talking and how well, but not what about.
+    fn build_detail(
+        &mut self,
+        state: &SystemState,
+        c: &RawConn,
+        down: f64,
+        up: f64,
+        pid: u32,
+    ) -> Detail {
+        let is_tcp = c.protocol == IPPROTO_TCP;
+        let proto = if is_tcp { "TCP" } else { "UDP" };
+        // Resolved first: it's the one field needing `&mut self`, and everything below
+        // borrows `self` immutably to look up service names.
+        let host = match self.resolver.reverse(&c.remote_ip) {
+            Lookup::Name(name) => name,
+            Lookup::Pending => "resolvendo…".to_string(),
+            Lookup::Unnamed => String::new(),
+        };
+
+        let mut conn = DetailSection::new("Conexão");
+        conn.push("Estado", state_name(c.state));
+        conn.push(
+            "Protocolo",
+            format!(
+                "{proto} · {}",
+                if c.family == AF_INET { "IPv4" } else { "IPv6" }
+            ),
+        );
+        conn.push("Local", self.with_service(c, c.local_port, c.local()));
+        conn.push("Remoto", self.with_service(c, c.remote_port, c.remote()));
+        conn.push("Host remoto", host);
+        if let Some(timer) = timer_name(c.timer) {
+            conn.push(
+                "Timer armado",
+                format!("{timer} · dispara em {}", millis_since(c.expires_ms)),
+            );
+        }
+        conn.push(
+            "Dono do socket",
+            match user_name(c.uid) {
+                Some(name) => format!("{name} (uid {})", c.uid),
+                None => format!("uid {}", c.uid),
+            },
+        );
+
+        let mut owner = DetailSection::new("Processo");
+        match state.sys.process(Pid::from_u32(pid)) {
+            Some(p) => {
+                owner.push("PID", pid.to_string());
+                owner.push("Ativo há", format::human_duration(p.run_time()));
+                // `exe` isn't in the refresh kind the Processes tab asks sysinfo for —
+                // reading the one link here is far cheaper than making every process
+                // pay for it on every tick.
+                if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
+                    owner.push("Executável", exe.to_string_lossy());
+                }
+                if let Some(cwd) = p.cwd() {
+                    owner.push("Diretório", cwd.to_string_lossy());
+                }
+                owner.push("Linha de comando", command_of(p));
+            }
+            // Same best-effort limit as the Ports panel: resolving a socket to a pid
+            // means reading every /proc/<pid>/fd, and other users' are off limits.
+            None => owner.push(
+                "PID",
+                "não identificado — socket de outro usuário, ou processo já encerrado",
+            ),
+        }
+
+        let mut traffic = DetailSection::new("Tráfego");
+        if is_tcp {
+            traffic.push("Taxa atual", format_rate(down, up));
+            traffic.push(
+                "Recebido",
+                format::human_bytes(c.info.bytes_received as f64),
+            );
+            traffic.push("Enviado", format::human_bytes(c.info.bytes_acked as f64));
+            traffic.push(
+                "Segmentos",
+                format!(
+                    "{} recebidos · {} enviados",
+                    c.info.segs_in, c.info.segs_out
+                ),
+            );
+            traffic.push(
+                "Destes, com dados",
+                format!(
+                    "{} recebidos · {} enviados",
+                    c.info.data_segs_in, c.info.data_segs_out
+                ),
+            );
+            traffic.push("Último recebimento", millis_since(c.info.last_data_recv));
+            traffic.push("Último envio", millis_since(c.info.last_data_sent));
+        } else {
+            traffic.push(
+                "Contadores",
+                "o kernel não conta bytes por socket UDP — só as filas abaixo",
+            );
+        }
+        // From inet_diag_msg rather than tcp_info, so these are just as real for UDP:
+        // what the application hasn't read yet, and what we haven't put on the wire.
+        traffic.push(
+            "Fila de recepção",
+            format!(
+                "{} esperando o processo ler",
+                format::human_bytes(c.rqueue as f64)
+            ),
+        );
+        traffic.push(
+            "Fila de envio",
+            format!("{} esperando a rede", format::human_bytes(c.wqueue as f64)),
+        );
+        if is_tcp && c.info.notsent_bytes > 0 {
+            traffic.push(
+                "Sem sair do socket",
+                format::human_bytes(c.info.notsent_bytes as f64),
+            );
+        }
+
+        let mut sections = vec![conn, owner, traffic];
+        if is_tcp {
+            sections.push(path_section(&c.info));
+        }
+
+        Detail {
+            title: format!("{proto} {} → {}", c.local(), c.remote()),
+            sections,
+            // A flat zero line would be worse than no sparkline at all, and UDP never
+            // reports bytes.
+            rates: is_tcp.then_some((down, up)),
+        }
+    }
+
+    /// `1.2.3.4:443 (https)` when the port is a registered service, plain otherwise —
+    /// which is the normal case for the ephemeral local port of an outgoing connection.
+    fn with_service(&self, c: &RawConn, port: u16, endpoint: String) -> String {
+        match self.services.name(c.protocol == IPPROTO_TCP, port) {
+            Some(svc) => format!("{endpoint} ({svc})"),
+            None => endpoint,
+        }
     }
 }
 
 impl Default for ConnectionsMonitor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A microsecond duration in whichever unit reads best — `tcp_info` reports RTT/RTO/ATO
+/// in microseconds, and they span tens of µs on loopback to whole seconds on a stalled
+/// path. Empty for zero, so an inapplicable timer is dropped from its section rather
+/// than shown as a meaningless "0 µs".
+fn micros(us: u32) -> String {
+    if us == 0 {
+        String::new()
+    } else if us < 1_000 {
+        format!("{us} µs")
+    } else if us < 1_000_000 {
+        format!("{:.1} ms", us as f64 / 1_000.0)
+    } else {
+        format!("{:.2} s", us as f64 / 1_000_000.0)
+    }
+}
+
+/// A millisecond "time since" counter — `tcp_info`'s idle clocks, which run from
+/// milliseconds on a busy connection to hours on one nobody's touched.
+fn millis_since(ms: u32) -> String {
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else {
+        format::human_duration(ms as u64 / 1_000)
     }
 }
 
@@ -384,15 +771,81 @@ fn build_row(
         vec![
             proto.to_string(),
             process,
-            format!("{} → {}", c.local, c.remote),
+            format!("{} → {}", c.local(), c.remote()),
             age,
-            format::human_bytes((c.bytes_acked + c.bytes_received) as f64),
+            format::human_bytes(c.total_bytes() as f64),
             format_rate(down, up),
         ],
         pid,
     );
-    row.key = conn_key(c.protocol, &c.local, &c.remote);
+    row.key = conn_key(c.protocol, &c.local(), &c.remote());
     row
+}
+
+/// How the path underneath the connection is behaving: latency, loss, and how much the
+/// sender is currently allowed (and able) to push. TCP only — none of it exists for a
+/// UDP socket.
+fn path_section(info: &TcpInfo) -> DetailSection {
+    let mut path = DetailSection::new("Caminho");
+    if info.rtt > 0 {
+        path.push(
+            "RTT",
+            format!("{} ± {}", micros(info.rtt), micros(info.rttvar)),
+        );
+    }
+    // Well above `rtt` means the difference is queueing somewhere on the path, not
+    // distance — the single most useful comparison in this section.
+    path.push("RTT mínimo", micros(info.min_rtt));
+    path.push(
+        "Retransmissões",
+        format!(
+            "{} no total · {} pendentes · {} tidos como perdidos",
+            info.total_retrans, info.retrans, info.lost
+        ),
+    );
+    if info.retransmits > 0 || info.probes > 0 {
+        path.push(
+            "Insistindo agora",
+            format!(
+                "{} retransmissões seguidas · {} sondagens",
+                info.retransmits, info.probes
+            ),
+        );
+    }
+    if info.snd_cwnd > 0 {
+        path.push(
+            "Janela de congestão",
+            format!(
+                "{} segmentos (~{} em voo)",
+                info.snd_cwnd,
+                format::human_bytes((info.snd_cwnd as u64 * info.snd_mss as u64) as f64)
+            ),
+        );
+    }
+    path.push(
+        "MSS",
+        format!(
+            "{} envio · {} recepção · {} anunciado",
+            info.snd_mss, info.rcv_mss, info.advmss
+        ),
+    );
+    if info.pmtu > 0 {
+        path.push("PMTU", format!("{} bytes", info.pmtu));
+    }
+    path.push(
+        "Ritmo permitido",
+        format::human_bytes_per_sec(info.pacing_rate as f64),
+    );
+    // What the connection actually achieved when it last had something to send —
+    // unlike the tick-to-tick rate above, an idle connection keeps reporting the last
+    // real measurement instead of falling to zero.
+    path.push(
+        "Entrega medida",
+        format::human_bytes_per_sec(info.delivery_rate as f64),
+    );
+    path.push("Timeout de retransmissão", micros(info.rto));
+    path.push("ACK atrasado", micros(info.ato));
+    path
 }
 
 impl TableMonitor for ConnectionsMonitor {
@@ -440,11 +893,25 @@ impl TableMonitor for ConnectionsMonitor {
                 *cell = age;
             }
             if let Some(cell) = row.cells.get_mut(4) {
-                *cell = format::human_bytes((c.bytes_acked + c.bytes_received) as f64);
+                *cell = format::human_bytes(c.total_bytes() as f64);
             }
             if let Some(cell) = row.cells.get_mut(5) {
                 *cell = format_rate(*down, *up);
             }
         }
+    }
+
+    fn has_detail(&self) -> bool {
+        true
+    }
+
+    fn detail(&mut self, state: &SystemState, row: &TableRow) -> Option<Detail> {
+        let snapshot = self.refresh_snapshot();
+        // Gone from the dump means the connection closed — the caller keeps the last
+        // detail it got and flags it, rather than the view blanking out.
+        let (c, down, up) = snapshot.get(&row.key)?;
+        let (down, up) = (*down, *up);
+        let pid = inode_to_pid().get(&(c.inode as u64)).copied().unwrap_or(0);
+        Some(self.build_detail(state, c, down, up, pid))
     }
 }

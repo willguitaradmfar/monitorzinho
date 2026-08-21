@@ -1,9 +1,10 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 
 use sysinfo::{Pid, Signal};
 
 use crate::history::{self, CAPACITY, History};
-use crate::monitor::{self, Monitor, SystemState, TableMonitor, TableRow};
+use crate::monitor::{self, Detail, Monitor, SystemState, TableMonitor, TableRow};
 
 /// The two top-level views. Each is sampled only while it's the active tab — see
 /// `App::tick` — so switching away from one stops spending resources on it.
@@ -189,10 +190,47 @@ impl TableFocus {
     }
 }
 
+/// One row of a table, opened with Enter for everything its monitor knows about it —
+/// the "wireshark-ish" view of a connection, minus the packets. Unlike `TableFocus`,
+/// nothing here is frozen: the whole `detail` is rebuilt every tick so its values stay
+/// live, which is the entire point of opening it.
+pub struct DetailFocus {
+    pub table_index: usize,
+    /// The row the detail is about. Its `key` is what each tick re-queries, so this is
+    /// kept rather than an index — the underlying table is free to reshape meanwhile.
+    pub row: TableRow,
+    pub detail: Detail,
+    /// Set once the subject stops showing up in fresh samples (connection closed,
+    /// process exited). The last known values stay on screen, flagged as stale —
+    /// blanking the view at the exact moment something disappears would throw away
+    /// what the user most likely opened it to see.
+    pub gone: bool,
+    /// Per-connection throughput, so the detail can sparkline just this one socket
+    /// instead of the whole interface. Starts empty on entry — unlike the chart
+    /// panels, there's no history to restore for a connection we've never seen.
+    pub down: History,
+    pub up: History,
+    /// How far the field list is scrolled, in lines — a detail runs longer than a
+    /// terminal on any real connection.
+    pub scroll: u16,
+    /// Largest offset `scroll` can usefully take: content height minus what fits on
+    /// screen. Only the renderer knows either number, so it writes this back each
+    /// frame and `App::scroll_detail` clamps against the last one it saw — a single
+    /// frame of lag, invisible in practice, and much better than letting `scroll` run
+    /// off past the end where several keypresses do nothing.
+    pub max_scroll: Cell<u16>,
+    /// The table view this was opened from, put back intact on Esc: same selection,
+    /// same query, same expanded nodes.
+    pub parent: TableFocus,
+}
+
 pub enum Focus {
     None,
     Chart(usize),
     Table(TableFocus),
+    /// Boxed because a `DetailFocus` carries the whole `TableFocus` it came from, and
+    /// every `Focus` value would otherwise be that big.
+    Detail(Box<DetailFocus>),
 }
 
 pub struct App {
@@ -300,12 +338,30 @@ impl App {
                 // (e.g. CPU%/memory) still refresh in place every tick.
                 let frozen_idx = match &self.focus {
                     Focus::Table(tf) => Some(tf.table_index),
+                    // A detail view's table is frozen too — it's still there behind it,
+                    // waiting to be restored exactly as it was left.
+                    Focus::Detail(df) => Some(df.table_index),
                     _ => None,
                 };
                 if let Some(idx) = frozen_idx {
                     let monitor = self.table_monitors[idx].as_mut();
-                    if let Focus::Table(tf) = &mut self.focus {
-                        monitor.refresh_values(&self.state, &mut tf.rows);
+                    match &mut self.focus {
+                        Focus::Table(tf) => monitor.refresh_values(&self.state, &mut tf.rows),
+                        // Rebuilt rather than patched in place: a detail is a few dozen
+                        // formatted strings, cheap enough that tracking which of them
+                        // changed would cost more than just building them again.
+                        Focus::Detail(df) => match monitor.detail(&self.state, &df.row) {
+                            Some(detail) => {
+                                if let Some((down, up)) = detail.rates {
+                                    df.down.push(down);
+                                    df.up.push(up);
+                                }
+                                df.detail = detail;
+                                df.gone = false;
+                            }
+                            None => df.gone = true,
+                        },
+                        _ => {}
                     }
                 }
                 for (i, (monitor, rows)) in self
@@ -395,6 +451,64 @@ impl App {
 
     pub fn exit_focus(&mut self) {
         self.focus = Focus::None;
+    }
+
+    /// Opens the detail view for the selected row (Enter). No-op outside a fullscreen
+    /// table, on an empty selection, or on a table whose monitor has no detail to give
+    /// — `TableMonitor::detail` returning `None` is how a table opts out.
+    pub fn open_detail(&mut self) {
+        let Focus::Table(tf) = &self.focus else {
+            return;
+        };
+        let Some(&row_idx) = tf.visible_indices().get(tf.selected) else {
+            return;
+        };
+        let (table_index, row) = (tf.table_index, tf.rows[row_idx].clone());
+
+        let monitor = self.table_monitors[table_index].as_mut();
+        let Some(detail) = monitor.detail(&self.state, &row) else {
+            return;
+        };
+
+        let mut down = History::new(CAPACITY);
+        let mut up = History::new(CAPACITY);
+        if let Some((d, u)) = detail.rates {
+            down.push(d);
+            up.push(u);
+        }
+        // Only now that we know there's a detail to show does the table get taken —
+        // bailing out above must leave the focus untouched.
+        let Focus::Table(parent) = std::mem::replace(&mut self.focus, Focus::None) else {
+            return;
+        };
+        self.focus = Focus::Detail(Box::new(DetailFocus {
+            table_index,
+            row,
+            detail,
+            gone: false,
+            down,
+            up,
+            scroll: 0,
+            max_scroll: Cell::new(0),
+            parent,
+        }));
+    }
+
+    /// Returns from a detail view to the table it was opened from, exactly as it was
+    /// left (Esc/q). No-op outside `Focus::Detail`.
+    pub fn close_detail(&mut self) {
+        if let Focus::Detail(df) = std::mem::replace(&mut self.focus, Focus::None) {
+            self.focus = Focus::Table(df.parent);
+        }
+    }
+
+    /// Scrolls the detail's field list by `delta` lines, clamped to what's actually
+    /// scrollable (see `DetailFocus::max_scroll`). No-op outside `Focus::Detail`.
+    pub fn scroll_detail(&mut self, delta: i32) {
+        if let Focus::Detail(df) = &mut self.focus {
+            let limit = df.max_scroll.get() as i32;
+            df.scroll = (df.scroll as i32 + delta).clamp(0, limit) as u16;
+        }
     }
 
     /// Moves the selection by `delta`, wrapping around. While searching, this instead
