@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
+use sysinfo::Pid;
+
 use super::process::describe_owner;
 use super::{SystemState, TableMonitor, TableRow};
 
@@ -90,7 +92,9 @@ pub(super) fn inode_to_pid() -> HashMap<u64, u32> {
     map
 }
 
-/// TCP and UDP listening ports in one list, sorted by port (ties keep TCP before UDP).
+/// TCP and UDP listening ports in one list, newest first (owning process' run time
+/// ascending — a port whose owner we can't resolve sinks to the bottom, since we have
+/// no age to rank it by). Ties keep TCP before UDP.
 fn sample_ports(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
     let owners = inode_to_pid();
     let mut rows: Vec<(&'static str, u16, u32)> = Vec::new();
@@ -103,7 +107,14 @@ fn sample_ports(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
             rows.push((proto, port, pid));
         }
     }
-    rows.sort_by_key(|&(_, port, _)| port);
+    rows.sort_by_key(|&(_, port, pid)| {
+        let age = state
+            .sys
+            .process(Pid::from_u32(pid))
+            .map(|p| p.run_time())
+            .unwrap_or(u64::MAX);
+        (age, port)
+    });
 
     rows.into_iter()
         .take(limit.unwrap_or(usize::MAX))
