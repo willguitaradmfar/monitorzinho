@@ -1,31 +1,45 @@
-use std::cell::Cell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::thread;
+use std::time::Duration;
 
 use sysinfo::{Pid, Signal};
 
 use crate::history::{self, CAPACITY, History};
 use crate::monitor::{self, Detail, Monitor, SystemState, TableMonitor, TableRow};
+use crate::tools::persist::ExecutionSpec;
+use crate::tools::{self, Execution, ParamKind, ParamSpec, Tool};
 
-/// The two top-level views. Each is sampled only while it's the active tab — see
+/// The top-level views. Each is sampled only while it's the active tab — see
 /// `App::tick` — so switching away from one stops spending resources on it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Overview,
     Processes,
+    /// Unlike the other two this one doesn't watch anything: it lists the tool
+    /// executions the user has started, which keep running regardless of which tab is
+    /// on screen.
+    Tools,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 2] = [Tab::Overview, Tab::Processes];
+    pub const ALL: [Tab; 3] = [Tab::Overview, Tab::Processes, Tab::Tools];
 
     pub fn title(&self) -> &'static str {
         match self {
             Tab::Overview => "Visão Geral",
             Tab::Processes => "Processos",
+            Tab::Tools => "Ferramentas",
         }
     }
 }
 
 const SAVE_EVERY_N_TICKS: u32 = 5;
+
+/// How long a restart waits between stopping an execution and starting its replacement.
+/// Comfortably longer than a tool's socket poll interval, so the old listener has
+/// actually released the port by the time the new one asks for it.
+const RESTART_GRACE: Duration = Duration::from_millis(300);
 
 /// a-z minus 'q' (always quits/exits) and 'x' (left free in case it's ever needed
 /// again — a fullscreened table's search box swallows every other letter it's given).
@@ -224,6 +238,193 @@ pub struct DetailFocus {
     pub parent: TableFocus,
 }
 
+/// The executions started from the Ferramentas tab, and which one is selected on it.
+/// Selection lives here rather than in `Focus` because that screen isn't a fullscreen
+/// mode — it *is* the tab.
+pub struct ToolsState {
+    pub executions: Vec<Execution>,
+    pub selected: usize,
+    /// Monotonic, never reused — an execution's id is what the monitor view holds onto,
+    /// so recycling one would silently point it at a different execution.
+    next_id: u64,
+}
+
+impl ToolsState {
+    fn new() -> Self {
+        Self {
+            executions: Vec::new(),
+            selected: 0,
+            next_id: 0,
+        }
+    }
+
+    fn take_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    pub fn selected(&self) -> Option<&Execution> {
+        self.executions.get(self.selected)
+    }
+
+    pub fn by_id(&self, id: u64) -> Option<&Execution> {
+        self.executions.iter().find(|e| e.id == id)
+    }
+
+    /// Runs `tool` with `values`, returning the execution either way: one that failed
+    /// to start is kept, carrying its error, rather than vanishing.
+    fn launch(&mut self, tool: &dyn Tool, values: HashMap<&'static str, String>) -> Execution {
+        let id = self.take_id();
+        let spec = ExecutionSpec {
+            tool: tool.id().to_string(),
+            params: values
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone()))
+                .collect(),
+        };
+        match tool.start(id, &values) {
+            Ok(execution) => execution,
+            Err(error) => Execution::failed(id, tool.name(), tool.summarize(&values), error),
+        }
+        .with_spec(spec)
+    }
+
+    /// Writes the current list of executions to disk. Called on every change rather
+    /// than on a timer, so a crash can't lose one that was added seconds earlier.
+    fn persist(&self) {
+        let specs: Vec<ExecutionSpec> = self
+            .executions
+            .iter()
+            .filter_map(|execution| execution.spec().cloned())
+            .collect();
+        tools::persist::save(&specs);
+    }
+}
+
+/// Rebuilds a saved execution's parameters against the tool's *current* declaration:
+/// a parameter added since the file was written gets its default, and one that no
+/// longer exists is dropped. That way an upgrade never rejects an old config outright.
+fn restore_params(tool: &dyn Tool, saved: &ExecutionSpec) -> HashMap<&'static str, String> {
+    tool.params()
+        .into_iter()
+        .map(|spec| {
+            let value = saved
+                .params
+                .get(spec.key)
+                .cloned()
+                .unwrap_or_else(|| spec.default.to_string());
+            (spec.key, value)
+        })
+        .collect()
+}
+
+/// Which step of adding an execution the user is on. Deliberately linear — pick a
+/// tool, fill in what it needs, look at it once before anything starts listening.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WizardStep {
+    SelectTool,
+    Params,
+    Confirm,
+}
+
+/// One parameter being filled in, i.e. its spec plus what's been typed so far.
+pub struct ParamField {
+    pub spec: ParamSpec,
+    pub value: String,
+}
+
+impl ParamField {
+    /// Moves a `Choice` field to the next/previous option, wrapping. No-op on a text
+    /// field, which is edited by typing instead.
+    fn cycle(&mut self, delta: i32) {
+        let ParamKind::Choice(options) = self.spec.kind else {
+            return;
+        };
+        let current = options.iter().position(|o| *o == self.value).unwrap_or(0);
+        let len = options.len() as i32;
+        let next = (current as i32 + delta).rem_euclid(len) as usize;
+        self.value = options[next].to_string();
+    }
+}
+
+/// The add-an-execution wizard.
+pub struct ToolWizard {
+    pub step: WizardStep,
+    /// Index into `App::tools_available`.
+    pub tool: usize,
+    pub fields: Vec<ParamField>,
+    /// Which field is focused during `Params`.
+    pub field: usize,
+    /// Why the last attempt to start failed — shown in place until the user changes
+    /// something. `Tool::start` does the validating, so this is whatever it said.
+    pub error: Option<String>,
+}
+
+/// How many lines of context are kept above a match when jumping to it, so a hit never
+/// lands flush against the top border with nothing before it.
+pub const MATCH_CONTEXT: u16 = 2;
+
+/// The live log of one execution, opened with Enter from the Ferramentas tab.
+///
+/// Events are shown newest-first, so the live edge is the top of the screen and new
+/// traffic pushes older lines downward. Several fields are `Cell`s written by the
+/// renderer: it's the only place that knows how many lines the log currently occupies,
+/// which of them match, and how tall the viewport is.
+pub struct ToolMonitorFocus {
+    /// Held by id, not index: the list can be reordered or shortened underneath.
+    pub execution_id: u64,
+    /// Free-text search, typed directly like the tables'. Matching text is highlighted
+    /// wherever it appears rather than the non-matching lines being hidden — in a relay
+    /// log the lines *around* a hit are usually the point.
+    pub query: String,
+    /// Show only lines that match, instead of highlighting in place.
+    pub only_matches: bool,
+    /// Render payloads as hex + ASCII rather than text. Off by default, since most of
+    /// what a tunnel carries while debugging is text.
+    pub hex: bool,
+    pub scroll: Cell<u16>,
+    /// Whether the view is pinned to the newest event — which, newest-first, means
+    /// simply sitting at the top. Scrolling down into history releases it; End re-pins.
+    pub follow: bool,
+    pub max_scroll: Cell<u16>,
+    /// Line indices of the current search's hits, ascending, as of the last frame.
+    pub matches: RefCell<Vec<u16>>,
+    /// Which of `matches` the view is parked on. `None` means the search hasn't been
+    /// navigated yet, which the renderer takes as "jump to the first hit".
+    pub match_index: Cell<Option<usize>>,
+    /// Sequence number of the newest event at the last frame — see `Event::seq`.
+    pub anchor_seq: Cell<u64>,
+}
+
+impl ToolMonitorFocus {
+    /// Moves to the next (`delta > 0`, further down the screen and so further back in
+    /// time) or previous hit, wrapping at either end. No-op with nothing to jump to.
+    fn jump_match(&mut self, delta: i32) {
+        let matches = self.matches.borrow();
+        if matches.is_empty() {
+            return;
+        }
+        let len = matches.len() as i32;
+        let next = match self.match_index.get() {
+            Some(current) => (current as i32 + delta).rem_euclid(len) as usize,
+            // A first press with no current hit lands on the nearest one in that
+            // direction rather than doing nothing.
+            None if delta >= 0 => 0,
+            None => (len - 1) as usize,
+        };
+        self.match_index.set(Some(next));
+        let target = matches[next].saturating_sub(MATCH_CONTEXT);
+        self.scroll.set(target.min(self.max_scroll.get()));
+        self.follow = false;
+    }
+
+    /// Forgets where the search was, so the next frame re-anchors on the first hit.
+    /// Called whenever the query text changes.
+    fn reset_search(&mut self) {
+        self.match_index.set(None);
+    }
+}
+
 pub enum Focus {
     None,
     Chart(usize),
@@ -231,6 +432,8 @@ pub enum Focus {
     /// Boxed because a `DetailFocus` carries the whole `TableFocus` it came from, and
     /// every `Focus` value would otherwise be that big.
     Detail(Box<DetailFocus>),
+    Wizard(ToolWizard),
+    ToolMonitor(ToolMonitorFocus),
 }
 
 pub struct App {
@@ -240,6 +443,8 @@ pub struct App {
     pub capacities: Vec<Option<f64>>,
     pub table_monitors: Vec<Box<dyn TableMonitor>>,
     pub table_rows: Vec<Vec<TableRow>>,
+    pub tools_available: Vec<Box<dyn Tool>>,
+    pub tools: ToolsState,
     pub focus: Focus,
     pub tab: Tab,
     state: SystemState,
@@ -263,6 +468,22 @@ impl App {
         let table_monitors = monitor::all_table_monitors();
         let table_rows = table_monitors.iter().map(|_| Vec::new()).collect();
 
+        // Executions come back up before the first frame: whatever was listening when
+        // the app was last closed is listening again by the time the user sees the tab.
+        let tools_available = tools::all_tools();
+        let mut tools = ToolsState::new();
+        for saved in tools::persist::load() {
+            // A tool that no longer exists in this build is skipped, but its entry is
+            // left in the file — downgrading and re-running shouldn't have silently
+            // thrown the configuration away.
+            let Some(tool) = tools_available.iter().find(|t| t.id() == saved.tool) else {
+                continue;
+            };
+            let values = restore_params(tool.as_ref(), &saved);
+            let execution = tools.launch(tool.as_ref(), values);
+            tools.executions.push(execution);
+        }
+
         Self {
             monitors,
             histories,
@@ -270,6 +491,8 @@ impl App {
             capacities,
             table_monitors,
             table_rows,
+            tools_available,
+            tools,
             focus: Focus::None,
             tab: Tab::Overview,
             state: SystemState::new(),
@@ -303,6 +526,9 @@ impl App {
         match self.tab {
             Tab::Overview => self.state.refresh_overview(),
             Tab::Processes => self.state.refresh_processes(),
+            // Nothing to refresh: an execution's counters are atomics the UI reads
+            // directly, and its log is appended to by the tool's own threads.
+            Tab::Tools => {}
         }
         self.sample_active_tab();
 
@@ -375,6 +601,7 @@ impl App {
                     }
                 }
             }
+            Tab::Tools => {}
         }
     }
 
@@ -410,6 +637,9 @@ impl App {
             Tab::Processes => (0..self.table_monitors.len())
                 .map(ShortcutTarget::Table)
                 .collect(),
+            // No shortcut-able panels here, which is also what frees the letter keys
+            // on this tab for its own bindings ('a' to add an execution).
+            Tab::Tools => Vec::new(),
         };
         targets.truncate(MAX_SHORTCUTS);
         targets
@@ -611,6 +841,312 @@ impl App {
     pub fn clear_search(&mut self) {
         if let Focus::Table(tf) = &mut self.focus {
             tf.query.clear();
+        }
+    }
+
+    // --- Ferramentas tab ---------------------------------------------------------
+
+    /// Moves the selection in the execution list, clamped (not wrapped — a short list
+    /// that jumps from top to bottom under an arrow key reads as a glitch).
+    pub fn move_tool_selection(&mut self, delta: i32) {
+        let len = self.tools.executions.len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.tools.selected as i32 + delta).clamp(0, len as i32 - 1);
+        self.tools.selected = next as usize;
+    }
+
+    /// Opens the add-an-execution wizard at its first step ('a').
+    pub fn open_wizard(&mut self) {
+        if self.tools_available.is_empty() {
+            return;
+        }
+        self.focus = Focus::Wizard(ToolWizard {
+            step: WizardStep::SelectTool,
+            tool: 0,
+            fields: Vec::new(),
+            field: 0,
+            error: None,
+        });
+    }
+
+    /// Moves within whatever the current wizard step is showing: the tool list, or the
+    /// parameter fields.
+    pub fn wizard_move(&mut self, delta: i32) {
+        let tool_count = self.tools_available.len();
+        let Focus::Wizard(wizard) = &mut self.focus else {
+            return;
+        };
+        match wizard.step {
+            WizardStep::SelectTool => {
+                if tool_count > 0 {
+                    let next = (wizard.tool as i32 + delta).clamp(0, tool_count as i32 - 1);
+                    wizard.tool = next as usize;
+                }
+            }
+            WizardStep::Params => {
+                if !wizard.fields.is_empty() {
+                    let next =
+                        (wizard.field as i32 + delta).clamp(0, wizard.fields.len() as i32 - 1);
+                    wizard.field = next as usize;
+                }
+            }
+            WizardStep::Confirm => {}
+        }
+    }
+
+    /// ←/→ on a multiple-choice parameter. Nothing else in the wizard uses them, so a
+    /// stray press on a text field is simply ignored.
+    pub fn wizard_cycle(&mut self, delta: i32) {
+        if let Focus::Wizard(wizard) = &mut self.focus
+            && wizard.step == WizardStep::Params
+            && let Some(field) = wizard.fields.get_mut(wizard.field)
+        {
+            field.cycle(delta);
+            wizard.error = None;
+        }
+    }
+
+    pub fn wizard_type(&mut self, c: char) {
+        if let Focus::Wizard(wizard) = &mut self.focus
+            && wizard.step == WizardStep::Params
+            && let Some(field) = wizard.fields.get_mut(wizard.field)
+            && matches!(field.spec.kind, ParamKind::Text)
+        {
+            field.value.push(c);
+            wizard.error = None;
+        }
+    }
+
+    pub fn wizard_backspace(&mut self) {
+        if let Focus::Wizard(wizard) = &mut self.focus
+            && wizard.step == WizardStep::Params
+            && let Some(field) = wizard.fields.get_mut(wizard.field)
+            && matches!(field.spec.kind, ParamKind::Text)
+        {
+            field.value.pop();
+            wizard.error = None;
+        }
+    }
+
+    /// Enter: advance a step, or — on the last one — actually start the execution.
+    /// Starting is the only step that can refuse to advance, and it says why.
+    pub fn wizard_advance(&mut self) {
+        let Focus::Wizard(wizard) = &mut self.focus else {
+            return;
+        };
+        match wizard.step {
+            WizardStep::SelectTool => {
+                let Some(tool) = self.tools_available.get(wizard.tool) else {
+                    return;
+                };
+                // Rebuilt from the spec on every entry, so backing out to pick a
+                // different tool can't leave the previous one's fields behind.
+                wizard.fields = tool
+                    .params()
+                    .into_iter()
+                    .map(|spec| ParamField {
+                        value: spec.default.to_string(),
+                        spec,
+                    })
+                    .collect();
+                wizard.field = 0;
+                wizard.error = None;
+                wizard.step = WizardStep::Params;
+            }
+            WizardStep::Params => {
+                wizard.error = None;
+                wizard.step = WizardStep::Confirm;
+            }
+            WizardStep::Confirm => self.start_execution(),
+        }
+    }
+
+    /// Esc: back up one step, or leave the wizard entirely from the first one. Nothing
+    /// has started yet at any point here, so backing out is always safe.
+    pub fn wizard_back(&mut self) {
+        let Focus::Wizard(wizard) = &mut self.focus else {
+            return;
+        };
+        match wizard.step {
+            WizardStep::SelectTool => self.focus = Focus::None,
+            WizardStep::Params => {
+                wizard.error = None;
+                wizard.step = WizardStep::SelectTool;
+            }
+            WizardStep::Confirm => {
+                wizard.error = None;
+                wizard.step = WizardStep::Params;
+            }
+        }
+    }
+
+    /// Runs the configured tool. On success the wizard closes and the new execution is
+    /// selected in the list; on failure the wizard drops back to the form with the
+    /// tool's own message, so the user can fix the field that was wrong.
+    fn start_execution(&mut self) {
+        let Focus::Wizard(wizard) = &mut self.focus else {
+            return;
+        };
+        let Some(tool) = self.tools_available.get(wizard.tool) else {
+            return;
+        };
+        let params: HashMap<&'static str, String> = wizard
+            .fields
+            .iter()
+            .map(|f| (f.spec.key, f.value.trim().to_string()))
+            .collect();
+
+        // Unlike a restored execution, one being added by hand shouldn't be accepted
+        // when it can't start — the user is right there and can fix the field.
+        let id = self.tools.take_id();
+        match tool.start(id, &params) {
+            Ok(execution) => {
+                let spec = ExecutionSpec {
+                    tool: tool.id().to_string(),
+                    params: params
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.clone()))
+                        .collect(),
+                };
+                self.tools.executions.push(execution.with_spec(spec));
+                self.tools.selected = self.tools.executions.len() - 1;
+                self.tools.persist();
+                self.focus = Focus::None;
+            }
+            Err(message) => {
+                wizard.error = Some(message);
+                wizard.step = WizardStep::Params;
+            }
+        }
+    }
+
+    /// Restarts the selected execution from its saved configuration ('r'). The point
+    /// is the one that failed to come back on startup — its port was busy at boot and
+    /// is free now — but it doubles as a way to bounce a live one.
+    pub fn restart_selected_execution(&mut self) {
+        let index = self.tools.selected;
+        let Some(existing) = self.tools.executions.get(index) else {
+            return;
+        };
+        let Some(saved) = existing.spec().cloned() else {
+            return;
+        };
+        // The old one has to let go of its port before the new one can take it, and its
+        // threads only notice the stop flag on their next poll — so this is a
+        // stop, wait, start, not an atomic swap. It blocks the UI for that beat, which
+        // is acceptable for an explicit keypress and honest about what's happening.
+        existing.stop();
+        thread::sleep(RESTART_GRACE);
+
+        let Some(tool) = self.tools_available.iter().find(|t| t.id() == saved.tool) else {
+            return;
+        };
+        let values = restore_params(tool.as_ref(), &saved);
+        let replacement = self.tools.launch(tool.as_ref(), values);
+        self.tools.executions[index] = replacement;
+        self.tools.persist();
+    }
+
+    /// Stops and forgets the selected execution (Del). The threads wind down on their
+    /// own within a poll interval; nothing here waits for them, so the UI never stalls
+    /// behind a socket.
+    pub fn remove_selected_execution(&mut self) {
+        if self.tools.selected >= self.tools.executions.len() {
+            return;
+        }
+        let execution = self.tools.executions.remove(self.tools.selected);
+        execution.stop();
+        self.tools.selected = self
+            .tools
+            .selected
+            .min(self.tools.executions.len().saturating_sub(1));
+        self.tools.persist();
+    }
+
+    /// Opens the live log of the selected execution (Enter).
+    pub fn open_tool_monitor(&mut self) {
+        let Some(execution) = self.tools.selected() else {
+            return;
+        };
+        self.focus = Focus::ToolMonitor(ToolMonitorFocus {
+            execution_id: execution.id,
+            query: String::new(),
+            only_matches: false,
+            hex: false,
+            scroll: Cell::new(0),
+            follow: true,
+            max_scroll: Cell::new(0),
+            matches: RefCell::new(Vec::new()),
+            match_index: Cell::new(None),
+            anchor_seq: Cell::new(0),
+        });
+    }
+
+    /// ↑/↓ in the monitor. With a search active these step between hits instead of
+    /// between lines — in a log you're searching, jumping is the whole point, and it's
+    /// what the fullscreen tables already do with the same keys.
+    pub fn tool_monitor_scroll(&mut self, delta: i32) {
+        if let Focus::ToolMonitor(monitor) = &mut self.focus {
+            if !monitor.query.is_empty() {
+                monitor.jump_match(delta);
+                return;
+            }
+            let limit = monitor.max_scroll.get() as i32;
+            let next = (monitor.scroll.get() as i32 + delta).clamp(0, limit) as u16;
+            monitor.scroll.set(next);
+            // Newest-first, so the live edge is the top: following means being there.
+            monitor.follow = next == 0;
+        }
+    }
+
+    /// Jumps back to the newest event and resumes following it (End).
+    pub fn tool_monitor_follow(&mut self) {
+        if let Focus::ToolMonitor(monitor) = &mut self.focus {
+            monitor.follow = true;
+            monitor.scroll.set(0);
+            monitor.match_index.set(None);
+        }
+    }
+
+    pub fn tool_monitor_toggle_hex(&mut self) {
+        if let Focus::ToolMonitor(monitor) = &mut self.focus {
+            monitor.hex = !monitor.hex;
+        }
+    }
+
+    /// Switches between highlighting matches in place and hiding everything else.
+    pub fn tool_monitor_toggle_filter(&mut self) {
+        if let Focus::ToolMonitor(monitor) = &mut self.focus {
+            monitor.only_matches = !monitor.only_matches;
+        }
+    }
+
+    pub fn tool_monitor_type(&mut self, c: char) {
+        if let Focus::ToolMonitor(monitor) = &mut self.focus {
+            monitor.query.push(c);
+            monitor.reset_search();
+        }
+    }
+
+    pub fn tool_monitor_backspace(&mut self) {
+        if let Focus::ToolMonitor(monitor) = &mut self.focus {
+            monitor.query.pop();
+            monitor.reset_search();
+        }
+    }
+
+    /// Esc in the monitor: drop the search first, leave only once there's none.
+    pub fn tool_monitor_escape(&mut self) {
+        if let Focus::ToolMonitor(monitor) = &mut self.focus {
+            if monitor.query.is_empty() {
+                self.focus = Focus::None;
+            } else {
+                monitor.query.clear();
+                monitor.only_matches = false;
+                monitor.reset_search();
+            }
         }
     }
 

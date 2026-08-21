@@ -1,17 +1,24 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, RenderDirection, Row as UiRow, Sparkline, Table, TableState,
+    Block, Borders, Cell, Clear, Paragraph, RenderDirection, Row as UiRow, Sparkline, Table,
+    TableState,
 };
 
-use crate::app::{App, DetailFocus, Focus, ShortcutTarget, Tab, TableFocus};
+use crate::app::{
+    App, DetailFocus, Focus, MATCH_CONTEXT, ParamField, ShortcutTarget, Tab, TableFocus,
+    ToolMonitorFocus, ToolWizard, WizardStep,
+};
 use crate::format;
 use crate::history::History;
 use crate::monitor::{Detail, Monitor, TableRow};
+use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, lock_log};
 
 const TAB_BAR_HEIGHT: u16 = 2;
 const COLS: usize = 3;
@@ -124,6 +131,14 @@ pub fn render(frame: &mut Frame, app: &App) {
             render_detail(frame, area, detail_focus);
             return;
         }
+        Focus::Wizard(wizard) => {
+            render_wizard(frame, area, app, wizard);
+            return;
+        }
+        Focus::ToolMonitor(monitor) => {
+            render_tool_monitor(frame, area, app, monitor);
+            return;
+        }
         Focus::None => {}
     }
 
@@ -136,6 +151,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     match app.tab {
         Tab::Overview => render_overview_tab(frame, sections[1], app),
         Tab::Processes => render_processes_tab(frame, sections[1], app),
+        Tab::Tools => render_tools_tab(frame, sections[1], app),
     }
 }
 
@@ -748,4 +764,676 @@ fn render_detail(frame: &mut Frame, area: Rect, focus: &DetailFocus) {
         Paragraph::new(lines).scroll((focus.scroll.min(max_scroll), 0)),
         body,
     );
+}
+
+// --- Ferramentas tab ---------------------------------------------------------------
+
+const TOOLS_HEADERS: [&str; 6] = [
+    "Ferramenta",
+    "Detalhe",
+    "Tempo",
+    "Conexões",
+    "Tráfego",
+    "Estado",
+];
+
+/// Carves a fixed-size box out of the middle of `area`, shrinking to fit rather than
+/// overflowing when the terminal is smaller than the box wants to be.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// The Ferramentas tab: every execution the user has started, live. Nothing is sampled
+/// here — the counters are atomics the tools' own threads keep updating.
+fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(" Execuções ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::CYAN))
+        .title_bottom(hint_line(
+            "a adicionar · Enter monitorar · r reiniciar · Del remover · ↑/↓ navegar",
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.tools.executions.is_empty() {
+        let empty = Paragraph::new(vec![
+            Line::raw(""),
+            Line::styled(
+                "  Nenhuma execução rodando.",
+                Style::default().fg(palette::DIM),
+            ),
+            Line::styled(
+                "  Tecle 'a' para adicionar uma.",
+                Style::default().fg(palette::DIM),
+            ),
+        ]);
+        frame.render_widget(empty, inner);
+        return;
+    }
+
+    let header = UiRow::new(
+        TOOLS_HEADERS
+            .iter()
+            .map(|h| Cell::from(*h))
+            .collect::<Vec<_>>(),
+    )
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let body: Vec<UiRow> = app
+        .tools
+        .executions
+        .iter()
+        .map(|execution| {
+            let stats = &execution.stats;
+            let (state, style) = if execution.is_running() {
+                ("rodando", Style::default().fg(palette::GREEN))
+            } else {
+                ("parada", Style::default().fg(palette::RED))
+            };
+            UiRow::new(vec![
+                Cell::from(execution.tool),
+                Cell::from(execution.summary.clone()),
+                Cell::from(format::human_duration(
+                    execution.started.elapsed().as_secs(),
+                )),
+                Cell::from(format!(
+                    "{} ({} ativas)",
+                    stats.connections.load(Ordering::Relaxed),
+                    stats.active.load(Ordering::Relaxed)
+                )),
+                Cell::from(format!(
+                    "→{} ←{}",
+                    format::human_bytes(stats.to_target.load(Ordering::Relaxed) as f64),
+                    format::human_bytes(stats.from_target.load(Ordering::Relaxed) as f64)
+                )),
+                Cell::from(Span::styled(state, style)),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Fill(1),
+        Constraint::Length(8),
+        Constraint::Length(16),
+        Constraint::Length(22),
+        Constraint::Length(8),
+    ];
+    let table = Table::new(body, widths)
+        .header(header)
+        .row_highlight_style(
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = TableState::default().with_selected(Some(app.tools.selected));
+    frame.render_stateful_widget(table, inner, &mut state);
+}
+
+/// The add-an-execution wizard: pick a tool, fill in what it needs, look at it once,
+/// then start it. Rendered as one centered box whose contents change per step.
+fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) {
+    let tool = app.tools_available.get(wizard.tool);
+    let (subtitle, hint) = match wizard.step {
+        WizardStep::SelectTool => (
+            "escolher ferramenta".to_string(),
+            "↑/↓ escolher · Enter continuar · Esc cancelar",
+        ),
+        WizardStep::Params => (
+            tool.map(|t| t.name().to_string()).unwrap_or_default(),
+            "↑/↓ campo · ←/→ alternar opção · digite para editar · Enter continuar · Esc voltar",
+        ),
+        WizardStep::Confirm => (
+            "confirmar".to_string(),
+            "Enter inicia a execução · Esc voltar",
+        ),
+    };
+
+    // Width is settled before the lines are built, since the prose in them has to be
+    // wrapped to it — and only then is the height known.
+    let width = WIZARD_WIDTH.min(area.width);
+    let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
+    let lines = match wizard.step {
+        WizardStep::SelectTool => wizard_tool_lines(app, wizard, text_width),
+        WizardStep::Params => wizard_param_lines(wizard, text_width),
+        WizardStep::Confirm => wizard_confirm_lines(app, wizard),
+    };
+
+    // Two rows of border plus a blank line of breathing room at each end.
+    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let box_area = centered(area, width, height);
+    let block = Block::default()
+        .title(format!(" Nova execução — {subtitle} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::PURPLE))
+        .title_bottom(hint_line(hint));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn wizard_tool_lines(app: &App, wizard: &ToolWizard, text_width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::raw("")];
+    for (i, tool) in app.tools_available.iter().enumerate() {
+        let selected = i == wizard.tool;
+        let marker = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}"), style),
+            Span::styled(tool.name().to_string(), style),
+        ]));
+        for chunk in wrap(tool.description(), text_width) {
+            lines.push(Line::styled(
+                format!("     {chunk}"),
+                Style::default().fg(palette::DIM),
+            ));
+        }
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+/// Label column for the parameter form, wide enough for the longest label any tool
+/// currently declares.
+const PARAM_LABEL_WIDTH: usize = 20;
+const WIZARD_WIDTH: u16 = 92;
+/// Borders plus the indent the wizard's prose sits at — subtracted from the box width
+/// to get the column that help text and descriptions wrap to.
+const WIZARD_TEXT_MARGIN: usize = 8;
+
+fn wizard_param_lines(wizard: &ToolWizard, text_width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::raw("")];
+    for (i, field) in wizard.fields.iter().enumerate() {
+        let focused = i == wizard.field;
+        let marker = if focused { "▶ " } else { "  " };
+        let label_style = if focused {
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette::DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}"), label_style),
+            Span::styled(
+                format!("{:width$}  ", field.spec.label, width = PARAM_LABEL_WIDTH),
+                label_style,
+            ),
+            Span::styled(field_value(field, focused), value_style(focused)),
+        ]));
+    }
+    // The focused field's help sits below the whole form rather than beside its row, so
+    // a long explanation never pushes the value column around as focus moves.
+    if let Some(field) = wizard.fields.get(wizard.field) {
+        lines.push(Line::raw(""));
+        for chunk in wrap(field.spec.help, text_width) {
+            lines.push(Line::styled(
+                format!("   {chunk}"),
+                Style::default().fg(palette::DIM),
+            ));
+        }
+    }
+    if let Some(error) = &wizard.error {
+        lines.push(Line::raw(""));
+        for (i, chunk) in wrap(error, text_width).into_iter().enumerate() {
+            let prefix = if i == 0 { "   ⚠ " } else { "     " };
+            lines.push(Line::styled(
+                format!("{prefix}{chunk}"),
+                Style::default()
+                    .fg(palette::RED)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    lines
+}
+
+/// A choice shows its arrows so it's visibly cycled rather than typed; a text field
+/// shows a caret while focused so it's visibly editable.
+fn field_value(field: &ParamField, focused: bool) -> String {
+    match field.spec.kind {
+        ParamKind::Choice(_) => format!("◂ {} ▸", field.value),
+        ParamKind::Text if focused => format!("{}▏", field.value),
+        ParamKind::Text => field.value.clone(),
+    }
+}
+
+fn value_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(palette::YELLOW)
+    } else {
+        Style::default()
+    }
+}
+
+fn wizard_confirm_lines(app: &App, wizard: &ToolWizard) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::raw("")];
+    if let Some(tool) = app.tools_available.get(wizard.tool) {
+        lines.push(Line::styled(
+            format!("  {}", tool.name()),
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::raw(""));
+    }
+    for field in &wizard.fields {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    "   {:width$}  ",
+                    field.spec.label,
+                    width = PARAM_LABEL_WIDTH
+                ),
+                Style::default().fg(palette::DIM),
+            ),
+            Span::raw(field.value.clone()),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "   Enter inicia agora — a porta passa a ser ouvida imediatamente.",
+        Style::default().fg(palette::DIM),
+    ));
+    lines
+}
+
+// --- Monitor de uma execução -------------------------------------------------------
+
+/// Width of the monitor's left gutter (`mm:ss.mmm` + connection number), which every
+/// continuation line of a payload is indented past.
+const GUTTER_WIDTH: usize = 17;
+/// Bytes per line in hex view — the classic 16, which keeps hex + ASCII inside 80
+/// columns once the gutter is accounted for.
+const HEX_COLUMNS: usize = 16;
+
+/// One rendered line of an execution's log. Split from the ratatui `Line` so the
+/// search pass can look at the plain text before styling anything.
+struct LogLine {
+    /// Sequence number of the event this line came from — see `Event::seq`.
+    seq: u64,
+    gutter: String,
+    text: String,
+    style: Style,
+}
+
+/// `mm:ss.mmm` since the execution started.
+fn stamp(at: Duration) -> String {
+    let secs = at.as_secs();
+    format!(
+        "{:02}:{:02}.{:03}",
+        secs / 60,
+        secs % 60,
+        at.subsec_millis()
+    )
+}
+
+/// Renders a payload as text: control characters that carry structure (newline) split
+/// lines, the rest become `·` so a binary blob still shows its printable islands
+/// instead of scrambling the terminal.
+fn payload_text_lines(bytes: &[u8], width: usize) -> Vec<String> {
+    let decoded = String::from_utf8_lossy(bytes);
+    let mut out = Vec::new();
+    for raw in decoded.split('\n') {
+        // Drop the CR of a CRLF: the line break already says what it meant, and
+        // marking every header end with a `·` buries the text under punctuation. A CR
+        // anywhere else is a real oddity and still shows up below.
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        let cleaned: String = raw
+            .chars()
+            .map(|c| {
+                if c == '\t' || !c.is_control() {
+                    c
+                } else {
+                    '·'
+                }
+            })
+            .collect();
+        out.extend(wrap(&cleaned, width));
+    }
+    out
+}
+
+/// Classic hexdump: offset, 16 bytes of hex split into two groups, then the printable
+/// rendering of the same bytes.
+fn payload_hex_lines(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .chunks(HEX_COLUMNS)
+        .enumerate()
+        .map(|(row, chunk)| {
+            let mut hex = String::new();
+            for i in 0..HEX_COLUMNS {
+                if i == HEX_COLUMNS / 2 {
+                    hex.push(' ');
+                }
+                match chunk.get(i) {
+                    Some(b) => hex.push_str(&format!("{b:02x} ")),
+                    None => hex.push_str("   "),
+                }
+            }
+            let ascii: String = chunk
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            format!("{:04x}  {hex} |{ascii}|", row * HEX_COLUMNS)
+        })
+        .collect()
+}
+
+/// Flattens an execution's log into displayable lines. Every event contributes one
+/// header line, and a data event additionally contributes its payload, indented under
+/// the gutter so the two read as one block.
+fn log_lines(execution: &Execution, hex: bool, width: usize) -> Vec<LogLine> {
+    let log = lock_log(&execution.log);
+    let payload_width = width.saturating_sub(GUTTER_WIDTH + 2).max(MIN_VALUE_WIDTH);
+    let mut lines = Vec::new();
+
+    // Newest event first, so the live edge is the top of the screen and new traffic
+    // pushes history downward. Each event's own block stays in its natural order —
+    // reversing *inside* one would scramble the request it represents.
+    for event in log.iter().rev() {
+        let conn = if event.conn == 0 {
+            "  · ".to_string()
+        } else {
+            format!("#{:<3}", event.conn)
+        };
+        let gutter = format!("{}  {}  ", stamp(event.at), conn);
+        let blank = " ".repeat(gutter.chars().count());
+
+        let (text, style) = match &event.kind {
+            EventKind::Opened { peer } => (
+                format!("conectado de {peer}"),
+                Style::default().fg(palette::GREEN),
+            ),
+            EventKind::Closed { reason } => (reason.clone(), Style::default().fg(palette::DIM)),
+            EventKind::Note(text) => (text.clone(), Style::default().fg(palette::CYAN)),
+            EventKind::Error(text) => (format!("⚠ {text}"), Style::default().fg(palette::RED)),
+            EventKind::Data { dir, len, preview } => {
+                let color = match dir {
+                    Flow::ToTarget => palette::YELLOW,
+                    Flow::FromTarget => palette::BLUE,
+                };
+                let dropped = len.saturating_sub(preview.len());
+                let suffix = if dropped > 0 {
+                    format!(
+                        " (+{} não registrados)",
+                        format::human_bytes(dropped as f64)
+                    )
+                } else {
+                    String::new()
+                };
+                lines.push(LogLine {
+                    seq: event.seq,
+                    gutter: gutter.clone(),
+                    text: format!(
+                        "{} {}{suffix}",
+                        dir.arrow(),
+                        format::human_bytes(*len as f64)
+                    ),
+                    style: Style::default().fg(color).add_modifier(Modifier::BOLD),
+                });
+                let payload = if hex {
+                    payload_hex_lines(preview)
+                } else {
+                    payload_text_lines(preview, payload_width)
+                };
+                for line in payload {
+                    lines.push(LogLine {
+                        seq: event.seq,
+                        gutter: blank.clone(),
+                        text: format!("  {line}"),
+                        style: Style::default().fg(color),
+                    });
+                }
+                continue;
+            }
+        };
+        lines.push(LogLine {
+            seq: event.seq,
+            gutter,
+            text,
+            style,
+        });
+    }
+
+    // Oldest thing there is, so newest-first puts it at the very bottom.
+    if log.dropped() > 0 {
+        lines.push(LogLine {
+            seq: 0,
+            gutter: " ".repeat(GUTTER_WIDTH),
+            text: format!(
+                "… {} eventos mais antigos foram descartados do buffer",
+                log.dropped()
+            ),
+            style: Style::default().fg(palette::DIM),
+        });
+    }
+    lines
+}
+
+/// Case-insensitive substring search over ASCII, returning a byte offset. Comparing
+/// raw bytes keeps the returned indices valid for slicing: an ASCII byte can never
+/// match a UTF-8 continuation byte, so a match can only ever start and end on a
+/// character boundary.
+fn find_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let (hay, need) = (haystack.as_bytes(), needle.as_bytes());
+    if need.is_empty() || hay.len() < need.len() || from > hay.len() - need.len() {
+        return None;
+    }
+    (from..=hay.len() - need.len()).find(|&i| hay[i..i + need.len()].eq_ignore_ascii_case(need))
+}
+
+/// Splits `text` into spans with every occurrence of `query` picked out, so a search
+/// hit is visible in place rather than only by the line having survived a filter.
+fn highlight(text: &str, query: &str, base: Style) -> Vec<Span<'static>> {
+    if query.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let hit = base
+        .fg(palette::ORANGE)
+        .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+    let mut spans = Vec::new();
+    let mut pos = 0;
+    while let Some(found) = find_ci(text, query, pos) {
+        if found > pos {
+            spans.push(Span::styled(text[pos..found].to_string(), base));
+        }
+        let end = found + query.len();
+        spans.push(Span::styled(text[found..end].to_string(), hit));
+        pos = end;
+    }
+    if pos < text.len() {
+        spans.push(Span::styled(text[pos..].to_string(), base));
+    }
+    spans
+}
+
+/// The live log of one execution, with search, in-place highlighting, and an optional
+/// hex rendering of the payloads.
+fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolMonitorFocus) {
+    let Some(execution) = app.tools.by_id(monitor.execution_id) else {
+        let block = Block::default()
+            .title(" Execução removida ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::DIM))
+            .title_bottom(hint_line("Esc voltar"));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  Esta execução não existe mais.",
+                Style::default().fg(palette::DIM),
+            )),
+            inner,
+        );
+        return;
+    };
+
+    let hint = if monitor.query.is_empty() {
+        "digite p/ buscar · Tab hex · ↑/↓ rolar · End ir ao mais recente · Esc voltar"
+    } else {
+        "↑/↓ resultado anterior/próximo · Ctrl+F filtrar · Tab hex · End mais recente · Esc limpar busca"
+    };
+    // The borders are drawn only once the title is known, and the title carries the
+    // match count — so the inner area comes from the same block shape up front.
+    let outer = Block::default().borders(Borders::ALL);
+    let inner = outer.inner(area);
+
+    let mut lines = log_lines(execution, monitor.hex, inner.width as usize);
+    if monitor.only_matches && !monitor.query.is_empty() {
+        lines.retain(|line| find_ci(&line.text, &monitor.query, 0).is_some());
+    }
+    let matches: Vec<u16> = if monitor.query.is_empty() {
+        Vec::new()
+    } else {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| find_ci(&line.text, &monitor.query, 0).is_some())
+            .map(|(i, _)| i as u16)
+            .collect()
+    };
+
+    let max_scroll = (lines.len() as u16).saturating_sub(inner.height);
+    monitor.max_scroll.set(max_scroll);
+    let current = settle_scroll(monitor, &lines, &matches, max_scroll);
+    let match_count = matches.len();
+    let current_line = current.and_then(|i| matches.get(i).copied());
+    monitor.matches.replace(matches);
+
+    let mut title = format!(" {} — {} ", execution.tool, execution.summary);
+    if !monitor.query.is_empty() {
+        let position = match (current, match_count) {
+            (_, 0) => " (nenhum resultado)".to_string(),
+            (Some(i), total) => format!(" ({}/{total})", i + 1),
+            (None, total) => format!(" ({total} resultados)"),
+        };
+        let filtered = if monitor.only_matches {
+            " · só correspondências"
+        } else {
+            ""
+        };
+        title = format!("{title}— busca: {}{position}{filtered} ", monitor.query);
+    }
+    let block = outer
+        .title(title)
+        .border_style(Style::default().fg(if execution.is_running() {
+            palette::CYAN
+        } else {
+            palette::DIM
+        }))
+        .title_bottom(hint_line(hint));
+    frame.render_widget(block, area);
+
+    if lines.is_empty() {
+        let message = if monitor.query.is_empty() {
+            "  Nada registrado ainda — aponte um cliente para a porta de escuta."
+        } else {
+            "  Nenhuma correspondência."
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(message, Style::default().fg(palette::DIM))),
+            inner,
+        );
+        return;
+    }
+
+    let rendered: Vec<Line> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            // The hit the arrows are parked on gets a marker in the gutter: with a
+            // dozen highlighted matches on screen, the highlighting alone doesn't say
+            // which one ↑/↓ will move away from.
+            let on_current = current_line == Some(i as u16);
+            let (gutter, gutter_style) = if on_current {
+                let mut marked = line.gutter.clone();
+                marked.replace_range(..1, "▸");
+                (
+                    marked,
+                    Style::default()
+                        .fg(palette::ORANGE)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (line.gutter.clone(), Style::default().fg(palette::DIM))
+            };
+            let mut spans = vec![Span::styled(gutter, gutter_style)];
+            spans.extend(highlight(&line.text, &monitor.query, line.style));
+            Line::from(spans)
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(rendered).scroll((monitor.scroll.get(), 0)),
+        inner,
+    );
+}
+
+/// Works out where the viewport should sit this frame, and returns which match — as an
+/// index into `matches` — it ends up parked on.
+///
+/// Three things can move it, in order: following pins it to the newest event; events
+/// that arrived since the last frame are counted so a reader scrolled back into history
+/// stays on the same line instead of being slid downward by new traffic; and a search
+/// that hasn't been navigated yet jumps to its first hit.
+fn settle_scroll(
+    monitor: &ToolMonitorFocus,
+    lines: &[LogLine],
+    matches: &[u16],
+    max_scroll: u16,
+) -> Option<usize> {
+    let newest = lines.first().map(|line| line.seq).unwrap_or(0);
+    let anchor = monitor.anchor_seq.replace(newest);
+
+    if monitor.follow {
+        monitor.scroll.set(0);
+    } else {
+        let arrived = lines.iter().take_while(|line| line.seq > anchor).count() as u16;
+        if arrived > 0 {
+            monitor
+                .scroll
+                .set(monitor.scroll.get().saturating_add(arrived));
+            // The same shift applies to the hit the arrows are on: new matches landing
+            // above it push its index further down the list.
+            if let Some(current) = monitor.match_index.get() {
+                let above = matches.iter().take_while(|&&line| line < arrived).count();
+                monitor.match_index.set(Some(current + above));
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        monitor.match_index.set(None);
+    } else if monitor.match_index.get().is_none() {
+        // A freshly typed search lands on its first hit without needing an arrow key,
+        // same as the fullscreen tables do.
+        monitor.match_index.set(Some(0));
+        monitor.scroll.set(matches[0].saturating_sub(MATCH_CONTEXT));
+    }
+
+    monitor.scroll.set(monitor.scroll.get().min(max_scroll));
+    monitor.match_index.get().filter(|&i| i < matches.len())
 }

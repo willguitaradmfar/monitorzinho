@@ -54,12 +54,19 @@ impl History {
     }
 }
 
-fn data_file_path() -> PathBuf {
+/// Path of one of monitorzinho's state files, creating the directory if needed. Shared
+/// with `tools::persist` — this module happens to own the "where we keep things on
+/// disk" logic, and a second copy of it would be one more place to get wrong.
+pub fn data_file(name: &str) -> PathBuf {
     let mut dir = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
     dir.push("monitorzinho");
     let _ = std::fs::create_dir_all(&dir);
-    dir.push("history.json");
+    dir.push(name);
     dir
+}
+
+fn data_file_path() -> PathBuf {
+    data_file("history.json")
 }
 
 pub fn load_all() -> HistoryMap {

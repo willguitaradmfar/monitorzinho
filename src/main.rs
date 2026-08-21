@@ -13,11 +13,18 @@ mod app;
 mod format;
 mod history;
 mod monitor;
+mod tools;
 mod ui;
 
-use app::{App, Focus};
+use app::{App, Focus, Tab};
 
 const TICK_RATE: Duration = Duration::from_secs(2);
+
+/// Whether the Ferramentas tab's own list is what the keyboard should be driving —
+/// i.e. that tab is showing and nothing is fullscreened on top of it.
+fn on_tools_tab(app: &App) -> bool {
+    matches!(app.focus, Focus::None) && app.tab == Tab::Tools
+}
 
 fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
@@ -73,14 +80,78 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     // A detail view goes back to the table it came from, not all the
                     // way out — that table is the thing it was opened on top of.
                     Focus::Detail(_) => app.close_detail(),
+                    // The wizard steps backwards one stage at a time, and the monitor
+                    // drops its search before it drops the view. Both keep their own
+                    // logic rather than exiting outright.
+                    Focus::Wizard(_) => app.wizard_back(),
+                    Focus::ToolMonitor(_) => app.tool_monitor_escape(),
                     Focus::Table(tf) if !tf.query.is_empty() => app.clear_search(),
                     _ => app.exit_focus(),
                 },
-                KeyCode::Char('q') if !matches!(app.focus, Focus::Table(_)) => match app.focus {
-                    Focus::None => break,
-                    Focus::Detail(_) => app.close_detail(),
-                    _ => app.exit_focus(),
-                },
+                // 'q' only quits where no text is being typed — the tables' search box,
+                // the wizard's fields and the monitor's search all need the letter.
+                KeyCode::Char('q')
+                    if matches!(app.focus, Focus::None | Focus::Chart(_) | Focus::Detail(_)) =>
+                {
+                    match app.focus {
+                        Focus::None => break,
+                        Focus::Detail(_) => app.close_detail(),
+                        _ => app.exit_focus(),
+                    }
+                }
+
+                // --- add-an-execution wizard ---
+                KeyCode::Enter if matches!(app.focus, Focus::Wizard(_)) => app.wizard_advance(),
+                KeyCode::Up if matches!(app.focus, Focus::Wizard(_)) => app.wizard_move(-1),
+                KeyCode::Down if matches!(app.focus, Focus::Wizard(_)) => app.wizard_move(1),
+                KeyCode::Left if matches!(app.focus, Focus::Wizard(_)) => app.wizard_cycle(-1),
+                KeyCode::Right if matches!(app.focus, Focus::Wizard(_)) => app.wizard_cycle(1),
+                KeyCode::Backspace if matches!(app.focus, Focus::Wizard(_)) => {
+                    app.wizard_backspace();
+                }
+                KeyCode::Char(c) if matches!(app.focus, Focus::Wizard(_)) => app.wizard_type(c),
+
+                // --- one execution's live log ---
+                KeyCode::Char('f')
+                    if matches!(app.focus, Focus::ToolMonitor(_))
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.tool_monitor_toggle_filter();
+                }
+                KeyCode::Tab if matches!(app.focus, Focus::ToolMonitor(_)) => {
+                    app.tool_monitor_toggle_hex();
+                }
+                KeyCode::End if matches!(app.focus, Focus::ToolMonitor(_)) => {
+                    app.tool_monitor_follow();
+                }
+                KeyCode::Up if matches!(app.focus, Focus::ToolMonitor(_)) => {
+                    app.tool_monitor_scroll(-1);
+                }
+                KeyCode::Down if matches!(app.focus, Focus::ToolMonitor(_)) => {
+                    app.tool_monitor_scroll(1);
+                }
+                KeyCode::PageUp if matches!(app.focus, Focus::ToolMonitor(_)) => {
+                    app.tool_monitor_scroll(-15);
+                }
+                KeyCode::PageDown if matches!(app.focus, Focus::ToolMonitor(_)) => {
+                    app.tool_monitor_scroll(15);
+                }
+                KeyCode::Backspace if matches!(app.focus, Focus::ToolMonitor(_)) => {
+                    app.tool_monitor_backspace();
+                }
+                KeyCode::Char(c) if matches!(app.focus, Focus::ToolMonitor(_)) => {
+                    app.tool_monitor_type(c);
+                }
+
+                // --- Ferramentas tab, nothing fullscreened ---
+                // Ahead of the shortcut arm below: this tab has no shortcut-able
+                // panels, so its letters are free for its own bindings.
+                KeyCode::Char('a') if on_tools_tab(&app) => app.open_wizard(),
+                KeyCode::Enter if on_tools_tab(&app) => app.open_tool_monitor(),
+                KeyCode::Delete if on_tools_tab(&app) => app.remove_selected_execution(),
+                KeyCode::Char('r') if on_tools_tab(&app) => app.restart_selected_execution(),
+                KeyCode::Up if on_tools_tab(&app) => app.move_tool_selection(-1),
+                KeyCode::Down if on_tools_tab(&app) => app.move_tool_selection(1),
                 KeyCode::Tab if matches!(app.focus, Focus::None) => app.next_tab(),
                 KeyCode::BackTab if matches!(app.focus, Focus::None) => app.prev_tab(),
                 // Like top's spacebar: force an immediate refresh without waiting for
