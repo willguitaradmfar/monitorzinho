@@ -58,7 +58,12 @@ fn read_utmp() -> Vec<UtmpEntry> {
     let Some(data) = UTMP_PATHS.iter().find_map(|p| fs::read(p).ok()) else {
         return Vec::new();
     };
-    data.chunks_exact(RECORD_SIZE)
+    // `as_chunks` rather than `chunks_exact`: the record size is a constant, so each
+    // chunk comes back as a fixed-size array and the trailing partial record (a
+    // truncated utmp) is dropped by the same token.
+    data.as_chunks::<RECORD_SIZE>()
+        .0
+        .iter()
         .filter_map(|rec| {
             let ty = i16::from_ne_bytes(rec[UT_TYPE..UT_TYPE + 2].try_into().unwrap());
             if ty != USER_PROCESS {
