@@ -17,7 +17,7 @@ mod ui;
 
 use app::{App, Focus};
 
-const TICK_RATE: Duration = Duration::from_secs(1);
+const TICK_RATE: Duration = Duration::from_secs(2);
 
 fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
@@ -79,6 +79,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 },
                 KeyCode::Tab if matches!(app.focus, Focus::None) => app.next_tab(),
                 KeyCode::BackTab if matches!(app.focus, Focus::None) => app.prev_tab(),
+                // Like top's spacebar: force an immediate refresh without waiting for
+                // the next tick, and restart the tick timer so it doesn't double-fire.
+                KeyCode::Char(' ') if matches!(app.focus, Focus::None) => {
+                    app.tick();
+                    last_tick = Instant::now();
+                }
                 KeyCode::Char(c) if matches!(app.focus, Focus::None) => {
                     app.activate_shortcut(c);
                 }
