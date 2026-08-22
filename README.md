@@ -10,7 +10,8 @@ A lightweight terminal system monitor, written in Rust.
   type, with a per-connection detail view.
 - **Tools** that don't just watch but *run*: a recording TCP/UDP tunnel that
   shows you the payload of a connection, speaks TLS to the target, and can
-  rewrite bytes on the way through.
+  rewrite bytes on the way through; and a port scanner that asks each open
+  port what it is rather than guessing from its number.
 - History is persisted to disk and restored on restart, so the charts aren't
   empty on launch. Tools come back running too.
 - Small, fast, no garbage collector: a single ~5 MB binary with no runtime to
@@ -89,13 +90,21 @@ congestion window, retransmits, MSS, and so on, read straight from `tcp_info`).
 
 ### Ferramentas — the tools
 
-Things monitorzinho runs, rather than watches. An execution owns background
-threads, keeps working while you look at something else, and is restored and
-restarted the next time you launch the app.
+Things monitorzinho runs, rather than watches. An execution keeps working while
+you look at something else, and comes back the next time you launch the app —
+or, where the tool says so, sits idle until you ask it for something.
 
 `a` walks you through adding one: pick the tool, fill in what it needs, look at
 it once, and confirm. `e` reopens that form on an execution that already
-exists, `r` restarts one, `Del` stops and forgets it.
+exists, `r` restarts one (or, for a tool that works on demand, runs it again),
+`Del` stops and forgets it.
+
+Two columns of each row are the tool's own — what it has to report, and a
+summary beside it — so a tunnel's byte counters and a scan's open-port tally
+share a place without pretending to be the same thing. The last column is where
+the row stands: `pronta` for an on-demand execution nobody has asked anything
+of yet, `rodando`, `concluída` once there's a result to read, `parada` for one
+that was stopped or never started.
 
 `Enter` opens an execution's live log — every chunk in both directions, newest
 at the top, as text or hex (`Tab`), with type-to-search, `↑`/`↓` to jump
@@ -130,6 +139,31 @@ Three things it does beyond relaying:
   there to pick again.
 - **UDP.** Same idea, one flow per source address.
 
+#### Scanner de portas
+
+A TCP connect scan of a host, and as much as can be said about each open port.
+
+It connects for real rather than sending half-open SYN probes, because raw
+sockets need `CAP_NET_RAW` and this runs as a normal user. That's the honest
+trade — it shows up in the target's logs, and it says nothing about UDP. What
+it buys is that every open port is a socket already in hand, so the scan can
+go on to *ask*: read whatever the service announces, try a TLS handshake, try
+an HTTP request. So an open port reads as
+`8080/tcp aberta · 0.3 ms · HTTP/1.1 200 OK · Server: MinIO` rather than as a
+number and a guess from `/etc/services`.
+
+Ports come from a preset (~90 common ones, `1-1024`, `1-10000`, or all 65535)
+or from a spec typed the way nmap takes it: `22,80,443,8000-8100`. Concurrency
+and per-port timeout are yours to set; the whole 65535 against localhost takes
+a few seconds.
+
+**Nothing runs until you open it.** A scan is a burst of work with an answer at
+the end, not something to keep running in the background, so creating one —
+or having one restored on launch — starts nothing at all. `Enter` runs it,
+and once there's a result `Enter` just shows it again; `r` is how you ask for a
+fresh scan. The list carries how many ports were open and what's listening,
+from the moment there's a first result.
+
 ## Keys
 
 | Key | Where | What |
@@ -141,8 +175,8 @@ Three things it does beyond relaying:
 | `←` / `→` | process tree | collapse/expand |
 | `Del` | a fullscreened table | kill the selected process (SIGKILL, with children) |
 | any letter | a fullscreened table | search, live |
-| `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart / remove an execution |
-| `Enter` | Ferramentas | open that execution's live log |
+| `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart (or re-run) / remove an execution |
+| `Enter` | Ferramentas | open that execution's live log — and run it, for an on-demand tool |
 | `Tab`, `Ctrl+F` | an execution's log | hex view, matches-only filter |
 | `Esc` | anywhere | back one level (clears a search first) |
 | `q` | a tab | quit |
@@ -160,8 +194,10 @@ Three small traits drive everything:
 - `TableMonitor` — a ranked snapshot list, for data that doesn't fit a time
   series. Optionally answers `detail()` to get an `Enter` view.
 - `Tool` — something that runs: it declares the parameters the wizard should
-  ask for, then starts threads and reports back through a shared event log.
-  Implement it in `src/tools/<name>.rs` and add it to `all_tools()`.
+  ask for, then starts threads and reports back through a shared event log and
+  two columns of its execution's row. Say `on_demand()` and it starts nothing
+  until the user opens it. Implement it in `src/tools/<name>.rs` and add it to
+  `all_tools()`.
 
 There are no bindings crates for the Linux-specific parts: the socket tables
 come from a hand-rolled netlink `SOCK_DIAG` client, names from `getnameinfo`

@@ -1332,6 +1332,26 @@ impl App {
         }
     }
 
+    /// The tool that owns an execution, found by the stable id its configuration
+    /// carries — not by display name, which is free to change.
+    pub fn tool_for(&self, execution: &Execution) -> Option<&dyn Tool> {
+        let spec = execution.spec()?;
+        self.tools_available
+            .iter()
+            .find(|tool| tool.id() == spec.tool)
+            .map(|tool| tool.as_ref())
+    }
+
+    /// The parameters an execution was started with, in the shape a tool expects.
+    fn params_of(
+        &self,
+        execution: &Execution,
+    ) -> Option<(&dyn Tool, HashMap<&'static str, String>)> {
+        let tool = self.tool_for(execution)?;
+        let spec = execution.spec()?;
+        Some((tool, restore_params(tool, spec)))
+    }
+
     /// Opens the wizard on an execution that already exists ('e'), pre-filled with what
     /// it was started with.
     pub fn edit_selected_execution(&mut self) {
@@ -1381,6 +1401,14 @@ impl App {
         let Some(existing) = self.tools.executions.get(index) else {
             return;
         };
+        // Nothing to recreate for an on-demand execution — it holds no threads and no
+        // port. 'r' there means "do it again", against the same target.
+        if let Some((tool, params)) = self.params_of(existing)
+            && tool.on_demand()
+        {
+            tool.rerun(existing, &params);
+            return;
+        }
         let Some(saved) = existing.spec().cloned() else {
             return;
         };
@@ -1418,6 +1446,14 @@ impl App {
 
     /// Opens the live log of the selected execution (Enter).
     pub fn open_tool_monitor(&mut self) {
+        let Some(execution) = self.tools.selected() else {
+            return;
+        };
+        // Opening is the trigger for a tool that only works on demand — the scan starts
+        // here, on the keypress, rather than at launch behind the user's back.
+        if let Some((tool, params)) = self.params_of(execution) {
+            tool.open(execution, &params);
+        }
         let Some(execution) = self.tools.selected() else {
             return;
         };

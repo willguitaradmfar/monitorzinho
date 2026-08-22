@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ratatui::Frame;
@@ -19,7 +18,7 @@ use crate::format;
 use crate::history::History;
 use crate::monitor::{Detail, Monitor, TableRow};
 use crate::tools::rewrite::{self, Rule};
-use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, lock_log};
+use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, State, lock_log};
 
 const TAB_BAR_HEIGHT: u16 = 2;
 const COLS: usize = 3;
@@ -784,8 +783,10 @@ const TOOLS_HEADERS: [&str; 6] = [
     "Ferramenta",
     "Detalhe",
     "Tempo",
-    "Conexões",
-    "Tráfego",
+    // Deliberately unnamed: what these two hold is the tool's business, and a tunnel's
+    // byte counters and a scan's open-port tally have nothing in common but their place.
+    "Resultado",
+    "Resumo",
     "Estado",
 ];
 
@@ -844,40 +845,38 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
         .executions
         .iter()
         .map(|execution| {
-            let stats = &execution.stats;
-            let (state, style) = if execution.is_running() {
-                ("rodando", Style::default().fg(palette::GREEN))
-            } else {
-                ("parada", Style::default().fg(palette::RED))
+            let (state, style) = match execution.state() {
+                State::Ready => ("pronta", Style::default().fg(palette::DIM)),
+                State::Running => ("rodando", Style::default().fg(palette::GREEN)),
+                State::Done => ("concluída", Style::default().fg(palette::CYAN)),
+                State::Stopped => ("parada", Style::default().fg(palette::RED)),
             };
+            // Straight from the tool that owns this execution. A row whose tool is
+            // somehow missing still renders — just without the two result columns.
+            let (headline, summary) = app
+                .tool_for(execution)
+                .map(|tool| tool.columns(execution))
+                .unwrap_or_default();
             UiRow::new(vec![
                 Cell::from(execution.tool),
                 Cell::from(execution.summary.clone()),
                 Cell::from(format::human_duration(
                     execution.started.elapsed().as_secs(),
                 )),
-                Cell::from(format!(
-                    "{} ({} ativas)",
-                    stats.connections.load(Ordering::Relaxed),
-                    stats.active.load(Ordering::Relaxed)
-                )),
-                Cell::from(format!(
-                    "→{} ←{}",
-                    format::human_bytes(stats.to_target.load(Ordering::Relaxed) as f64),
-                    format::human_bytes(stats.from_target.load(Ordering::Relaxed) as f64)
-                )),
+                Cell::from(headline),
+                Cell::from(summary),
                 Cell::from(Span::styled(state, style)),
             ])
         })
         .collect();
 
     let widths = [
-        Constraint::Length(16),
+        Constraint::Length(18),
         Constraint::Fill(1),
         Constraint::Length(8),
-        Constraint::Length(16),
-        Constraint::Length(22),
-        Constraint::Length(8),
+        Constraint::Length(20),
+        Constraint::Length(34),
+        Constraint::Length(10),
     ];
     let table = Table::new(body, widths)
         .header(header)

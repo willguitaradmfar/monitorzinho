@@ -121,6 +121,27 @@ impl Tool for TunnelTool {
         )
     }
 
+    fn columns(&self, execution: &Execution) -> (String, String) {
+        let stats = &execution.stats;
+        let (total, active) = (
+            stats.connections.load(Ordering::Relaxed),
+            stats.active.load(Ordering::Relaxed),
+        );
+        let (noun, adjective) = (
+            if total == 1 { "conexão" } else { "conexões" },
+            if active == 1 { "ativa" } else { "ativas" },
+        );
+        let headline = format!("{total} {noun} ({active} {adjective})");
+        (
+            headline,
+            format!(
+                "→{} ←{}",
+                crate::format::human_bytes(stats.to_target.load(Ordering::Relaxed) as f64),
+                crate::format::human_bytes(stats.from_target.load(Ordering::Relaxed) as f64)
+            ),
+        )
+    }
+
     fn start(&self, id: u64, params: &HashMap<&'static str, String>) -> Result<Execution, String> {
         let proto = params.get("proto").map(String::as_str).unwrap_or("TCP");
         let listen = params.get("listen").map(String::as_str).unwrap_or_default();

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub mod persist;
 pub mod poll;
 pub mod rewrite;
+pub mod scan;
 pub mod tls;
 pub mod tunnel;
 
@@ -108,10 +109,33 @@ pub trait Tool: Send + Sync {
             .collect::<Vec<_>>()
             .join(" ")
     }
+
+    /// Whether this tool only works when asked. An on-demand execution starts nothing
+    /// — not when it's created, not when it's restored on launch — and does its work
+    /// when the user opens its monitor. A scan of sixty thousand ports has no business
+    /// running because the app happened to start.
+    fn on_demand(&self) -> bool {
+        false
+    }
+
+    /// The user opened this execution's monitor. Where an on-demand tool does its work;
+    /// a no-op for one that's been running all along.
+    fn open(&self, _execution: &Execution, _params: &HashMap<&'static str, String>) {}
+
+    /// Asked for again, explicitly ('r'). Only reached for an on-demand tool — for
+    /// anything else 'r' recreates the execution from its configuration instead.
+    fn rerun(&self, _execution: &Execution, _params: &HashMap<&'static str, String>) {}
+
+    /// The two result columns of this execution's row: a headline figure and a summary
+    /// beside it. Both empty until there is something to say, which for an on-demand
+    /// tool means until it has been run at least once.
+    fn columns(&self, _execution: &Execution) -> (String, String) {
+        (String::new(), String::new())
+    }
 }
 
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(tunnel::TunnelTool)]
+    vec![Box::new(tunnel::TunnelTool), Box::new(scan::ScanTool)]
 }
 
 /// Live counters for an execution, written by its threads and read by the UI every
@@ -248,6 +272,8 @@ pub struct Recorder {
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
     started: Instant,
+    outcome: Arc<Mutex<(String, String)>>,
+    runs: Arc<AtomicU64>,
 }
 
 impl Recorder {
@@ -277,6 +303,23 @@ impl Recorder {
         &self.stats
     }
 
+    /// Publishes the two result columns of this execution's row. Called as work
+    /// progresses, not only at the end, so a long scan shows how far along it is
+    /// without anyone having to open it.
+    pub fn report(&self, headline: impl Into<String>, summary: impl Into<String>) {
+        let mut slot = self
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = (headline.into(), summary.into());
+    }
+
+    /// Marks one piece of on-demand work as finished. What separates "never run" from
+    /// "run, and this is the answer" in the list.
+    pub fn ran(&self) {
+        self.runs.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Whether the execution has been removed and every thread should wind down.
     pub fn stopping(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
@@ -297,6 +340,18 @@ pub struct Execution {
     /// Set by a tool's main loop when it exits for any reason — so the list can tell
     /// "still working" from "died on its own", instead of showing a dead row as live.
     finished: Arc<AtomicBool>,
+    /// Whether this execution's tool only works when asked. Decides how the flags above
+    /// read: for an on-demand tool "not finished" means "working right now" rather than
+    /// "alive", and being finished is the resting state rather than the end.
+    on_demand: bool,
+    /// Never started at all — a bad address, a busy port. Distinguished from stopped
+    /// because an on-demand execution that has simply never been asked to do anything
+    /// looks exactly the same otherwise.
+    failed: bool,
+    /// How many pieces of on-demand work have completed.
+    runs: Arc<AtomicU64>,
+    /// The two result columns, written by the tool as it goes.
+    outcome: Arc<Mutex<(String, String)>>,
     /// What would recreate this execution on the next run. `None` for one nobody asked
     /// to persist; the tool itself never sets it, since being saved isn't its concern.
     spec: Option<persist::ExecutionSpec>,
@@ -310,12 +365,16 @@ impl Execution {
         let log = Arc::new(Mutex::new(EventLog::new(LOG_CAPACITY)));
         let stats = Arc::new(Stats::default());
         let shutdown = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicU64::new(0));
+        let outcome = Arc::new(Mutex::new((String::new(), String::new())));
         let started = Instant::now();
         let recorder = Recorder {
             log: Arc::clone(&log),
             stats: Arc::clone(&stats),
             shutdown: Arc::clone(&shutdown),
             started,
+            outcome: Arc::clone(&outcome),
+            runs: Arc::clone(&runs),
         };
         let execution = Self {
             id,
@@ -326,9 +385,71 @@ impl Execution {
             stats,
             shutdown,
             finished: Arc::new(AtomicBool::new(false)),
+            on_demand: false,
+            failed: false,
+            runs,
+            outcome,
             spec: None,
         };
         (execution, recorder)
+    }
+
+    /// Marks this as an execution that idles until asked. Its threads aren't running,
+    /// so it starts out finished rather than alive.
+    pub fn on_demand(mut self) -> Self {
+        self.on_demand = true;
+        self.finished.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// A second handle for a tool that starts work after the execution already exists.
+    pub fn recorder(&self) -> Recorder {
+        Recorder {
+            log: Arc::clone(&self.log),
+            stats: Arc::clone(&self.stats),
+            shutdown: Arc::clone(&self.shutdown),
+            started: self.started,
+            outcome: Arc::clone(&self.outcome),
+            runs: Arc::clone(&self.runs),
+        }
+    }
+
+    /// Whether any work has ever completed here. What the list uses to decide there's a
+    /// result worth showing at all.
+    pub fn has_result(&self) -> bool {
+        self.runs.load(Ordering::Relaxed) > 0
+    }
+
+    /// True while an on-demand tool is actually working.
+    pub fn is_working(&self) -> bool {
+        !self.finished.load(Ordering::Relaxed) && !self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Where this row stands, in the one vocabulary the list can render.
+    pub fn state(&self) -> State {
+        if self.failed || self.shutdown.load(Ordering::Relaxed) {
+            return State::Stopped;
+        }
+        if !self.on_demand {
+            return if self.finished.load(Ordering::Relaxed) {
+                State::Stopped
+            } else {
+                State::Running
+            };
+        }
+        match (self.is_working(), self.has_result()) {
+            (true, _) => State::Running,
+            (false, true) => State::Done,
+            (false, false) => State::Ready,
+        }
+    }
+
+    /// The tool's own two result columns, blank until it has run.
+    pub fn outcome(&self) -> (String, String) {
+        self.outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// An execution that never got off the ground, carrying the reason in its log.
@@ -337,9 +458,10 @@ impl Execution {
     /// configuration silently disappearing when its port happens to be busy — the user
     /// would have no way to know it had ever been there.
     pub fn failed(id: u64, tool: &'static str, summary: String, error: String) -> Self {
-        let (execution, recorder) = Self::new(id, tool, summary);
+        let (mut execution, recorder) = Self::new(id, tool, summary);
         recorder.record(0, EventKind::Error(error));
         execution.finished.store(true, Ordering::Relaxed);
+        execution.failed = true;
         execution
     }
 
@@ -368,4 +490,15 @@ impl Execution {
     pub fn is_running(&self) -> bool {
         !self.finished.load(Ordering::Relaxed) && !self.shutdown.load(Ordering::Relaxed)
     }
+}
+
+/// What an execution's row says in its last column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// On-demand, never asked to do anything yet.
+    Ready,
+    Running,
+    /// On-demand, work finished, results are there to read.
+    Done,
+    Stopped,
 }
