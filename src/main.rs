@@ -68,15 +68,32 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         if event::poll(timeout)?
             && let Event::Key(key) = event::read()?
         {
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                break;
+            // Ctrl+C twice in a row is the one and only way out: the first press arms
+            // the quit, the second confirms it, and any other key in between disarms
+            // it. Nothing else closes the app — a monitor left running for hours
+            // shouldn't die to a mistyped letter.
+            let ctrl_c =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+            if ctrl_c {
+                if app.quit_armed {
+                    break;
+                }
+                app.quit_armed = true;
+                continue;
             }
+            app.quit_armed = false;
+
             match key.code {
+                // The rules screen sits on top of the wizard and takes every key,
+                // including Esc and 'q': in its Edit mode they're just characters.
+                code if app.rules_editor_open() => app.rules_key(code),
                 // A fullscreened table's search box swallows every letter, including
                 // 'q' — so Esc is its only way out, and it first clears an active
                 // query rather than leaving fullscreen outright.
                 KeyCode::Esc => match &app.focus {
-                    Focus::None => break,
+                    // Nothing is fullscreened, so there's nothing to back out of —
+                    // and Esc deliberately doesn't quit.
+                    Focus::None => {}
                     // A detail view goes back to the table it came from, not all the
                     // way out — that table is the thing it was opened on top of.
                     Focus::Detail(_) => app.close_detail(),
@@ -88,13 +105,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     Focus::Table(tf) if !tf.query.is_empty() => app.clear_search(),
                     _ => app.exit_focus(),
                 },
-                // 'q' only quits where no text is being typed — the tables' search box,
-                // the wizard's fields and the monitor's search all need the letter.
-                KeyCode::Char('q')
-                    if matches!(app.focus, Focus::None | Focus::Chart(_) | Focus::Detail(_)) =>
-                {
+                // 'q' closes whatever is fullscreened, and only that — on the plain
+                // dashboard it does nothing (it isn't a shortcut letter either).
+                KeyCode::Char('q') if matches!(app.focus, Focus::Chart(_) | Focus::Detail(_)) => {
                     match app.focus {
-                        Focus::None => break,
                         Focus::Detail(_) => app.close_detail(),
                         _ => app.exit_focus(),
                     }
@@ -149,6 +163,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 KeyCode::Char('a') if on_tools_tab(&app) => app.open_wizard(),
                 KeyCode::Enter if on_tools_tab(&app) => app.open_tool_monitor(),
                 KeyCode::Delete if on_tools_tab(&app) => app.remove_selected_execution(),
+                KeyCode::Char('e') if on_tools_tab(&app) => app.edit_selected_execution(),
                 KeyCode::Char('r') if on_tools_tab(&app) => app.restart_selected_execution(),
                 KeyCode::Up if on_tools_tab(&app) => app.move_tool_selection(-1),
                 KeyCode::Down if on_tools_tab(&app) => app.move_tool_selection(1),

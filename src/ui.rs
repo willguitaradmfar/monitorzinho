@@ -12,12 +12,13 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, DetailFocus, Focus, MATCH_CONTEXT, ParamField, ShortcutTarget, Tab, TableFocus,
-    ToolMonitorFocus, ToolWizard, WizardStep,
+    App, DetailFocus, Focus, MATCH_CONTEXT, ParamField, RulesEditor, RulesMode, ShortcutTarget,
+    Tab, TableFocus, ToolMonitorFocus, ToolWizard, WizardStep,
 };
 use crate::format;
 use crate::history::History;
 use crate::monitor::{Detail, Monitor, TableRow};
+use crate::tools::rewrite::{self, Rule};
 use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, lock_log};
 
 const TAB_BAR_HEIGHT: u16 = 2;
@@ -180,13 +181,24 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
-    let hint = Paragraph::new(Line::styled(
-        format!(
-            " v{} · Tab/Shift+Tab alternar aba ",
-            env!("CARGO_PKG_VERSION")
-        ),
-        Style::default().fg(palette::DIM),
-    ))
+    // With one Ctrl+C already pressed, the corner says what the second one does —
+    // otherwise it's the usual version/tab hint.
+    let hint = if app.quit_armed {
+        Paragraph::new(Line::styled(
+            " Ctrl+C de novo para sair · qualquer outra tecla cancela ",
+            Style::default()
+                .fg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Paragraph::new(Line::styled(
+            format!(
+                " v{} · Tab/Shift+Tab alternar aba · Ctrl+C 2x sair ",
+                env!("CARGO_PKG_VERSION")
+            ),
+            Style::default().fg(palette::DIM),
+        ))
+    }
     .alignment(Alignment::Right);
     frame.render_widget(hint, inner);
 }
@@ -798,7 +810,7 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN))
         .title_bottom(hint_line(
-            "a adicionar · Enter monitorar · r reiniciar · Del remover · ↑/↓ navegar",
+            "a adicionar · Enter monitorar · e editar · r reiniciar · Del remover · ↑/↓ navegar",
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -882,7 +894,14 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
 /// The add-an-execution wizard: pick a tool, fill in what it needs, look at it once,
 /// then start it. Rendered as one centered box whose contents change per step.
 fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) {
+    // The rules screen replaces the form rather than sitting on top of it: two centred
+    // boxes of different sizes only ever read as one box with a hole cut in it.
+    if let Some(editor) = &wizard.editor {
+        render_rules(frame, area, editor);
+        return;
+    }
     let tool = app.tools_available.get(wizard.tool);
+    let editing = wizard.editing.is_some();
     let (subtitle, hint) = match wizard.step {
         WizardStep::SelectTool => (
             "escolher ferramenta".to_string(),
@@ -890,11 +909,19 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
         ),
         WizardStep::Params => (
             tool.map(|t| t.name().to_string()).unwrap_or_default(),
-            "↑/↓ campo · ←/→ alternar opção · digite para editar · Enter continuar · Esc voltar",
+            if editing {
+                "↑/↓ campo · ←/→ alternar opção · digite para editar · Enter continuar · Esc descartar"
+            } else {
+                "↑/↓ campo · ←/→ alternar opção · digite para editar · Enter continuar · Esc voltar"
+            },
         ),
         WizardStep::Confirm => (
             "confirmar".to_string(),
-            "Enter inicia a execução · Esc voltar",
+            if editing {
+                "Enter aplica as mudanças · Esc voltar"
+            } else {
+                "Enter inicia a execução · Esc voltar"
+            },
         ),
     };
 
@@ -911,8 +938,13 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
     // Two rows of border plus a blank line of breathing room at each end.
     let height = (lines.len() as u16).saturating_add(4).min(area.height);
     let box_area = centered(area, width, height);
+    let heading = if editing {
+        "Editar execução"
+    } else {
+        "Nova execução"
+    };
     let block = Block::default()
-        .title(format!(" Nova execução — {subtitle} "))
+        .title(format!(" {heading} — {subtitle} "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::PURPLE))
         .title_bottom(hint_line(hint));
@@ -920,6 +952,188 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
     frame.render_widget(Clear, box_area);
     frame.render_widget(block, box_area);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The rewrite rules of one execution, plus the shared history to pull from.
+fn render_rules(frame: &mut Frame, area: Rect, editor: &RulesEditor) {
+    let (subtitle, hint) = match &editor.mode {
+        RulesMode::List => (
+            "regex/replace",
+            "a nova · e editar · h histórico · Del remover · Esc concluir",
+        ),
+        RulesMode::Edit { editing, .. } => (
+            if editing.is_some() {
+                "editar regra"
+            } else {
+                "nova regra"
+            },
+            "Tab/↑/↓ trocar de linha · Enter salvar · Esc cancelar",
+        ),
+        RulesMode::History { .. } => (
+            "histórico de regras",
+            "↑/↓ escolher · Enter usar nesta execução · Del apagar do histórico · Esc voltar",
+        ),
+    };
+
+    let width = WIZARD_WIDTH.min(area.width);
+    let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
+    let mut lines = match &editor.mode {
+        RulesMode::List => rules_list_lines(editor, text_width),
+        RulesMode::Edit {
+            find,
+            replace,
+            on_replace,
+            ..
+        } => rules_edit_lines(find, replace, *on_replace, text_width),
+        RulesMode::History { entries, selected } => {
+            rules_history_lines(entries, *selected, text_width)
+        }
+    };
+    if let Some(error) = &editor.error {
+        lines.push(Line::raw(""));
+        for line in wrap(&format!("⚠ {error}"), text_width) {
+            lines.push(Line::styled(
+                format!("   {line}"),
+                Style::default().fg(palette::RED),
+            ));
+        }
+    }
+
+    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let box_area = centered(area, width, height);
+    let block = Block::default()
+        .title(format!(" {subtitle} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::CYAN))
+        .title_bottom(hint_line(hint));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One rule as `procurado → substituto`, which is how they read in the file too.
+fn rule_lines(rule: &Rule, marker: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    let replace = if rule.replace.is_empty() {
+        "(apaga)".to_string()
+    } else {
+        rule.replace.clone()
+    };
+    wrap(&format!("{} → {}", rule.find, replace), width)
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let prefix = if i == 0 { marker } else { "   " };
+            Line::styled(format!(" {prefix}{text}"), style)
+        })
+        .collect()
+}
+
+fn rules_list_lines(editor: &RulesEditor, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::raw("")];
+    if editor.rules.is_empty() {
+        lines.push(Line::styled(
+            "   Nenhuma regra. 'a' escreve uma, 'h' pega uma já usada antes.",
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    for (i, rule) in editor.rules.iter().enumerate() {
+        let selected = i == editor.selected;
+        let style = if selected {
+            Style::default()
+                .fg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let marker = if selected { "▶ " } else { "  " };
+        lines.extend(rule_lines(rule, marker, style, width));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "   Aplicadas em ordem, ao que o cliente manda, antes de sair para o destino.",
+        Style::default().fg(palette::DIM),
+    ));
+    lines
+}
+
+fn rules_edit_lines(
+    find: &str,
+    replace: &str,
+    on_replace: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::raw("")];
+    for (label, value, focused) in [
+        ("Procurar (regex)", find, !on_replace),
+        ("Substituir por", replace, on_replace),
+    ] {
+        let marker = if focused { "▶ " } else { "  " };
+        let shown = if focused {
+            format!("{value}▏")
+        } else {
+            value.to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {marker}{label:PARAM_LABEL_WIDTH$}  "),
+                Style::default().fg(palette::DIM),
+            ),
+            Span::styled(shown, value_style(focused)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    let help = if on_replace {
+        "Texto puro; $1 e ${nome} trazem o que os grupos capturaram. Vazio apaga o trecho."
+    } else {
+        "Sintaxe regex, casada sobre os bytes crus — vale para payload binário também."
+    };
+    for line in wrap(help, width) {
+        lines.push(Line::styled(
+            format!("   {line}"),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    lines.push(Line::raw(""));
+    for line in wrap(
+        "A regra roda em cima de cada pedaço lido: casa o que chega numa leitura só, e trocar por algo de tamanho diferente muda o tamanho do que o destino recebe.",
+        width,
+    ) {
+        lines.push(Line::styled(
+            format!("   {line}"),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    lines
+}
+
+fn rules_history_lines(entries: &[Rule], selected: usize, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::raw("")];
+    if entries.is_empty() {
+        lines.push(Line::styled(
+            "   Nada guardado ainda. Toda regra escrita entra aqui e fica.",
+            Style::default().fg(palette::DIM),
+        ));
+        return lines;
+    }
+    for (i, rule) in entries.iter().enumerate() {
+        let is_selected = i == selected;
+        let style = if is_selected {
+            Style::default()
+                .fg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let marker = if is_selected { "▶ " } else { "  " };
+        lines.extend(rule_lines(rule, marker, style, width));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "   Guardado por máquina, não por execução: remover a execução não apaga daqui.",
+        Style::default().fg(palette::DIM),
+    ));
+    lines
 }
 
 fn wizard_tool_lines(app: &App, wizard: &ToolWizard, text_width: usize) -> Vec<Line<'static>> {
@@ -1009,8 +1223,18 @@ fn wizard_param_lines(wizard: &ToolWizard, text_width: usize) -> Vec<Line<'stati
 fn field_value(field: &ParamField, focused: bool) -> String {
     match field.spec.kind {
         ParamKind::Choice(_) => format!("◂ {} ▸", field.value),
+        ParamKind::Rules => rules_summary(&field.value),
         ParamKind::Text if focused => format!("{}▏", field.value),
         ParamKind::Text => field.value.clone(),
+    }
+}
+
+/// A rules field shows its size, not its contents — the list lives on its own screen.
+fn rules_summary(encoded: &str) -> String {
+    match rewrite::decode(encoded).len() {
+        0 => "nenhuma  ⏎ editar".to_string(),
+        1 => "1 regra  ⏎ editar".to_string(),
+        n => format!("{n} regras  ⏎ editar"),
     }
 }
 
@@ -1034,6 +1258,32 @@ fn wizard_confirm_lines(app: &App, wizard: &ToolWizard) -> Vec<Line<'static>> {
         lines.push(Line::raw(""));
     }
     for field in &wizard.fields {
+        // A rules field has no single value to show, so the count goes on the label's
+        // line and the rules themselves follow it — this is the last screen before
+        // anything starts, so it's worth reading them once.
+        if matches!(field.spec.kind, ParamKind::Rules) {
+            let rules = rewrite::decode(&field.value);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("   {:PARAM_LABEL_WIDTH$}  ", field.spec.label),
+                    Style::default().fg(palette::DIM),
+                ),
+                match rules.len() {
+                    0 => Span::styled("(nenhuma)", Style::default().fg(palette::DIM)),
+                    1 => Span::raw("1 regra"),
+                    n => Span::raw(format!("{n} regras")),
+                },
+            ]));
+            for rule in &rules {
+                lines.extend(rule_lines(
+                    rule,
+                    "  ",
+                    Style::default().fg(palette::DIM),
+                    WIZARD_WIDTH as usize - WIZARD_TEXT_MARGIN - PARAM_LABEL_WIDTH,
+                ));
+            }
+            continue;
+        }
         lines.push(Line::from(vec![
             Span::styled(
                 format!(
@@ -1043,12 +1293,22 @@ fn wizard_confirm_lines(app: &App, wizard: &ToolWizard) -> Vec<Line<'static>> {
                 ),
                 Style::default().fg(palette::DIM),
             ),
-            Span::raw(field.value.clone()),
+            if field.value.is_empty() {
+                // An optional field left blank still gets a line, so the confirmation
+                // shows the whole form rather than quietly hiding part of it.
+                Span::styled("(vazio)", Style::default().fg(palette::DIM))
+            } else {
+                Span::raw(field.value.clone())
+            },
         ]));
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "   Enter inicia agora — a porta passa a ser ouvida imediatamente.",
+        if wizard.editing.is_some() {
+            "   Enter aplica agora — a execução atual para e recomeça com estes parâmetros."
+        } else {
+            "   Enter inicia agora — a porta passa a ser ouvida imediatamente."
+        },
         Style::default().fg(palette::DIM),
     ));
     lines

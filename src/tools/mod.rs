@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub mod persist;
+pub mod poll;
+pub mod rewrite;
+pub mod tls;
 pub mod tunnel;
 
 /// How one parameter is edited in the add-execution wizard.
@@ -20,6 +23,9 @@ pub enum ParamKind {
     /// One of a fixed set, cycled with ←/→ rather than typed, so it can't be spelled
     /// wrong.
     Choice(&'static [&'static str]),
+    /// A list of search/replace rules, edited on its own screen because it's the one
+    /// parameter that isn't a single value. The stored value is `rewrite::encode`d.
+    Rules,
 }
 
 /// One thing a tool needs to know before it can start.
@@ -47,6 +53,16 @@ impl ParamSpec {
             help,
             default,
             kind: ParamKind::Text,
+        }
+    }
+
+    pub fn rules(key: &'static str, label: &'static str, help: &'static str) -> Self {
+        Self {
+            key,
+            label,
+            help,
+            default: "",
+            kind: ParamKind::Rules,
         }
     }
 

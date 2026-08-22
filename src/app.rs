@@ -3,11 +3,13 @@ use std::collections::{HashMap, HashSet};
 use std::thread;
 use std::time::Duration;
 
+use crossterm::event::KeyCode;
 use sysinfo::{Pid, Signal};
 
 use crate::history::{self, CAPACITY, History};
 use crate::monitor::{self, Detail, Monitor, SystemState, TableMonitor, TableRow};
 use crate::tools::persist::ExecutionSpec;
+use crate::tools::rewrite::{self, Rule};
 use crate::tools::{self, Execution, ParamKind, ParamSpec, Tool};
 
 /// The top-level views. Each is sampled only while it's the active tab — see
@@ -41,8 +43,9 @@ const SAVE_EVERY_N_TICKS: u32 = 5;
 /// actually released the port by the time the new one asks for it.
 const RESTART_GRACE: Duration = Duration::from_millis(300);
 
-/// a-z minus 'q' (always quits/exits) and 'x' (left free in case it's ever needed
-/// again — a fullscreened table's search box swallows every other letter it's given).
+/// a-z minus 'q' (closes a fullscreened chart/detail) and 'x' (left free in case it's
+/// ever needed again — a fullscreened table's search box swallows every other letter
+/// it's given). Quitting the app is Ctrl+C twice, never a letter.
 const SHORTCUT_LETTERS: &[char] = &[
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'r', 's', 't',
     'u', 'v', 'w', 'y', 'z',
@@ -267,6 +270,10 @@ impl ToolsState {
         self.executions.get(self.selected)
     }
 
+    fn index_of(&self, id: u64) -> Option<usize> {
+        self.executions.iter().position(|e| e.id == id)
+    }
+
     pub fn by_id(&self, id: u64) -> Option<&Execution> {
         self.executions.iter().find(|e| e.id == id)
     }
@@ -358,6 +365,143 @@ pub struct ToolWizard {
     /// Why the last attempt to start failed — shown in place until the user changes
     /// something. `Tool::start` does the validating, so this is whatever it said.
     pub error: Option<String>,
+    /// The rules screen, while it's open on top of the form.
+    pub editor: Option<RulesEditor>,
+    /// The execution being reconfigured, or `None` when adding a new one. An edit skips
+    /// the tool-picking step — the tool is what it already is — and replaces that
+    /// execution instead of appending one.
+    pub editing: Option<u64>,
+}
+
+/// Editing one execution's list of rewrite rules.
+///
+/// It lives inside the wizard rather than beside it: the list belongs to the parameter
+/// being filled in, and closing it writes the encoded value straight back into that
+/// field. Nothing is committed to the execution until the wizard itself is confirmed.
+pub struct RulesEditor {
+    /// Which wizard field this list belongs to.
+    field: usize,
+    pub rules: Vec<Rule>,
+    pub selected: usize,
+    pub mode: RulesMode,
+    pub error: Option<String>,
+}
+
+pub enum RulesMode {
+    /// Looking at this execution's rules.
+    List,
+    /// Typing one rule. `editing` is the index being replaced, or `None` for a new one.
+    Edit {
+        find: String,
+        replace: String,
+        on_replace: bool,
+        editing: Option<usize>,
+    },
+    /// Picking from the rules saved by every execution that ever had one.
+    History { entries: Vec<Rule>, selected: usize },
+}
+
+impl RulesEditor {
+    fn new(field: usize, encoded: &str) -> Self {
+        Self {
+            field,
+            rules: rewrite::decode(encoded),
+            selected: 0,
+            mode: RulesMode::List,
+            error: None,
+        }
+    }
+
+    fn edit_new(&mut self) {
+        self.mode = RulesMode::Edit {
+            find: String::new(),
+            replace: String::new(),
+            on_replace: false,
+            editing: None,
+        };
+        self.error = None;
+    }
+
+    fn edit_selected(&mut self) {
+        let Some(rule) = self.rules.get(self.selected) else {
+            return;
+        };
+        self.mode = RulesMode::Edit {
+            find: rule.find.clone(),
+            replace: rule.replace.clone(),
+            on_replace: false,
+            editing: Some(self.selected),
+        };
+        self.error = None;
+    }
+
+    /// Validates the typed pattern and files it, both in this list and in the shared
+    /// history. Compiling here is the point: a rule that can't compile would otherwise
+    /// only fail much later, when the execution refuses to start.
+    fn commit(&mut self) {
+        let RulesMode::Edit {
+            find,
+            replace,
+            editing,
+            ..
+        } = &self.mode
+        else {
+            return;
+        };
+        if find.is_empty() {
+            self.error = Some("informe o que procurar".to_string());
+            return;
+        }
+        let rule = Rule {
+            find: find.clone(),
+            replace: replace.clone(),
+        };
+        if let Err(e) = rewrite::Rules::parse(&rewrite::encode(std::slice::from_ref(&rule))) {
+            self.error = Some(e);
+            return;
+        }
+        match editing {
+            Some(index) => {
+                let index = *index;
+                self.rules[index] = rule.clone();
+                self.selected = index;
+            }
+            None => {
+                self.rules.push(rule.clone());
+                self.selected = self.rules.len() - 1;
+            }
+        }
+        rewrite::remember(&rule);
+        self.mode = RulesMode::List;
+        self.error = None;
+    }
+
+    fn open_history(&mut self) {
+        self.mode = RulesMode::History {
+            entries: rewrite::history(),
+            selected: 0,
+        };
+        self.error = None;
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        match &mut self.mode {
+            RulesMode::List => {
+                if !self.rules.is_empty() {
+                    let last = self.rules.len() as i32 - 1;
+                    self.selected = (self.selected as i32 + delta).clamp(0, last) as usize;
+                }
+            }
+            RulesMode::History { entries, selected } => {
+                if !entries.is_empty() {
+                    let last = entries.len() as i32 - 1;
+                    *selected = (*selected as i32 + delta).clamp(0, last) as usize;
+                }
+            }
+            // Up/Down move between the two lines of the form instead.
+            RulesMode::Edit { on_replace, .. } => *on_replace = delta > 0,
+        }
+    }
 }
 
 /// How many lines of context are kept above a match when jumping to it, so a hit never
@@ -447,6 +591,10 @@ pub struct App {
     pub tools: ToolsState,
     pub focus: Focus,
     pub tab: Tab,
+    /// Set by the first Ctrl+C and cleared by any other key: the app only closes on a
+    /// second Ctrl+C pressed straight after the first, so a stray one never kills a
+    /// session that's carrying live executions.
+    pub quit_armed: bool,
     state: SystemState,
     ticks_since_save: u32,
 }
@@ -495,6 +643,7 @@ impl App {
             tools,
             focus: Focus::None,
             tab: Tab::Overview,
+            quit_armed: false,
             state: SystemState::new(),
             ticks_since_save: 0,
         }
@@ -868,6 +1017,8 @@ impl App {
             fields: Vec::new(),
             field: 0,
             error: None,
+            editor: None,
+            editing: None,
         });
     }
 
@@ -930,6 +1081,118 @@ impl App {
         }
     }
 
+    /// True while the rules screen is on top of the wizard, so key handling can go
+    /// there first instead of to the form underneath.
+    pub fn rules_editor_open(&self) -> bool {
+        matches!(&self.focus, Focus::Wizard(wizard) if wizard.editor.is_some())
+    }
+
+    /// Every key while the rules screen is open. One entry point rather than an arm per
+    /// binding, because what a letter means depends on which of the three modes is
+    /// showing — in `Edit` they're all just text.
+    pub fn rules_key(&mut self, code: KeyCode) {
+        let Focus::Wizard(wizard) = &mut self.focus else {
+            return;
+        };
+        let Some(editor) = &mut wizard.editor else {
+            return;
+        };
+
+        if let RulesMode::Edit {
+            find,
+            replace,
+            on_replace,
+            ..
+        } = &mut editor.mode
+        {
+            let line = if *on_replace { replace } else { find };
+            match code {
+                KeyCode::Char(c) => {
+                    line.push(c);
+                    editor.error = None;
+                }
+                KeyCode::Backspace => {
+                    line.pop();
+                    editor.error = None;
+                }
+                KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
+                    *on_replace = !*on_replace;
+                }
+                KeyCode::Enter => editor.commit(),
+                KeyCode::Esc => {
+                    editor.mode = RulesMode::List;
+                    editor.error = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if let RulesMode::History { entries, selected } = &editor.mode {
+            match code {
+                KeyCode::Up => editor.move_selection(-1),
+                KeyCode::Down => editor.move_selection(1),
+                KeyCode::Enter => {
+                    if let Some(rule) = entries.get(*selected).cloned() {
+                        // Re-filed as it's picked, so the history keeps ordering itself
+                        // by what's actually being used.
+                        rewrite::remember(&rule);
+                        editor.rules.push(rule);
+                        editor.selected = editor.rules.len() - 1;
+                        editor.mode = RulesMode::List;
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Some(rule) = entries.get(*selected).cloned() {
+                        rewrite::forget(&rule);
+                        editor.open_history();
+                    }
+                }
+                KeyCode::Esc => editor.mode = RulesMode::List,
+                _ => {}
+            }
+            return;
+        }
+
+        match code {
+            KeyCode::Up => editor.move_selection(-1),
+            KeyCode::Down => editor.move_selection(1),
+            KeyCode::Char('a') => editor.edit_new(),
+            KeyCode::Char('e') | KeyCode::Enter => editor.edit_selected(),
+            KeyCode::Char('h') => editor.open_history(),
+            KeyCode::Delete => {
+                // Only from this execution. The shared history is deliberately left
+                // alone — that's the whole reason it's a separate list.
+                if editor.selected < editor.rules.len() {
+                    editor.rules.remove(editor.selected);
+                    editor.selected = editor.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Esc => self.close_rules_editor(),
+            _ => {}
+        }
+    }
+
+    /// Closes the rules screen, writing the list back into the field it belongs to.
+    fn close_rules_editor(&mut self) {
+        let Focus::Wizard(wizard) = &mut self.focus else {
+            return;
+        };
+        let Some(editor) = wizard.editor.take() else {
+            return;
+        };
+        if let Some(field) = wizard.fields.get_mut(editor.field) {
+            field.value = rewrite::encode(&editor.rules);
+        }
+        // Step off the rules field on the way out. Leaving the cursor on it would mean
+        // the next Enter reopens the list the user just closed, with no way forward
+        // that doesn't look like the form is stuck.
+        if editor.field + 1 < wizard.fields.len() {
+            wizard.field = editor.field + 1;
+        }
+        wizard.error = None;
+    }
+
     /// Enter: advance a step, or — on the last one — actually start the execution.
     /// Starting is the only step that can refuse to advance, and it says why.
     pub fn wizard_advance(&mut self) {
@@ -956,6 +1219,14 @@ impl App {
                 wizard.step = WizardStep::Params;
             }
             WizardStep::Params => {
+                // A rules field is a list, not a value: Enter on it opens that list
+                // rather than moving the wizard along.
+                if let Some(field) = wizard.fields.get(wizard.field)
+                    && matches!(field.spec.kind, ParamKind::Rules)
+                {
+                    wizard.editor = Some(RulesEditor::new(wizard.field, &field.value));
+                    return;
+                }
                 wizard.error = None;
                 wizard.step = WizardStep::Confirm;
             }
@@ -971,6 +1242,8 @@ impl App {
         };
         match wizard.step {
             WizardStep::SelectTool => self.focus = Focus::None,
+            // There's no tool-picking step behind an edit to go back to.
+            WizardStep::Params if wizard.editing.is_some() => self.focus = Focus::None,
             WizardStep::Params => {
                 wizard.error = None;
                 wizard.step = WizardStep::SelectTool;
@@ -998,6 +1271,21 @@ impl App {
             .map(|f| (f.spec.key, f.value.trim().to_string()))
             .collect();
 
+        let editing = wizard.editing;
+        // Reconfiguring means the old execution has to let go of its port before the
+        // new one can ask for it, exactly like a restart — and for the same reason it's
+        // a stop, wait, start rather than a swap.
+        let replacing = editing.and_then(|id| self.tools.index_of(id));
+        let previous = replacing.and_then(|index| {
+            let existing = &self.tools.executions[index];
+            let saved = existing.spec().cloned();
+            existing.stop();
+            saved
+        });
+        if previous.is_some() {
+            thread::sleep(RESTART_GRACE);
+        }
+
         // Unlike a restored execution, one being added by hand shouldn't be accepted
         // when it can't start — the user is right there and can fix the field.
         let id = self.tools.take_id();
@@ -1010,16 +1298,79 @@ impl App {
                         .map(|(key, value)| (key.to_string(), value.clone()))
                         .collect(),
                 };
-                self.tools.executions.push(execution.with_spec(spec));
-                self.tools.selected = self.tools.executions.len() - 1;
+                let execution = execution.with_spec(spec);
+                match replacing {
+                    Some(index) => {
+                        self.tools.executions[index] = execution;
+                        self.tools.selected = index;
+                    }
+                    None => {
+                        self.tools.executions.push(execution);
+                        self.tools.selected = self.tools.executions.len() - 1;
+                    }
+                }
                 self.tools.persist();
                 self.focus = Focus::None;
             }
             Err(message) => {
+                // The old one was already stopped to free the port, so a rejected edit
+                // would otherwise cost a working execution over a typo. Put it back the
+                // way it was and let the wizard say what was wrong.
+                if let (Some(index), Some(saved)) = (replacing, previous)
+                    && let Some(tool) = self.tools_available.iter().find(|t| t.id() == saved.tool)
+                {
+                    let values = restore_params(tool.as_ref(), &saved);
+                    let restored = self.tools.launch(tool.as_ref(), values);
+                    self.tools.executions[index] = restored;
+                }
+                let Focus::Wizard(wizard) = &mut self.focus else {
+                    return;
+                };
                 wizard.error = Some(message);
                 wizard.step = WizardStep::Params;
             }
         }
+    }
+
+    /// Opens the wizard on an execution that already exists ('e'), pre-filled with what
+    /// it was started with.
+    pub fn edit_selected_execution(&mut self) {
+        let Some(existing) = self.tools.selected() else {
+            return;
+        };
+        let (id, Some(saved)) = (existing.id, existing.spec().cloned()) else {
+            return;
+        };
+        let Some(index) = self
+            .tools_available
+            .iter()
+            .position(|t| t.id() == saved.tool)
+        else {
+            return;
+        };
+        let tool = &self.tools_available[index];
+        let fields = tool
+            .params()
+            .into_iter()
+            .map(|spec| ParamField {
+                value: saved
+                    .params
+                    .get(spec.key)
+                    .cloned()
+                    .unwrap_or_else(|| spec.default.to_string()),
+                spec,
+            })
+            .collect();
+        self.focus = Focus::Wizard(ToolWizard {
+            // Straight to the form: the tool of an existing execution isn't in question.
+            step: WizardStep::Params,
+            tool: index,
+            fields,
+            field: 0,
+            error: None,
+            editor: None,
+            editing: Some(id),
+        });
     }
 
     /// Restarts the selected execution from its saved configuration ('r'). The point

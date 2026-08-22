@@ -5,17 +5,28 @@
 //! client at the tunnel instead of straight at the server is the one way to read a
 //! connection's actual payload without `CAP_NET_RAW`, because the bytes pass through
 //! this process rather than past it. It also sees plaintext that packet capture
-//! wouldn't: if the client speaks TLS to the tunnel this shows ciphertext like anything
-//! else, but for the plain HTTP/Postgres/Redis/gRPC traffic that debugging usually
+//! wouldn't: for the plain HTTP/Postgres/Redis/gRPC traffic that debugging usually
 //! involves, this is the whole conversation.
+//!
+//! A TLS target goes one better. With TLS on, the client still speaks plain TCP to the
+//! tunnel and the tunnel does the handshake with the server, so what gets recorded is
+//! the decrypted conversation with a server that would otherwise only ever show
+//! ciphertext. (Client-side TLS is a different thing and stays out of scope: a client
+//! that speaks TLS *to* the tunnel just logs as ciphertext, since we have no
+//! certificate it would trust.)
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
+use super::poll;
+use super::rewrite::{Rules, rewritten};
+use super::tls;
 use super::{Direction, EventKind, Execution, ParamSpec, Recorder, Tool};
 
 /// Relay buffer. Big enough that a bulk transfer isn't chopped into hundreds of log
@@ -31,6 +42,9 @@ const POLL: Duration = Duration::from_millis(200);
 const MAX_UDP_CLIENTS: usize = 64;
 
 const PROTOCOLS: &[&str] = &["TCP", "UDP"];
+/// Saved verbatim into `tools.json`, so these strings are part of the on-disk format:
+/// change the wording and a saved execution silently falls back to the first option.
+const TLS_MODES: &[&str] = &["não", "sim", "sim, sem validar certificado"];
 
 pub struct TunnelTool;
 
@@ -67,23 +81,79 @@ impl Tool for TunnelTool {
                 "127.0.0.1:5432",
                 "Destino real, host:porta. Nomes são resolvidos agora, na criação",
             ),
+            ParamSpec::choice(
+                "tls",
+                "TLS no destino",
+                TLS_MODES,
+                "Só para TCP: o cliente continua em texto puro e o túnel fala TLS com o destino, então o log mostra o conteúdo decifrado",
+            ),
+            ParamSpec::rules(
+                "rewrite",
+                "Regex/replace",
+                "Regras aplicadas ao que o cliente manda, antes de sair para o destino. Enter abre a lista",
+            ),
+            ParamSpec::text(
+                "sni",
+                "Nome no certificado",
+                "",
+                "Só com TLS: nome enviado no SNI e conferido no certificado. Vazio usa o host do destino — preencha quando o destino for um IP",
+            ),
         ]
     }
 
     fn summarize(&self, params: &HashMap<&'static str, String>) -> String {
         let get = |key| params.get(key).map(String::as_str).unwrap_or("?");
-        format!("{} {} → {}", get("proto"), get("listen"), get("target"))
+        let tls = match tls_mode(params) {
+            TlsMode::Off => "",
+            TlsMode::Verified => "TLS ",
+            TlsMode::Unverified => "TLS(sem validar) ",
+        };
+        let rules = match super::rewrite::decode(get("rewrite")).len() {
+            0 => String::new(),
+            1 => "  ·  1 regra".to_string(),
+            n => format!("  ·  {n} regras"),
+        };
+        format!(
+            "{} {} → {tls}{}{rules}",
+            get("proto"),
+            get("listen"),
+            get("target")
+        )
     }
 
     fn start(&self, id: u64, params: &HashMap<&'static str, String>) -> Result<Execution, String> {
         let proto = params.get("proto").map(String::as_str).unwrap_or("TCP");
         let listen = params.get("listen").map(String::as_str).unwrap_or_default();
         let target = params.get("target").map(String::as_str).unwrap_or_default();
+        let sni = params.get("sni").map(String::as_str).unwrap_or_default();
+        let mode = tls_mode(params);
+        // Compiled before anything is listening, so a bad pattern is an error on the
+        // form rather than a rule that silently never matches.
+        let rules = Arc::new(Rules::parse(
+            params
+                .get("rewrite")
+                .map(String::as_str)
+                .unwrap_or_default(),
+        )?);
 
         let listen_addr = resolve(listen, "endereço de escuta")?;
         // Resolved here purely to fail early on a typo'd host; the relay reconnects by
         // name so a target behind a changing DNS record still works.
         resolve(target, "destino")?;
+
+        if mode != TlsMode::Off && proto == "UDP" {
+            return Err("TLS só vale para TCP — para UDP, desligue a opção".to_string());
+        }
+        // Built now, before anything is listening, so a bad SNI or an unusable trust
+        // store is an error in the form rather than a connection that fails later.
+        let tls_client = match mode {
+            TlsMode::Off => None,
+            mode => Some(Arc::new(tls::Client::new(
+                target,
+                sni,
+                mode == TlsMode::Verified,
+            )?)),
+        };
 
         let (execution, recorder) = Execution::new(id, self.name(), self.summarize(params));
         let finished = execution.finish_flag();
@@ -97,7 +167,7 @@ impl Tool for TunnelTool {
                     .set_read_timeout(Some(POLL))
                     .map_err(|e| format!("não consegui configurar o socket: {e}"))?;
                 thread::spawn(move || {
-                    serve_udp(socket, target, &recorder);
+                    serve_udp(socket, target, rules, &recorder);
                     finished.store(true, Ordering::Relaxed);
                 });
             }
@@ -110,13 +180,31 @@ impl Tool for TunnelTool {
                     .set_nonblocking(true)
                     .map_err(|e| format!("não consegui configurar o socket: {e}"))?;
                 thread::spawn(move || {
-                    serve_tcp(listener, target, &recorder);
+                    serve_tcp(listener, target, tls_client, rules, &recorder);
                     finished.store(true, Ordering::Relaxed);
                 });
             }
         }
 
         Ok(execution)
+    }
+}
+
+/// What to do with the connection to the target, once the wizard's wording is out of
+/// the way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TlsMode {
+    Off,
+    Verified,
+    /// TLS with certificate checking turned off, for self-signed and internal CAs.
+    Unverified,
+}
+
+fn tls_mode(params: &HashMap<&'static str, String>) -> TlsMode {
+    match params.get("tls").map(String::as_str) {
+        Some(mode) if mode == TLS_MODES[1] => TlsMode::Verified,
+        Some(mode) if mode == TLS_MODES[2] => TlsMode::Unverified,
+        _ => TlsMode::Off,
     }
 }
 
@@ -138,10 +226,17 @@ fn is_timeout(err: &std::io::Error) -> bool {
     matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-fn serve_tcp(listener: TcpListener, target: String, rec: &Recorder) {
+fn serve_tcp(
+    listener: TcpListener,
+    target: String,
+    tls_client: Option<Arc<tls::Client>>,
+    rules: Arc<Rules>,
+    rec: &Recorder,
+) {
+    let how = if tls_client.is_some() { " via TLS" } else { "" };
     rec.record(
         0,
-        EventKind::Note(format!("túnel TCP no ar, encaminhando para {target}")),
+        EventKind::Note(format!("túnel TCP no ar, encaminhando para {target}{how}")),
     );
     let mut next_conn: u64 = 0;
     while !rec.stopping() {
@@ -152,12 +247,25 @@ fn serve_tcp(listener: TcpListener, target: String, rec: &Recorder) {
                 rec.stats().connections.fetch_add(1, Ordering::Relaxed);
                 rec.stats().active.fetch_add(1, Ordering::Relaxed);
                 let (target, rec) = (target.clone(), rec.clone());
+                let (tls_client, rules) = (tls_client.clone(), rules.clone());
                 thread::spawn(move || {
-                    relay_tcp(client, peer, &target, conn, &rec);
+                    relay_tcp(
+                        client,
+                        peer,
+                        &target,
+                        tls_client.as_deref(),
+                        &rules,
+                        conn,
+                        &rec,
+                    );
                     rec.stats().active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
-            Err(e) if is_timeout(&e) => thread::sleep(POLL),
+            // Nothing waiting. Sleeping here instead would charge every new connection
+            // up to a full `POLL` before it was even accepted.
+            Err(e) if is_timeout(&e) => {
+                poll::readable(listener.as_raw_fd(), poll::TIMEOUT_MS);
+            }
             Err(e) => {
                 rec.record(0, EventKind::Error(format!("accept falhou: {e}")));
                 break;
@@ -169,7 +277,15 @@ fn serve_tcp(listener: TcpListener, target: String, rec: &Recorder) {
 
 /// Handles one accepted connection: dial the target, then copy in both directions until
 /// either side hangs up.
-fn relay_tcp(client: TcpStream, peer: SocketAddr, target: &str, conn: u64, rec: &Recorder) {
+fn relay_tcp(
+    client: TcpStream,
+    peer: SocketAddr,
+    target: &str,
+    tls_client: Option<&tls::Client>,
+    rules: &Rules,
+    conn: u64,
+    rec: &Recorder,
+) {
     rec.record(
         conn,
         EventKind::Opened {
@@ -188,6 +304,31 @@ fn relay_tcp(client: TcpStream, peer: SocketAddr, target: &str, conn: u64, rec: 
         }
     };
 
+    // A TLS session is one state machine for both directions, so it can't be split
+    // between two pumps the way a pair of plain sockets can; `tls::relay` runs both
+    // directions in this thread instead.
+    if let Some(tls_client) = tls_client {
+        match tls_client.session() {
+            Ok(session) => tls::relay(client, upstream, session, rules, conn, rec),
+            Err(e) => {
+                rec.record(conn, EventKind::Error(e));
+                let _ = client.shutdown(Shutdown::Both);
+            }
+        }
+        rec.record(
+            conn,
+            EventKind::Closed {
+                reason: "conexão encerrada".to_string(),
+            },
+        );
+        return;
+    }
+
+    // Same reasoning as the TLS path: a relay only forwards what someone else framed,
+    // so coalescing small writes can only add latency.
+    let _ = client.set_nodelay(true);
+    let _ = upstream.set_nodelay(true);
+
     // Each direction needs its own handle on both sockets: one to read from, one to
     // write to, and `shutdown` on either end unblocks whichever side is still reading.
     let (Ok(client_r), Ok(upstream_r)) = (client.try_clone(), upstream.try_clone()) else {
@@ -201,10 +342,18 @@ fn relay_tcp(client: TcpStream, peer: SocketAddr, target: &str, conn: u64, rec: 
     let back = {
         let rec = rec.clone();
         thread::spawn(move || {
-            pump(upstream_r, client, Direction::FromTarget, conn, &rec);
+            pump(upstream_r, client, Direction::FromTarget, None, conn, &rec);
         })
     };
-    pump(client_r, upstream, Direction::ToTarget, conn, rec);
+    // Only this direction gets the rules: they exist to fix up what the client sends.
+    pump(
+        client_r,
+        upstream,
+        Direction::ToTarget,
+        Some(rules),
+        conn,
+        rec,
+    );
     let _ = back.join();
 
     rec.record(
@@ -218,15 +367,23 @@ fn relay_tcp(client: TcpStream, peer: SocketAddr, target: &str, conn: u64, rec: 
 /// Copies one direction of a TCP connection, recording every chunk. Ends on EOF, on
 /// error, or when the execution is stopped; either way it shuts both sockets down so
 /// the opposite pump ends too instead of blocking forever on a half-dead connection.
-fn pump(mut from: TcpStream, mut to: TcpStream, dir: Direction, conn: u64, rec: &Recorder) {
+fn pump(
+    mut from: TcpStream,
+    mut to: TcpStream,
+    dir: Direction,
+    rules: Option<&Rules>,
+    conn: u64,
+    rec: &Recorder,
+) {
     let _ = from.set_read_timeout(Some(POLL));
     let mut buf = vec![0u8; RELAY_BUF];
     while !rec.stopping() {
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                rec.record_data(conn, dir, &buf[..n]);
-                if let Err(e) = to.write_all(&buf[..n]) {
+                let payload = rewritten(rules, &buf[..n], conn, rec);
+                rec.record_data(conn, dir, &payload);
+                if let Err(e) = to.write_all(&payload) {
                     rec.record(conn, EventKind::Error(format!("escrita falhou: {e}")));
                     break;
                 }
@@ -245,7 +402,7 @@ fn pump(mut from: TcpStream, mut to: TcpStream, dir: Direction, conn: u64, rec: 
 /// UDP has no connections, so a "flow" here is just everything arriving from one source
 /// address. Each source gets its own upstream socket (so the target sees them apart)
 /// plus a thread carrying replies back.
-fn serve_udp(socket: UdpSocket, target: String, rec: &Recorder) {
+fn serve_udp(socket: UdpSocket, target: String, rules: Arc<Rules>, rec: &Recorder) {
     rec.record(
         0,
         EventKind::Note(format!("túnel UDP no ar, encaminhando para {target}")),
@@ -292,8 +449,9 @@ fn serve_udp(socket: UdpSocket, target: String, rec: &Recorder) {
         }
 
         let (conn, upstream) = &clients[&peer];
-        rec.record_data(*conn, Direction::ToTarget, &buf[..n]);
-        if let Err(e) = upstream.send(&buf[..n]) {
+        let payload = rewritten(Some(&rules), &buf[..n], *conn, rec);
+        rec.record_data(*conn, Direction::ToTarget, &payload);
+        if let Err(e) = upstream.send(&payload) {
             rec.record(*conn, EventKind::Error(format!("envio falhou: {e}")));
         }
     }

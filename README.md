@@ -2,15 +2,23 @@
 
 A lightweight terminal system monitor, written in Rust.
 
-- **CPU**, **memory**, **disk** (occupancy + read/write throughput), **network**
-  (down/up), and **GPU** (NVIDIA, auto-detected) — last value, peak, and a
+- **Charts** for CPU, memory, disk (occupancy + read/write throughput),
+  network (down/up), and GPU (NVIDIA, auto-detected) — last value, peak, and a
   recent-history sparkline for each.
+- **Tables** for processes (as a tree), listening ports, live connections, SSH
+  sessions, and system info — any of them fullscreenable, searchable as you
+  type, with a per-connection detail view.
+- **Tools** that don't just watch but *run*: a recording TCP/UDP tunnel that
+  shows you the payload of a connection, speaks TLS to the target, and can
+  rewrite bytes on the way through.
 - History is persisted to disk and restored on restart, so the charts aren't
-  empty on launch.
-- Small, fast, no garbage collector: the release binary is a couple of
-  megabytes and starts instantly.
-- Built to grow: adding a new metric is implementing one trait and registering
-  it — see [Architecture](#architecture).
+  empty on launch. Tools come back running too.
+- Small, fast, no garbage collector: a single ~5 MB binary with no runtime to
+  install, starting instantly.
+- Built to grow: adding a metric, a table, or a tool is implementing one trait
+  and registering it — see [Architecture](#architecture).
+
+The interface is in Portuguese; this README is not.
 
 ## Install
 
@@ -25,8 +33,6 @@ x86_64 only for now). Then just run:
 monitorzinho
 ```
 
-**Keys:** `q`, `Esc`, or `Ctrl+C` to quit (saves history cleanly before exit).
-
 ### Build from source
 
 Requires a stable Rust toolchain ([rustup.rs](https://rustup.rs)).
@@ -38,34 +44,140 @@ cargo build --release
 
 or just `cargo run --release` during development.
 
-## What it shows
+## Tabs
 
-- **System** — CPU usage, memory usage (+ used/total in GB).
+`Tab` / `Shift+Tab` cycle between three tabs. Everything samples every 2
+seconds; spacebar forces an immediate refresh, like `top`'s.
+
+### Visão Geral — the charts
+
+- **System** — CPU usage (with logical core count) and memory usage
+  (+ used/total in GB).
 - **Disk** — occupancy of the root filesystem as a compact numeric line
-  (changes too slowly for a chart to be useful), plus read/write throughput
+  (it changes too slowly for a chart to be useful), plus read/write throughput
   charts.
 - **Network** — download/upload throughput.
 - **GPU** — utilization and VRAM usage, only shown on machines with a working
   NVIDIA driver (via [NVML](https://developer.nvidia.com/nvidia-management-library-nvml),
   dynamically loaded — the binary runs fine without one).
-- **Top CPU** / **Top Memory** — the 10 heaviest processes by each metric,
-  with full command line and run time.
 
 Panels are grouped and color-coded by category, and turn yellow/red as a
 metric approaches its natural limit (e.g. memory nearing 100%).
 
+### Processos — the tables
+
+- **Ports** — everything listening, TCP and UDP together, newest first.
+- **Connections** — established sockets with per-connection rates and age,
+  refreshed live while fullscreened.
+- **Top CPU** / **Top Memory** — the heaviest processes by each metric, shown
+  as a tree: parents expand to their children with `←`/`→`.
+- **SSH Sessions** — who is logged in over SSH, from where, on which TTY,
+  since when, and what they're running.
+- **System Info** — host, user, gateway, DNS, and a one-line summary of CPU,
+  memory, disk and GPU: the facts that don't belong on a chart.
+
+Each panel has a shortcut key in its corner (`1`–`9`, then letters).
+Pressing it fullscreens that panel with every row, not just the top ten the
+compact grid shows. In a fullscreened table, typing searches immediately —
+there's no search mode to enter first — and `Del` kills the selected process
+(SIGKILL, with its children).
+
+Pressing `Enter` on a connection opens a **detail view**: both endpoints with
+reverse-DNS names and service names, the owning process, throughput, and — for
+TCP — what the kernel knows about the path itself (RTT and its variance,
+congestion window, retransmits, MSS, and so on, read straight from `tcp_info`).
+
+### Ferramentas — the tools
+
+Things monitorzinho runs, rather than watches. An execution owns background
+threads, keeps working while you look at something else, and is restored and
+restarted the next time you launch the app.
+
+`a` walks you through adding one: pick the tool, fill in what it needs, look at
+it once, and confirm. `e` reopens that form on an execution that already
+exists, `r` restarts one, `Del` stops and forgets it.
+
+`Enter` opens an execution's live log — every chunk in both directions, newest
+at the top, as text or hex (`Tab`), with type-to-search, `↑`/`↓` to jump
+between matches, and `Ctrl+F` to hide everything that doesn't match.
+
+#### Túnel TCP/UDP
+
+Listens on a local port and forwards everything to another host:port,
+recording both directions on the way through.
+
+The point isn't the forwarding — `socat` does that — it's the recording.
+Pointing a client at the tunnel instead of straight at the server is the one
+way to read a connection's actual payload without `CAP_NET_RAW`, because the
+bytes pass through this process rather than past it.
+
+Three things it does beyond relaying:
+
+- **TLS to the target.** The client still speaks plain TCP to the tunnel while
+  the tunnel does the handshake with the real server, so what gets logged is
+  the *decrypted* conversation with a server that would otherwise only ever
+  show ciphertext. Certificates are checked against the system trust store plus
+  the bundled Mozilla roots, or not checked at all if you say so — a debugging
+  escape hatch for self-signed and internal CAs. Fill in a certificate name
+  when the target is an IP.
+- **regex/replace.** A list of rules applied to what the client sends, before
+  it leaves for the target — the reason it exists is a header that has to
+  change for the far side to accept the connection at all, like
+  `Host: note:8080` becoming `Host: google.com.br`. Rules run in order, over
+  the raw bytes, so they work on binary payloads too, and the log shows a note
+  naming whichever ones fired. Every rule you write is kept in a shared
+  history, per machine and not per execution: removing the execution leaves it
+  there to pick again.
+- **UDP.** Same idea, one flow per source address.
+
+## Keys
+
+| Key | Where | What |
+| --- | --- | --- |
+| `Tab` / `Shift+Tab` | anywhere | next/previous tab |
+| space | a tab | refresh now, without waiting for the tick |
+| `1`–`9`, letters | Visão Geral, Processos | fullscreen that panel |
+| `Enter` | a fullscreened table | open the row's detail view, where there is one |
+| `←` / `→` | process tree | collapse/expand |
+| `Del` | a fullscreened table | kill the selected process (SIGKILL, with children) |
+| any letter | a fullscreened table | search, live |
+| `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart / remove an execution |
+| `Enter` | Ferramentas | open that execution's live log |
+| `Tab`, `Ctrl+F` | an execution's log | hex view, matches-only filter |
+| `Esc` | anywhere | back one level (clears a search first) |
+| `q` | a tab | quit |
+| `Ctrl+C` twice | anywhere | quit — one press only arms it, so a stray `Ctrl+C` can't kill a session carrying live executions |
+
+Quitting saves history cleanly before exit.
+
 ## Architecture
 
-Two small traits drive everything:
+Three small traits drive everything:
 
 - `Monitor` — a metric tracked over time (sparkline + persisted history).
   Implement it in `src/monitor/<name>.rs` and add it to `all_monitors()` in
-  `src/monitor/mod.rs` to add a new one.
-- `TableMonitor` — a ranked snapshot list (like the top-processes tables),
-  for data that doesn't fit a time series.
+  `src/monitor/mod.rs`.
+- `TableMonitor` — a ranked snapshot list, for data that doesn't fit a time
+  series. Optionally answers `detail()` to get an `Enter` view.
+- `Tool` — something that runs: it declares the parameters the wizard should
+  ask for, then starts threads and reports back through a shared event log.
+  Implement it in `src/tools/<name>.rs` and add it to `all_tools()`.
 
-History persists to `~/.local/share/monitorzinho/history.json` (or your
-platform's equivalent data directory).
+There are no bindings crates for the Linux-specific parts: the socket tables
+come from a hand-rolled netlink `SOCK_DIAG` client, names from `getnameinfo`
+through NSS (on background threads, so a slow resolver can't stall the UI),
+and the relays wait on `poll(2)` directly.
+
+### Files on disk
+
+Under `~/.local/share/monitorzinho/` (or your platform's equivalent data
+directory):
+
+| File | What |
+| --- | --- |
+| `history.json` | chart history, so the sparklines survive a restart |
+| `tools.json` | the executions to bring back on launch, and their parameters |
+| `rewrites.json` | every rewrite rule ever written, offered as suggestions |
 
 ## License
 
