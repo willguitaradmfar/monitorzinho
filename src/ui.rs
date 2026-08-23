@@ -1090,7 +1090,14 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
 
     // Width is settled before the lines are built, since the prose in them has to be
     // wrapped to it — and only then is the height known.
-    let width = WIZARD_WIDTH.min(area.width);
+    //
+    // The tool picker is a table and wants room for its widest row; the rest of the
+    // wizard is a form and reads better narrow. Neither ever exceeds the screen.
+    let wanted = match wizard.step {
+        WizardStep::SelectTool => picker_width(app),
+        _ => WIZARD_WIDTH,
+    };
+    let width = wanted.min(area.width.saturating_sub(2).max(20));
     let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
     let lines = match wizard.step {
         WizardStep::SelectTool => wizard_tool_lines(app, wizard, text_width),
@@ -1311,31 +1318,106 @@ fn rules_history_lines(entries: &[Rule], selected: usize, width: usize) -> Vec<L
     lines
 }
 
+/// The tool picker: one row per tool, name in the first column and what it does in the
+/// second.
+///
+/// One line each rather than a name with its description wrapped underneath. Thirteen
+/// tools at three lines apiece is a list you scroll; at one line apiece it is a list you
+/// read — and choosing between tools is a comparison, which wants them side by side.
 fn wizard_tool_lines(app: &App, wizard: &ToolWizard, text_width: usize) -> Vec<Line<'static>> {
+    let name_width = app
+        .tools_available
+        .iter()
+        .map(|tool| tool.name().chars().count())
+        .max()
+        .unwrap_or(0);
+    // Two for the marker, two between the columns, one of breathing room at the end.
+    let description_width = text_width.saturating_sub(name_width + 5).max(20);
+
     let mut lines = vec![Line::raw("")];
     for (i, tool) in app.tools_available.iter().enumerate() {
         let selected = i == wizard.tool;
-        let marker = if selected { "▶ " } else { "  " };
-        let style = if selected {
-            Style::default()
-                .fg(palette::CYAN)
-                .add_modifier(Modifier::BOLD)
+        let (marker, name_style) = if selected {
+            (
+                "▶ ",
+                Style::default()
+                    .fg(palette::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
-            Style::default()
+            ("  ", Style::default())
         };
+        // The description stays dim on the selected row too: it is the same text either
+        // way, and highlighting the whole row would leave nothing pointing at the name.
+        let description_style = if selected {
+            Style::default().fg(palette::CYAN)
+        } else {
+            Style::default().fg(palette::DIM)
+        };
+
+        // The row under the cursor is never cut. Every other row is one line, because
+        // thirteen tools at three lines apiece is a list you scroll rather than read —
+        // but the one being considered is the one whose description has to be complete,
+        // so it opens up and wraps instead of ending in an ellipsis.
+        let mut description = if selected {
+            wrap(tool.description(), description_width)
+        } else {
+            vec![clip(tool.description(), description_width)]
+        };
+        if description.is_empty() {
+            description.push(String::new());
+        }
         lines.push(Line::from(vec![
-            Span::styled(format!(" {marker}"), style),
-            Span::styled(tool.name().to_string(), style),
+            Span::styled(format!(" {marker}"), name_style),
+            Span::styled(format!("{:<name_width$}  ", tool.name()), name_style),
+            Span::styled(description.remove(0), description_style),
         ]));
-        for chunk in wrap(tool.description(), text_width) {
+        // Continuation lines sit under the description column, so the two columns stay
+        // two columns however tall the focused row gets.
+        for rest in description {
             lines.push(Line::styled(
-                format!("     {chunk}"),
-                Style::default().fg(palette::DIM),
+                format!("{}{rest}", " ".repeat(name_width + 5)),
+                description_style,
             ));
         }
-        lines.push(Line::raw(""));
     }
     lines
+}
+
+/// Cuts text to a column width, with an ellipsis so a reader knows it was cut rather
+/// than that the sentence ends there.
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    text.chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
+/// How wide the tool picker would like to be: everything on its widest row, uncut. It
+/// gets that much or the screen, whichever is smaller.
+fn picker_width(app: &App) -> u16 {
+    // The two columns are sized independently — every name is padded to the longest one
+    // — so the widest row is the longest name plus the longest description, which are
+    // rarely the same tool.
+    let longest_name = app
+        .tools_available
+        .iter()
+        .map(|tool| tool.name().chars().count())
+        .max()
+        .unwrap_or(0);
+    let longest_description = app
+        .tools_available
+        .iter()
+        .map(|tool| tool.description().chars().count())
+        .max()
+        .unwrap_or(0);
+    let widest = longest_name + longest_description;
+    // The two columns, the gap between them, the marker, and the borders and padding
+    // the box adds around all of it.
+    (widest + WIZARD_TEXT_MARGIN + 7) as u16
 }
 
 /// Label column for the parameter form, wide enough for the longest label any tool
