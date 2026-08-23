@@ -1108,13 +1108,22 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
                 .tool_for(execution)
                 .map(|tool| tool.columns(execution))
                 .unwrap_or_default();
-            UiRow::new(vec![
+            let row = UiRow::new(vec![
                 Cell::from(execution.tool),
                 Cell::from(execution.summary.clone()),
                 Cell::from(headline),
                 Cell::from(summary),
                 Cell::from(Span::styled(state, style)),
-            ])
+            ]);
+            // Failing right now — the last thing it logged was an error — paints the
+            // whole row. The list is where several executions are watched at once, and a
+            // failure that only exists inside the execution makes the list lie by
+            // omission. It goes back to normal by itself when something works again.
+            if execution.failing() {
+                row.style(Style::default().fg(palette::RED))
+            } else {
+                row
+            }
         })
         .collect();
 

@@ -575,6 +575,11 @@ impl EventLog {
         });
     }
 
+    /// The newest event, or nothing if it hasn't said anything yet.
+    pub fn last(&self) -> Option<&Event> {
+        self.events.back()
+    }
+
     pub fn iter(&self) -> std::collections::vec_deque::Iter<'_, Event> {
         self.events.iter()
     }
@@ -952,6 +957,19 @@ impl Execution {
         execution.finished.store(true, Ordering::Relaxed);
         execution.failed = true;
         execution
+    }
+
+    /// Whether the last thing this execution said was a failure — failing *now*, as
+    /// opposed to having failed at some point and recovered.
+    ///
+    /// Read from the log rather than from a flag a tool sets, so it means the same for
+    /// every tool: an HTTP probe whose status stopped matching, a relay that can't reach
+    /// its target, a measurement losing every packet. And it goes back on its own the
+    /// moment something works again, which is the half that makes it worth showing.
+    pub fn failing(&self) -> bool {
+        lock_log(&self.log)
+            .last()
+            .is_some_and(|event| matches!(event.kind, EventKind::Error(_)))
     }
 
     /// Never got off the ground: a missing parameter, a bad address, a busy port. Told

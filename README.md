@@ -187,6 +187,13 @@ the row stands: `pronta` for an on-demand execution nobody has asked anything
 of yet, `rodando`, `concluída` once there's a result to read, `parada` for one
 that was stopped or never started.
 
+A row whose **last** logged event was an error is drawn in red, and goes back to
+normal by itself when something works again — the list is where several
+executions are watched at once, so a failure that only exists inside one of them
+makes the list lie by omission. Failing *now*, not "has failed": an error an hour
+ago on something that has worked ever since would otherwise paint a row that
+never turns back.
+
 `Enter` opens an execution's live log — every chunk in both directions, oldest
 first with new traffic appending at the bottom, as text or hex (`Tab`), with
 type-to-search, `↑`/`↓` to jump between matches, `Ctrl+F` to hide everything
