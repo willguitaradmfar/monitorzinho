@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sysinfo::Pid;
 
@@ -12,8 +12,12 @@ use super::ports;
 use super::process::{command_of, describe_owner, kill_danger};
 use super::resolve::{Lookup, Resolver, Services, user_name};
 use super::{Danger, Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow};
+use crate::app::TICK_RATE;
 use crate::format;
 use crate::tools::Handoff;
+
+/// The longest a container reading may go stale, however expensive it is.
+const MAX_CONTAINER_INTERVAL: Duration = Duration::from_secs(10);
 
 const HEADERS: [&str; 6] = ["Proto", "Process", "Connection", "Age", "Traffic", "Rate"];
 
@@ -330,6 +334,7 @@ fn parse_tcp_info(payload: &[u8]) -> TcpInfo {
     }
 }
 
+#[derive(Clone)]
 struct RawConn {
     protocol: u8,
     family: u8,
@@ -668,6 +673,14 @@ fn format_rate(down_per_sec: f64, up_per_sec: f64) -> String {
 /// unconnected sockets, which the Ports panel already covers. UDP carries no byte
 /// counter in the kernel, so its connections always report zero traffic/rate.
 pub struct ConnectionsMonitor {
+    /// The last reading of the container namespaces, with what it cost and when it was
+    /// taken. On a machine where that reading is cheap it happens every tick like
+    /// everything else; where it is expensive — a Kubernetes node spends a sixth of a
+    /// second on it — it is reused for a while instead, and the panel says so rather
+    /// than quietly showing something older than it looks.
+    containers: Vec<RawConn>,
+    containers_at: Option<Instant>,
+    containers_cost: Duration,
     /// The container namespaces, re-enumerated only every few seconds: walking every
     /// process to find them is the single most expensive thing this panel could do, and
     /// the answer changes when a container starts, not twice a second.
@@ -692,6 +705,9 @@ pub struct ConnectionsMonitor {
 impl ConnectionsMonitor {
     pub fn new() -> Self {
         Self {
+            containers: Vec::new(),
+            containers_at: None,
+            containers_cost: Duration::ZERO,
             namespaces: netns::Watcher::new(),
             unreadable_namespaces: 0,
             history: HashMap::new(),
@@ -708,11 +724,25 @@ impl ConnectionsMonitor {
         let mut raw = query(IPPROTO_TCP, TCP_OPEN_STATES);
         raw.extend(query(IPPROTO_UDP, 1u32 << TCP_ESTABLISHED));
         // Containers. Without these the panel is confidently wrong on any machine
-        // running them: it answers "who is talking to whom" with the host's own
-        // sockets and calls that the whole picture.
-        let (containers, unreadable) = namespace_connections(&mut self.namespaces);
-        raw.extend(containers);
-        self.unreadable_namespaces = unreadable;
+        // running them: it answers "who is talking to whom" with the host's own sockets
+        // and calls that the whole picture.
+        //
+        // Read again only when the last reading has aged past what it cost to take:
+        // cheap on an ordinary machine means every tick, and expensive on a busy node
+        // means every few seconds, which is the difference between a monitor and a
+        // second workload.
+        let due = self
+            .containers_at
+            .is_none_or(|at| at.elapsed() >= self.container_interval());
+        if due {
+            let started = Instant::now();
+            let (containers, unreadable) = namespace_connections(&mut self.namespaces);
+            self.containers_cost = started.elapsed();
+            self.containers = containers;
+            self.containers_at = Some(started);
+            self.unreadable_namespaces = unreadable;
+        }
+        raw.extend(self.containers.iter().cloned());
 
         let now = Instant::now();
         let mut next_history = HashMap::with_capacity(raw.len());
@@ -1082,15 +1112,22 @@ impl TableMonitor for ConnectionsMonitor {
     }
 
     fn note(&self) -> Option<String> {
-        match self.unreadable_namespaces {
-            0 => None,
-            1 => Some("1 container não legível — rode como root para incluí-lo".to_string()),
-            n => Some(format!(
-                "{n} containers não legíveis — rode como root para incluí-los"
-            )),
+        let mut parts: Vec<String> = Vec::new();
+        // Only worth saying when the reading is actually being spaced out; at every
+        // tick there is nothing to disclose.
+        let interval = self.container_interval();
+        if interval > TICK_RATE && !self.containers.is_empty() {
+            parts.push(format!(
+                "conexões de container relidas a cada {:.0}s (custam {:.0} ms)",
+                interval.as_secs_f64(),
+                self.containers_cost.as_secs_f64() * 1000.0
+            ));
         }
+        if let Some(missing) = self.unreadable_note() {
+            parts.push(missing);
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
-
     fn refresh_values(&mut self, state: &SystemState, rows: &mut [TableRow]) {
         let snapshot = self.refresh_snapshot();
         let owners = state.inode_to_pid();
@@ -1158,5 +1195,25 @@ impl TableMonitor for ConnectionsMonitor {
             .copied()
             .unwrap_or(0);
         Some(self.build_detail(state, c, down, up, pid))
+    }
+}
+
+impl ConnectionsMonitor {
+    /// How long a reading of the container namespaces stays good for. Twenty times what
+    /// it cost to take, which keeps the panel spending about five per cent of its time
+    /// on them however many there are — bounded so it is never slower than a few
+    /// seconds nor faster than the tick itself.
+    fn container_interval(&self) -> Duration {
+        (self.containers_cost * 20).clamp(TICK_RATE, MAX_CONTAINER_INTERVAL)
+    }
+
+    fn unreadable_note(&self) -> Option<String> {
+        match self.unreadable_namespaces {
+            0 => None,
+            1 => Some("1 container não legível — rode como root para incluí-lo".to_string()),
+            n => Some(format!(
+                "{n} containers não legíveis — rode como root para incluí-los"
+            )),
+        }
     }
 }

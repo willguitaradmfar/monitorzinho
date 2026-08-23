@@ -18,7 +18,6 @@ mod ui;
 
 use app::{App, Focus, Tab};
 
-const TICK_RATE: Duration = Duration::from_secs(2);
 /// Longest the loop sleeps before looking at whether a tool has written something. Also
 /// the worst-case lag between a byte crossing a tunnel and its line appearing.
 const REDRAW_SLICE: Duration = Duration::from_millis(60);
@@ -128,7 +127,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         // Waiting in slices instead of straight through to the next sample: a relay
         // thread appending to a log can't interrupt `poll`, so a long wait here is a
         // long wait before its line reaches the screen.
-        let timeout = TICK_RATE
+        let timeout = app
+            .interval()
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::ZERO)
             .min(REDRAW_SLICE);
@@ -345,7 +345,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
             dirty |= app.shows_tools();
         }
 
-        if last_tick.elapsed() >= TICK_RATE {
+        if last_tick.elapsed() >= app.interval() {
             app.tick();
             last_tick = Instant::now();
             dirty = true;

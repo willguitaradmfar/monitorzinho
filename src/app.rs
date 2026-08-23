@@ -257,6 +257,12 @@ pub fn bench() {
             );
         }
         println!("  {:<28}{:>8.1} ms", "TOTAL", total.as_secs_f64() * 1000.0);
+        // What the loop does with a sample this expensive.
+        println!(
+            "  {:<28}{:>8.1} s    (intervalo escolhido para este custo)",
+            "TICK",
+            interval_for(total).as_secs_f64()
+        );
         println!();
     }
 }
@@ -701,6 +707,33 @@ impl HandoffPicker {
 /// lands flush against the top border with nothing before it.
 pub const MATCH_CONTEXT: u16 = 2;
 
+/// The interval a sample of this cost earns.
+///
+/// Kept apart from `App` so it can be reasoned about — and printed by `--bench` — on
+/// its own: it is a function of one number and nothing else.
+pub fn interval_for(cost: Duration) -> Duration {
+    let budget = SAMPLE_BUDGET.as_secs_f64();
+    let cost = cost.as_secs_f64();
+    if cost <= budget {
+        return TICK_RATE;
+    }
+    // Keeps sampling at roughly the share of the machine it would have at two seconds
+    // and a cheap sample: cost over interval stays near budget over TICK_RATE.
+    TICK_RATE
+        .mul_f64((cost / budget).min(MAX_SLOWDOWN))
+        .min(MAX_TICK_RATE)
+}
+
+/// How often the active tab is resampled on a machine where that is cheap.
+pub const TICK_RATE: Duration = Duration::from_secs(2);
+/// What one sample may cost before the interval starts stretching. A tenth of a second
+/// is under what anyone notices and a twentieth of the interval.
+const SAMPLE_BUDGET: Duration = Duration::from_millis(100);
+/// How much slower the tick may get, and the hard ceiling on the interval. Even the
+/// most expensive machine gets fresh numbers within a handful of seconds.
+const MAX_SLOWDOWN: f64 = 4.0;
+const MAX_TICK_RATE: Duration = Duration::from_secs(8);
+
 /// Rows a PgUp/PgDn moves a selection by, in every list that has one. A fixed step
 /// rather than the panel's own height: only the renderer knows that, and a page that
 /// means the same distance everywhere is easier to build a feel for than one that
@@ -814,6 +847,8 @@ pub struct App {
     /// Set when the tab changed and its data hasn't been refreshed yet — see
     /// `switch_tab`.
     pending_sample: bool,
+    /// How long the last sample took. What the interval is chosen from — see `interval`.
+    last_sample: Duration,
     /// A destructive key waiting to be confirmed. Sits above every screen and takes
     /// every key while it's open, so nothing underneath can act on the keypress that
     /// dismisses it.
@@ -886,6 +921,7 @@ impl App {
             tab: Tab::Overview,
             quit_armed: false,
             pending_sample: false,
+            last_sample: Duration::ZERO,
             pending: None,
             state: SystemState::new(),
             ticks_since_save: 0,
@@ -916,6 +952,19 @@ impl App {
         self.pending_sample = true;
     }
 
+    /// How long to wait before sampling again.
+    ///
+    /// Two seconds on any ordinary machine. But sampling costs what the machine *has* —
+    /// a Kubernetes node with eight hundred processes and forty-four network namespaces
+    /// takes a third of a second to answer, and spending a sixth of every second on
+    /// that is a monitor that competes with what it is monitoring. So a sample that
+    /// takes longer than `SAMPLE_BUDGET` buys itself proportionally more room, up to a
+    /// ceiling: the machine that is cheap to read stays live, and the one that is
+    /// expensive to read stops charging for it twice a second.
+    pub fn interval(&self) -> Duration {
+        interval_for(self.last_sample)
+    }
+
     /// Whether the loop owes the newly-shown tab a sample. Taken, not peeked: asking is
     /// what clears it.
     pub fn take_pending_sample(&mut self) -> bool {
@@ -934,6 +983,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        let started = Instant::now();
         match self.tab {
             Tab::Overview => self.state.refresh_overview(),
             Tab::Processes => self.state.refresh_processes(),
@@ -942,6 +992,7 @@ impl App {
             Tab::Tools => {}
         }
         self.sample_active_tab();
+        self.last_sample = started.elapsed();
 
         self.ticks_since_save += 1;
         if self.ticks_since_save >= SAVE_EVERY_N_TICKS {

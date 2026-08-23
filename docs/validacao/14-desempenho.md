@@ -89,6 +89,44 @@ Mede uma amostragem da aba Processos — exatamente o que uma troca de aba paga 
 imprime onde o tempo foi, painel por painel. Duas passagens: a segunda é a que
 conta.
 
+## Terceira rodada: pagar pelo que a máquina é (v0.23.1)
+
+Duas mudanças que atacam justamente a máquina cara, sem tirar nada da barata.
+
+### Tick proporcional ao custo
+
+Amostrar custa o que a máquina **tem**. Numa que responde em 50 ms, dois segundos
+está ótimo; numa que leva 400 ms, gastar um sexto de cada segundo nisso é um
+monitor competindo com o que ele monitora.
+
+O intervalo agora é função do custo: até 100 ms, dois segundos como sempre; acima
+disso, esticado na mesma proporção, até o teto de 8 s. A conta é uma função pura
+(`interval_for`) e o `--bench` imprime o intervalo que ela escolheria:
+
+```
+TOTAL                          198.1 ms
+TICK                             4.0 s    (intervalo escolhido para este custo)
+```
+
+### Conexões de container relidas conforme o que custam
+
+Ler os 44 namespaces custa ~300 ms naquela máquina e ~2 ms numa comum. A leitura
+agora vale por **vinte vezes o que custou** (mínimo: o tick; teto: 10 s), então a
+máquina barata relê a cada tick e a cara a cada ~6 s — e o painel **diz isso** no
+rodapé, em vez de mostrar algo mais velho do que parece:
+
+```
+conexões de container relidas a cada 6s (custam 299 ms)
+```
+
+### Resultado acumulado no nó com k3s
+
+| | v0.22.0 | v0.22.2 | v0.23.1 |
+| --- | --- | --- | --- |
+| Uma amostragem | 718 ms | 418 ms | **198 ms** |
+| Intervalo | 2 s | 2 s | **4 s** |
+| CPU em regime | ~95% de um núcleo | ~20% | **12%** |
+
 ## Como testar
 
 ### 1. Medir, não achar
@@ -135,3 +173,5 @@ o cache não está expirando; se aparecer instantaneamente, ele não está sendo
 - `--bench` acima de ~350 ms num nó de porte grande (o valor de referência aqui é
   291 ms com 787 processos e 44 namespaces)
 - A aba não aparecer imediatamente ao teclar Tab, mesmo que os números demorem
+- `--bench` mostrando `TICK 2.0 s` para um custo acima de 100 ms (adaptação não entrou)
+- Rodapé do painel de conexões calado numa máquina onde a releitura está espaçada
