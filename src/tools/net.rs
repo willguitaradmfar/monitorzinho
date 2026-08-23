@@ -17,7 +17,6 @@
 //! because a host that replied has necessarily answered ARP on the way.
 
 use std::collections::HashMap;
-use std::ffi::c_int;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -25,6 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::icmp::Pinger;
 use crate::monitor::resolve;
 
 use super::{EventKind, Execution, ParamSpec, Recorder, Suggestion, Tool};
@@ -716,146 +716,4 @@ fn open_ports(plan: &Plan, address: Ipv4Addr) -> Vec<u16> {
                 .is_ok()
         })
         .collect()
-}
-
-// --- unprivileged ICMP ---------------------------------------------------------------
-
-const AF_INET: c_int = 2;
-const SOCK_DGRAM: c_int = 2;
-const IPPROTO_ICMP: c_int = 1;
-const SOL_SOCKET: c_int = 1;
-const SO_RCVTIMEO: c_int = 20;
-const ICMP_ECHO: u8 = 8;
-const ICMP_ECHOREPLY: u8 = 0;
-
-unsafe extern "C" {
-    fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
-    fn close(fd: c_int) -> c_int;
-    fn setsockopt(
-        fd: c_int,
-        level: c_int,
-        name: c_int,
-        value: *const std::ffi::c_void,
-        len: u32,
-    ) -> c_int;
-    fn sendto(
-        fd: c_int,
-        buf: *const u8,
-        len: usize,
-        flags: c_int,
-        addr: *const SockaddrIn,
-        addrlen: u32,
-    ) -> isize;
-    fn recv(fd: c_int, buf: *mut u8, len: usize, flags: c_int) -> isize;
-}
-
-#[repr(C)]
-struct SockaddrIn {
-    sin_family: u16,
-    sin_port: u16,
-    sin_addr: u32,
-    sin_zero: [u8; 8],
-}
-
-#[repr(C)]
-struct Timeval {
-    tv_sec: i64,
-    tv_usec: i64,
-}
-
-/// An ICMP echo socket, if the kernel will give one to an unprivileged process.
-///
-/// `SOCK_DGRAM` + `IPPROTO_ICMP` is the mode `ping` uses when it isn't setuid: the
-/// kernel owns the identifier and only delivers replies to this socket, so no privilege
-/// is needed and no other process's replies are visible. Gated by
-/// `net.ipv4.ping_group_range`; where that excludes us, `socket()` fails and the sweep
-/// falls back to TCP.
-pub struct Pinger {
-    fd: c_int,
-}
-
-impl Pinger {
-    fn new() -> Option<Self> {
-        let fd = unsafe { socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP) };
-        (fd >= 0).then_some(Self { fd })
-    }
-
-    fn reaches(&self, address: Ipv4Addr, timeout: Duration) -> bool {
-        let timeval = Timeval {
-            tv_sec: timeout.as_secs() as i64,
-            tv_usec: timeout.subsec_micros() as i64,
-        };
-        let set = unsafe {
-            setsockopt(
-                self.fd,
-                SOL_SOCKET,
-                SO_RCVTIMEO,
-                (&raw const timeval).cast(),
-                size_of::<Timeval>() as u32,
-            )
-        };
-        if set != 0 {
-            return false;
-        }
-
-        // Type, code, checksum, identifier, sequence. The kernel rewrites the
-        // identifier and fixes the checksum for datagram ICMP sockets, but a correct
-        // one costs nothing and keeps the packet valid if that ever changes.
-        let mut packet = [0u8; 16];
-        packet[0] = ICMP_ECHO;
-        packet[6..8].copy_from_slice(&1u16.to_be_bytes());
-        let sum = checksum(&packet);
-        packet[2..4].copy_from_slice(&sum.to_be_bytes());
-
-        let destination = SockaddrIn {
-            sin_family: AF_INET as u16,
-            sin_port: 0,
-            sin_addr: u32::from(address).to_be(),
-            sin_zero: [0; 8],
-        };
-        let sent = unsafe {
-            sendto(
-                self.fd,
-                packet.as_ptr(),
-                packet.len(),
-                0,
-                &raw const destination,
-                size_of::<SockaddrIn>() as u32,
-            )
-        };
-        if sent < 0 {
-            return false;
-        }
-
-        let mut buf = [0u8; 128];
-        let received = unsafe { recv(self.fd, buf.as_mut_ptr(), buf.len(), 0) };
-        received > 0 && buf[0] == ICMP_ECHOREPLY
-    }
-}
-
-impl Drop for Pinger {
-    fn drop(&mut self) {
-        unsafe { close(self.fd) };
-    }
-}
-
-// The socket is only ever used through `&self` and every call is a self-contained
-// send/receive on a datagram socket the kernel demultiplexes per-socket.
-unsafe impl Send for Pinger {}
-unsafe impl Sync for Pinger {}
-
-/// The internet checksum: one's complement of the one's complement sum of 16-bit words.
-fn checksum(data: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let (chunks, tail) = data.as_chunks::<2>();
-    for chunk in chunks {
-        sum += u16::from_be_bytes(*chunk) as u32;
-    }
-    if let [last] = tail {
-        sum += (*last as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
 }

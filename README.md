@@ -365,6 +365,30 @@ second verifies properly, and its error message is the verdict.
 SMTP, IMAP, POP3 — so a mail server's certificate reads the same way a web
 server's does.
 
+#### Rota até o host
+
+Every router between here and a host, with the latency of each hop — the gap
+between "the host is alive" and "the host doesn't answer". A silent host may be
+off, filtered at its own door, or behind a link that dies three hops earlier, and
+those are three different afternoons.
+
+The path is found through the ICMP errors a packet provokes by running out of
+hops, and those never arrive on a socket's receive queue: the kernel puts them on
+its error queue, where `recvmsg(MSG_ERRQUEUE)` collects both the error and the
+address of the router that sent it.
+
+Which is why the probe is **UDP rather than ICMP**. An unprivileged ICMP socket
+depends on `net.ipv4.ping_group_range`, which was empty on both machines this was
+developed against — including for root — while a UDP socket with `IP_RECVERR`
+depends on nobody and collects the same answers: routers reply "time exceeded" to
+a datagram exactly as they would to an echo, and the destination replies "port
+unreachable", which is how the trace knows it arrived. Same approach as
+`tracepath`, and it works everywhere.
+
+Three probes a hop, a silent router shown as `* * *` without ending the trace,
+and five silent hops in a row called what it is — a wall — instead of thirty
+lines of stars.
+
 #### Scanner de rede
 
 What's alive on the local network, with a MAC, a vendor and a name for each.

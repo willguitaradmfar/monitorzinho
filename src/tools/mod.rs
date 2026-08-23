@@ -11,11 +11,13 @@ use std::time::{Duration, Instant};
 
 pub mod cert;
 pub mod dns;
+pub mod icmp;
 pub mod listen;
 pub mod net;
 pub mod persist;
 pub mod poll;
 pub mod rewrite;
+pub mod rota;
 pub mod scan;
 pub mod tail;
 pub mod tls;
@@ -356,6 +358,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(dns::DnsTool),
         Box::new(cert::CertTool),
         Box::new(net::NetTool),
+        Box::new(rota::RotaTool),
     ]
 }
 

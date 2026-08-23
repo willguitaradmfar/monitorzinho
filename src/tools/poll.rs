@@ -66,6 +66,15 @@ pub fn wait(fds: &mut [Fd], timeout_ms: i32) -> std::io::Result<bool> {
     }
 }
 
+/// Waits for a descriptor to have either data or a queued error. An ICMP socket doing
+/// a traceroute needs both: the reply from the destination arrives the ordinary way,
+/// and every router along the path answers onto the error queue, which announces itself
+/// as `POLLERR`.
+pub fn readable_or_error(fd: RawFd, timeout_ms: i32) -> bool {
+    let mut fds = [Fd::new(fd, IN | ERR)];
+    wait(&mut fds, timeout_ms).unwrap_or(false)
+}
+
 /// Waits for one descriptor to become readable, reporting a failure the same as a
 /// timeout — the callers here loop either way, and a genuinely broken descriptor shows
 /// up on the next `accept` or `read` with a better message than `poll` could give.
