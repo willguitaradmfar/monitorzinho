@@ -226,7 +226,9 @@ fn encode_name(name: &str, out: &mut Vec<u8>) -> Result<(), String> {
 /// one datagram instead of forcing a TCP retry, small enough to survive most paths.
 const EDNS_PAYLOAD: u16 = 1232;
 
-fn build_query(
+/// Builds a plain query packet. Public for the same reason `parse_message` is: an mDNS
+/// question is a DNS question, sent to a multicast address instead of to a resolver.
+pub(crate) fn build_query(
     id: u16,
     name: &str,
     rtype: u16,
@@ -436,7 +438,10 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn parse_message(message: &[u8]) -> Result<Response, String> {
+/// Parses a DNS message. Public because multicast DNS is DNS: an mDNS announcement is
+/// the same wire format arriving unasked, and the discovery sweep reads it with the same
+/// parser rather than a second one written to be almost the same.
+pub fn parse_message(message: &[u8]) -> Result<Response, String> {
     if message.len() < 12 {
         return Err("resposta curta demais para ser DNS".to_string());
     }

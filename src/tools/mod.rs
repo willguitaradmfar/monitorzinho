@@ -14,6 +14,7 @@ pub mod dns;
 pub mod http;
 pub mod icmp;
 pub mod listen;
+pub mod mdns;
 pub mod net;
 pub mod persist;
 pub mod poll;

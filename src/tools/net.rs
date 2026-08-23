@@ -99,6 +99,12 @@ impl Tool for NetTool {
                 YES_NO,
                 "Faz DNS reverso de cada host encontrado — em rede doméstica normalmente vem do roteador",
             ),
+            ParamSpec::choice(
+                "anuncios",
+                "Ouvir anúncios",
+                YES_NO,
+                "mDNS e SSDP: pergunta uma vez e escuta 4s. É o que diz que o IP mudo é uma impressora, uma TV ou um Chromecast",
+            ),
         ]
     }
 
@@ -214,6 +220,8 @@ struct Plan {
     workers: usize,
     timeout: Duration,
     names: bool,
+    /// Whether to listen for what the devices say about themselves before probing them.
+    announce: bool,
 }
 
 impl Plan {
@@ -268,6 +276,7 @@ impl Plan {
             workers,
             timeout: Duration::from_millis(timeout),
             names: get("nomes") != "não",
+            announce: get("anuncios") != "não",
         };
         let total = plan.hosts().len();
         if total > MAX_HOSTS {
@@ -467,6 +476,10 @@ struct Host {
     latency: Option<Duration>,
 }
 
+/// How long the multicast listen lasts. Long enough for a television to answer, short
+/// enough that nobody notices it in front of a sweep that takes tens of seconds.
+const ANNOUNCE_WINDOW: Duration = Duration::from_secs(4);
+
 fn sweep(plan: Plan, rec: &Recorder) {
     let started = Instant::now();
     let hosts = plan.hosts();
@@ -498,6 +511,24 @@ fn sweep(plan: Plan, rec: &Recorder) {
             )),
         );
     }
+
+    // What the devices say about themselves, before anything is probed: it costs four
+    // seconds and two small packets, and it is the only part of this that can tell a
+    // printer from a television.
+    let announced = if plan.announce {
+        rec.record(
+            0,
+            EventKind::Note("   ouvindo anúncios de mDNS e SSDP por 4s…".to_string()),
+        );
+        let found = super::mdns::discover(ANNOUNCE_WINDOW);
+        rec.record(
+            0,
+            EventKind::Note(format!("   {} dispositivo(s) se anunciaram", found.len())),
+        );
+        found
+    } else {
+        HashMap::new()
+    };
 
     let pinger = Pinger::new();
     if pinger.is_none() {
@@ -568,12 +599,45 @@ fn sweep(plan: Plan, rec: &Recorder) {
             });
         }
     }
+    // A device that announced itself is alive, whatever it did with the probes — plenty
+    // of them ignore ping and refuse every port while shouting their name on multicast.
+    for address in announced.keys() {
+        if plan.networks.iter().any(|net| net.contains(*address))
+            && !found.iter().any(|host| host.address == *address)
+        {
+            found.push(Host {
+                address: *address,
+                how: "anúncio".to_string(),
+                ports: Vec::new(),
+                latency: None,
+            });
+        }
+    }
     found.sort_by_key(|host| u32::from(host.address));
 
-    report(&plan, rec, &found, started.elapsed(), total);
+    report(&plan, rec, &found, &announced, started.elapsed(), total);
 }
 
-fn report(plan: &Plan, rec: &Recorder, found: &[Host], elapsed: Duration, total: usize) {
+/// Cuts a field to the width its column has, with an ellipsis so a reader knows it was
+/// cut rather than that the value ends there.
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    text.chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
+fn report(
+    plan: &Plan,
+    rec: &Recorder,
+    found: &[Host],
+    announced: &HashMap<Ipv4Addr, super::mdns::Announcement>,
+    elapsed: Duration,
+    total: usize,
+) {
     // Re-read after probing: a host that replied has answered ARP by definition, so the
     // table knows more now than it did at the start.
     let table = neighbours();
@@ -595,11 +659,24 @@ fn report(plan: &Plan, rec: &Recorder, found: &[Host], elapsed: Duration, total:
                     .to_ascii_uppercase()
             })
             .and_then(|prefix| vendors.get(&prefix).cloned());
-        let name = if plan.names {
-            resolve::reverse_now(&host.address.to_string())
-        } else {
-            None
-        };
+        // The name it called itself beats the one the resolver has for it: a device that
+        // announces "Impressora do escritório" is telling you what it is, and a PTR
+        // record saying "192-168-0-47.lan" is telling you nothing.
+        let announcement = announced.get(&host.address);
+        let name = announcement
+            .filter(|a| !a.name.is_empty())
+            .map(|a| a.name.clone())
+            .or_else(|| {
+                if plan.names {
+                    resolve::reverse_now(&host.address.to_string())
+                } else {
+                    None
+                }
+            });
+        let kind = announcement
+            .filter(|a| !a.kind.is_empty())
+            .map(|a| format!("  ·  {} ({})", a.kind, a.via))
+            .unwrap_or_default();
         let ports = if host.ports.is_empty() {
             String::new()
         } else {
@@ -618,18 +695,21 @@ fn report(plan: &Plan, rec: &Recorder, found: &[Host], elapsed: Duration, total:
         // How it was found is part of the finding: a host known only from the neighbour
         // table is one that answered ARP and dropped everything else, which is a
         // different thing from one that refused a connection.
+        // Every column clipped to its own width: a vendor string long enough to run into
+        // the next field turns a table into a paragraph, and these come from a database
+        // nobody here controls.
         rec.record(
             0,
             EventKind::Note(format!(
-                "{:<16}{:>9}  {:<16}{:<18}{:<24}{}{ports}",
+                "{:<16}{:>9}  {:<20}{:<19}{:<26}{:<22}{ports}{kind}",
                 host.address,
                 host.latency
                     .map(|rtt| format!("{:.1} ms", rtt.as_secs_f64() * 1000.0))
                     .unwrap_or_default(),
                 host.how,
                 mac.cloned().unwrap_or_default(),
-                vendor.clone().unwrap_or_default(),
-                name.clone().unwrap_or_default(),
+                clip(&vendor.clone().unwrap_or_default(), 25),
+                clip(&name.clone().unwrap_or_default(), 21),
             )),
         );
         rec.found("ip", host.address.to_string());

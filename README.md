@@ -449,6 +449,21 @@ normal user actually has, cheapest first:
   a reply, and a reply proves the host is there. A host that answers `RST` on
   every port is as discovered as one running a web server.
 
+Before probing anything it asks the network what it has, and listens for four
+seconds. mDNS and SSDP are how printers, televisions, speakers and NAS boxes
+announce themselves, and every one of them answers a question anybody may ask —
+so the silent address at `.112` stops being an address and becomes
+`HP Smart Tank 580`, and `.113` becomes a Chromecast. A device that announced
+itself is alive whatever it did with the probes, and the name it calls itself
+beats whatever reverse DNS has for it.
+
+The DNS-SD walk takes two rounds on purpose: the well-known "what services exist
+here" question answers with service *types*, and treating those as names is how
+six different machines end up called `_services._dns-sd._udp`. The second round
+asks who offers each type, and those answers carry the label the owner typed.
+Replies are asked for over unicast, so nothing has to bind port 5353 and fight
+the `avahi-daemon` that already owns it.
+
 Networks come from the kernel's routing table, so a laptop on a VPN with
 container bridges sweeps all of them rather than a guess at `192.168.x`, each
 named with the interface it's reached through; a CIDR can be typed instead. MAC vendors are read from whatever OUI database the
