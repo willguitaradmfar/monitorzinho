@@ -18,6 +18,7 @@ pub mod listen;
 pub mod mdns;
 pub mod net;
 pub mod persist;
+pub mod ping;
 pub mod poll;
 pub mod rewrite;
 pub mod rota;
@@ -240,6 +241,11 @@ pub fn offers_for(kind: &str, value: &str) -> Vec<Handoff> {
                 tool: "cert",
                 params: vec![("alvo", value.to_string()), ("porta", "443".to_string())],
             },
+            Handoff {
+                label: format!("medir a latência até {value} continuamente"),
+                tool: "ping",
+                params: vec![("alvo", value.to_string())],
+            },
         ],
         "dominio" => vec![
             Handoff {
@@ -260,6 +266,11 @@ pub fn offers_for(kind: &str, value: &str) -> Vec<Handoff> {
                 label: format!("varrer portas de {value}"),
                 tool: "scan",
                 params: vec![("alvo", value.to_string()), ("faixa", "comuns".to_string())],
+            },
+            Handoff {
+                label: format!("medir a latência até {value} continuamente"),
+                tool: "ping",
+                params: vec![("alvo", value.to_string())],
             },
         ],
         // A mail exchanger is a host name like any other, plus the one thing that is
@@ -374,6 +385,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(smtp::SmtpTool),
         Box::new(net::NetTool),
         Box::new(rota::RotaTool),
+        Box::new(ping::PingTool),
         Box::new(stun::StunTool),
         Box::new(egress::EgressTool),
         Box::new(wol::WolTool),
@@ -750,6 +762,23 @@ pub struct Execution {
     /// What would recreate this execution on the next run. `None` for one nobody asked
     /// to persist; the tool itself never sets it, since being saved isn't its concern.
     spec: Option<persist::ExecutionSpec>,
+    /// The series this execution publishes for a chart panel, for a tool that measures
+    /// something over time. `None` for the ones that don't.
+    chart: Option<Chart>,
+}
+
+/// A line on the Overview tab fed by a running execution.
+///
+/// The tool writes measurements into `series` from its own thread; the panel is built
+/// from the rest. Keyed by what is being measured rather than by the execution — an
+/// execution's number is assigned fresh every run, but "the latency to 1.1.1.1" is the
+/// same line today as it was yesterday, which is what makes the history worth keeping.
+pub struct Chart {
+    pub key: String,
+    pub title: String,
+    pub group: &'static str,
+    pub format: fn(f64) -> String,
+    pub series: Arc<crate::monitor::live::LiveSeries>,
 }
 
 impl Execution {
@@ -788,8 +817,29 @@ impl Execution {
             outcome,
             findings,
             spec: None,
+            chart: None,
         };
         (execution, recorder)
+    }
+
+    /// Gives this execution a chart panel on the Overview tab, fed by `chart.series`.
+    pub fn charting(mut self, chart: Chart) -> Self {
+        self.chart = Some(chart);
+        self
+    }
+
+    /// A panel for this execution's series, if it publishes one. Built on demand rather
+    /// than stored: the monitor is the app's to own, the series is shared with the
+    /// thread writing it, and asking twice gives two panels reading the same numbers.
+    pub fn chart_monitor(&self) -> Option<Box<dyn crate::monitor::Monitor>> {
+        let chart = self.chart.as_ref()?;
+        Some(Box::new(crate::monitor::live::LiveMonitor::new(
+            chart.key.clone(),
+            chart.title.clone(),
+            chart.group,
+            chart.format,
+            Arc::clone(&chart.series),
+        )))
     }
 
     /// Marks this as an execution that idles until asked. Its threads aren't running,

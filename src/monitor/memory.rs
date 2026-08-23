@@ -4,11 +4,11 @@ use crate::format;
 pub struct MemoryMonitor;
 
 impl Monitor for MemoryMonitor {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "memory"
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> &str {
         "Memory"
     }
 

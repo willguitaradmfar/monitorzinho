@@ -3,11 +3,11 @@ use super::{Monitor, SystemState};
 pub struct CpuMonitor;
 
 impl Monitor for CpuMonitor {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "cpu"
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> &str {
         "CPU"
     }
 

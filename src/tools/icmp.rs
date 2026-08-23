@@ -182,6 +182,14 @@ impl Pinger {
         )
     }
 
+    /// One echo request to `address`, timed. Full distance, like `reaches` — a ping is
+    /// a question about the host, not about the path — but the answer is kept whole,
+    /// since what a latency chart is made of is the round trip, not the yes/no.
+    pub fn ping(&self, address: Ipv4Addr, sequence: u16, timeout: Duration) -> Hop {
+        self.set_int(SOL_IP, IP_TTL, 255);
+        self.probe(address, sequence, timeout)
+    }
+
     fn probe(&self, address: Ipv4Addr, sequence: u16, timeout: Duration) -> Hop {
         if !self.set_timeout(timeout) {
             return Hop::Silent;

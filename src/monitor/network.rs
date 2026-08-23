@@ -29,11 +29,11 @@ fn busiest(state: &SystemState, bytes: fn(&NetworkData) -> u64) -> Option<String
 pub struct NetRxMonitor;
 
 impl Monitor for NetRxMonitor {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "net_rx"
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> &str {
         "Net down"
     }
 
@@ -58,11 +58,11 @@ impl Monitor for NetRxMonitor {
 pub struct NetTxMonitor;
 
 impl Monitor for NetTxMonitor {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "net_tx"
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> &str {
         "Net up"
     }
 

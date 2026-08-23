@@ -68,7 +68,7 @@ fn dns_servers() -> String {
 /// `192.168.1.1`. The kernel prints the raw 32-bit address (stored host-endian) as a
 /// hex number, so recovering the dotted-quad octet order means reading it back out
 /// little-endian rather than the more obvious big-endian.
-pub(super) fn hex_ipv4(hex: &str) -> Option<Ipv4Addr> {
+pub(crate) fn hex_ipv4(hex: &str) -> Option<Ipv4Addr> {
     let bytes = u32::from_str_radix(hex, 16).ok()?.to_le_bytes();
     Some(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
 }
@@ -76,7 +76,7 @@ pub(super) fn hex_ipv4(hex: &str) -> Option<Ipv4Addr> {
 /// The default route's gateway: the `/proc/net/route` row for destination `0.0.0.0`
 /// whose gateway isn't itself `0.0.0.0` (an on-link default route, i.e. no real
 /// gateway).
-fn default_gateway() -> Option<Ipv4Addr> {
+pub(crate) fn default_gateway() -> Option<Ipv4Addr> {
     let content = fs::read_to_string("/proc/net/route").ok()?;
     content.lines().skip(1).find_map(|line| {
         let fields: Vec<&str> = line.split_whitespace().collect();

@@ -11,8 +11,9 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, DetailFocus, Focus, HandoffPicker, MATCH_CONTEXT, MarkEditor, ParamField, RulesEditor,
-    RulesMode, ShortcutTarget, Tab, TableFocus, ToolMonitorFocus, ToolWizard, WizardStep,
+    App, ChartPanel, DetailFocus, Focus, HandoffPicker, MATCH_CONTEXT, MarkEditor, ParamField,
+    RulesEditor, RulesMode, ShortcutTarget, Tab, TableFocus, ToolMonitorFocus, ToolWizard,
+    WizardStep,
 };
 use crate::format;
 use crate::history::History;
@@ -115,10 +116,7 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
             render_panel(
                 frame,
                 area,
-                app.monitors[*idx].as_ref(),
-                &app.histories[*idx],
-                app.extras[*idx].as_deref(),
-                app.capacities[*idx],
+                &app.charts[*idx],
                 PanelChrome {
                     shortcut: None,
                     hint: Some("Esc/q voltar"),
@@ -465,10 +463,7 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &App, shortcuts: &ShortcutM
             render_panel(
                 frame,
                 col_areas[c],
-                app.monitors[idx].as_ref(),
-                &app.histories[idx],
-                app.extras[idx].as_deref(),
-                app.capacities[idx],
+                &app.charts[idx],
                 PanelChrome {
                     shortcut: shortcuts.chart.get(&idx).copied(),
                     hint: None,
@@ -486,15 +481,11 @@ struct PanelChrome<'a> {
     hint: Option<&'a str>,
 }
 
-fn render_panel(
-    frame: &mut Frame,
-    area: Rect,
-    monitor: &dyn Monitor,
-    history: &History,
-    extra: Option<&str>,
-    capacity: Option<f64>,
-    chrome: PanelChrome,
-) {
+fn render_panel(frame: &mut Frame, area: Rect, panel: &ChartPanel, chrome: PanelChrome) {
+    let monitor = panel.monitor.as_ref();
+    let history = &panel.history;
+    let extra = panel.extra.as_deref();
+    let capacity = panel.capacity;
     let last = history.last().unwrap_or(0.0);
     let color = signal_color(monitor, last);
 

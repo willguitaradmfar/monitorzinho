@@ -9,6 +9,7 @@ pub mod cpu;
 pub mod disk;
 pub mod gpu;
 pub mod iface;
+pub mod live;
 pub mod mark;
 pub mod memory;
 pub mod netns;
@@ -137,8 +138,13 @@ impl SystemState {
 /// To add a new one: implement this trait in a new file and register it in `all_monitors()`.
 pub trait Monitor: Send {
     /// Stable key used for persistence — never change once shipped.
-    fn id(&self) -> &'static str;
-    fn title(&self) -> &'static str;
+    ///
+    /// Borrowed rather than `&'static`: unlike the tables, which are a fixed set decided
+    /// at compile time, a chart can be created while the app runs — a tool that measures
+    /// something over time gets a panel named after whatever it was pointed at, and that
+    /// name only exists at runtime. See `live::LiveMonitor`.
+    fn id(&self) -> &str;
+    fn title(&self) -> &str;
     fn sample(&mut self, state: &SystemState) -> f64;
     /// How to render a sampled value, e.g. "32.8%" or "1.3 MB/s".
     fn format(&self, value: f64) -> String;

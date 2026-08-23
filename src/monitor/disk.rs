@@ -17,11 +17,11 @@ pub(super) fn primary_disk(state: &SystemState) -> Option<&Disk> {
 pub struct DiskMonitor;
 
 impl Monitor for DiskMonitor {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "disk"
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> &str {
         "Disk (/)"
     }
 
@@ -66,11 +66,11 @@ impl Monitor for DiskMonitor {
 pub struct DiskReadMonitor;
 
 impl Monitor for DiskReadMonitor {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "disk_read"
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> &str {
         "Disk read"
     }
 
@@ -92,11 +92,11 @@ impl Monitor for DiskReadMonitor {
 pub struct DiskWriteMonitor;
 
 impl Monitor for DiskWriteMonitor {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "disk_write"
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> &str {
         "Disk write"
     }
 

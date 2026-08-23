@@ -440,6 +440,28 @@ Three probes a hop, a silent router shown as `* * *` without ending the trace,
 and five silent hops in a row called what it is — a wall — instead of thirty
 lines of stars.
 
+#### Latência contínua
+
+The same round trip `ping` measures, kept running and drawn as a line on the
+Visão geral tab beside CPU, memory and network. `ping` in a terminal answers "is
+it up right now"; this answers what the link did while you were looking at
+something else, which is the question that actually comes up — the loss worth
+finding lasts forty seconds, twice an hour.
+
+Three ways to measure, because the classic one is often unavailable: a real ICMP
+echo where `net.ipv4.ping_group_range` allows it, the time to open a TCP
+connection (a refusal counts — the RST came from the host and times the round
+trip just as well), or a UDP datagram to a dead port timed by the "port
+unreachable" it provokes. `automático` prefers ICMP and falls back to TCP, and
+the log says which one it settled on rather than pretending.
+
+A lost packet is charted as a zero, never as the timeout: silence is not a
+measurement, and charting it as one would put a spike where there was nothing and
+drag the average up with numbers nobody measured. The panel's history is kept
+under the target — `ping:1.1.1.1` — so it is the same line tomorrow, and a panel
+a tool feeds keeps sampling on every tab, since leaving the measurement running
+is the entire point.
+
 #### Sonda SMTP
 
 What a mail server says about itself before anyone tries to send anything through
@@ -624,7 +646,7 @@ directory):
 
 | File | What |
 | --- | --- |
-| `history.json` | chart history, so the sparklines survive a restart |
+| `history.json` | chart history, so the sparklines survive a restart — including the ones a tool feeds, keyed by what they measure |
 | `tools.json` | the executions to bring back on launch, and their parameters |
 | `rewrites.json` | every rewrite rule ever written, offered as suggestions |
 | `marks.json` | the rows you asked to keep an eye on, per table |

@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -874,11 +875,43 @@ pub enum Focus {
     ToolMonitor(ToolMonitorFocus),
 }
 
+/// One chart on the Overview tab: what it measures, and everything the panel knows
+/// about it.
+///
+/// Kept together rather than as four vectors indexed in parallel, because panels are no
+/// longer a fixed set — a tool that measures something over time adds one while the app
+/// runs and takes it away again when its execution is removed, and four vectors that
+/// have to be inserted into and removed from in lockstep is a bug waiting for the first
+/// place that forgets one of them.
+pub struct ChartPanel {
+    pub monitor: Box<dyn Monitor>,
+    pub history: History,
+    /// The absolute quantity shown beside the value, sampled with it (e.g. "5.6 GB / 16.0 GB").
+    pub extra: Option<String>,
+    /// Total capacity behind a percentage metric, sampled with the value.
+    pub capacity: Option<f64>,
+    /// The execution this panel belongs to, for one created by a tool. `None` for the
+    /// machine's own panels, which nothing can remove.
+    pub execution: Option<u64>,
+}
+
+impl ChartPanel {
+    fn new(monitor: Box<dyn Monitor>, history: History, execution: Option<u64>) -> Self {
+        Self {
+            monitor,
+            history,
+            extra: None,
+            capacity: None,
+            execution,
+        }
+    }
+}
+
 pub struct App {
-    pub monitors: Vec<Box<dyn Monitor>>,
-    pub histories: Vec<History>,
-    pub extras: Vec<Option<String>>,
-    pub capacities: Vec<Option<f64>>,
+    pub charts: Vec<ChartPanel>,
+    /// Histories for charts that aren't on screen: what was read from disk at launch,
+    /// plus what a removed panel left behind. Keyed by `Monitor::id`, same as the file.
+    known_histories: history::HistoryMap,
     pub table_monitors: Vec<Box<dyn TableMonitor>>,
     pub table_rows: Vec<Vec<TableRow>>,
     /// What the user asked to keep an eye on, across restarts — see `monitor::mark`.
@@ -924,19 +957,25 @@ pub enum PendingAction {
     ForgetRule(Rule),
 }
 
+/// The saved line for `key`, or a blank one. A chart that has been running before picks
+/// up where it left off; a new one starts empty.
+fn restored_history(saved: &history::HistoryMap, key: &str) -> History {
+    match saved.get(key) {
+        Some(values) => History::from_saved(values.clone(), CAPACITY),
+        None => History::new(CAPACITY),
+    }
+}
+
 impl App {
     pub fn new() -> Self {
-        let monitors = monitors::all_monitors();
-        let saved = history::load_all();
-        let histories = monitors
-            .iter()
-            .map(|m| match saved.get(m.id()) {
-                Some(values) => History::from_saved(values.clone(), CAPACITY),
-                None => History::new(CAPACITY),
+        let known_histories = history::load_all();
+        let charts = monitors::all_monitors()
+            .into_iter()
+            .map(|m| {
+                let history = restored_history(&known_histories, m.id());
+                ChartPanel::new(m, history, None)
             })
             .collect();
-        let extras = monitors.iter().map(|_| None).collect();
-        let capacities = monitors.iter().map(|_| None).collect();
 
         let table_monitors = monitors::all_table_monitors();
         let table_rows = table_monitors.iter().map(|_| Vec::new()).collect();
@@ -958,11 +997,9 @@ impl App {
             tools.executions.push(execution);
         }
 
-        Self {
-            monitors,
-            histories,
-            extras,
-            capacities,
+        let mut app = Self {
+            charts,
+            known_histories,
             table_monitors,
             table_rows,
             marks,
@@ -977,6 +1014,46 @@ impl App {
             pending: None,
             state: SystemState::new(),
             ticks_since_save: 0,
+        };
+        // A restored execution that charts something gets its panel back here, so the
+        // Overview tab looks the same as it did when the app was closed.
+        app.sync_tool_charts();
+        app
+    }
+
+    /// Brings the chart panels in line with the executions that exist right now: one
+    /// panel for every execution publishing a series, and none for an execution that
+    /// has gone away.
+    ///
+    /// Reconciled rather than hooked onto each place an execution is created or removed
+    /// — there are five of those, and the failure mode of missing one is a chart that
+    /// keeps drawing for something that stopped existing.
+    fn sync_tool_charts(&mut self) {
+        let live: Vec<u64> = self.tools.executions.iter().map(|e| e.id).collect();
+        let mut removed = Vec::new();
+        self.charts.retain(|panel| {
+            let keep = panel.execution.is_none_or(|id| live.contains(&id));
+            if !keep {
+                removed.push((panel.monitor.id().to_string(), panel.history.values()));
+            }
+            keep
+        });
+        // A panel that goes away leaves its line behind: pointing a tool at the same
+        // target again in the same session continues where it stopped rather than
+        // starting blank, which is the whole reason the key names the target.
+        self.known_histories.extend(removed);
+
+        for index in 0..self.tools.executions.len() {
+            let id = self.tools.executions[index].id;
+            if self.charts.iter().any(|p| p.execution == Some(id)) {
+                continue;
+            }
+            let Some(monitor) = self.tools.executions[index].chart_monitor() else {
+                continue;
+            };
+            let history = restored_history(&self.known_histories, monitor.id());
+            self.charts
+                .push(ChartPanel::new(monitor, history, Some(id)));
         }
     }
 
@@ -1036,6 +1113,9 @@ impl App {
 
     pub fn tick(&mut self) {
         let started = Instant::now();
+        // Executions come and go between ticks — from the wizard, from a hand-off, from
+        // being removed — and the panels follow whatever exists now.
+        self.sync_tool_charts();
         match self.tab {
             Tab::Overview => self.state.refresh_overview(),
             Tab::Processes => self.state.refresh_processes(),
@@ -1056,19 +1136,26 @@ impl App {
     /// Samples only the monitors backing the currently active tab — the point of
     /// having tabs at all: an unfocused tab's monitors don't run.
     fn sample_active_tab(&mut self) {
+        // A panel a tool feeds is sampled on every tab, not just its own: the value is
+        // already measured and reading it costs one atomic load, and the whole point of
+        // leaving a measurement running is that its line keeps being drawn while the
+        // user is looking at something else. The machine's own panels are the expensive
+        // ones, and those still only run while their tab is up.
+        if self.tab != Tab::Overview {
+            for panel in self.charts.iter_mut() {
+                if panel.execution.is_some() {
+                    let value = panel.monitor.sample(&self.state);
+                    panel.history.push(value);
+                }
+            }
+        }
         match self.tab {
             Tab::Overview => {
-                for (((monitor, history), extra), capacity) in self
-                    .monitors
-                    .iter_mut()
-                    .zip(self.histories.iter_mut())
-                    .zip(self.extras.iter_mut())
-                    .zip(self.capacities.iter_mut())
-                {
-                    let value = monitor.sample(&self.state);
-                    history.push(value);
-                    *extra = monitor.extra(&self.state);
-                    *capacity = monitor.capacity(&self.state);
+                for panel in self.charts.iter_mut() {
+                    let value = panel.monitor.sample(&self.state);
+                    panel.history.push(value);
+                    panel.extra = panel.monitor.extra(&self.state);
+                    panel.capacity = panel.monitor.capacity(&self.state);
                 }
             }
             Tab::Processes => {
@@ -1142,8 +1229,8 @@ impl App {
     /// on screen.
     pub fn chart_monitor_order(&self) -> Vec<usize> {
         let mut groups: Vec<(&'static str, Vec<usize>)> = Vec::new();
-        for (i, m) in self.monitors.iter().enumerate() {
-            let g = m.group();
+        for (i, panel) in self.charts.iter().enumerate() {
+            let g = panel.monitor.group();
             match groups.iter_mut().find(|(name, _)| *name == g) {
                 Some(entry) => entry.1.push(i),
                 None => groups.push((g, vec![i])),
@@ -1990,8 +2077,20 @@ impl App {
         };
         let mut lines = vec![format!("{} — {}", execution.tool, execution.summary)];
         if matches!(execution.state(), State::Running) {
+            lines.push("Está rodando agora: para na hora.".to_string());
+        }
+        // Only said when it's true: a tunnel with people connected through it is a very
+        // different loss from a probe that is merely between measurements, and a
+        // warning that cries wolf on every row stops being read.
+        let open = execution.stats.active.load(Ordering::Relaxed);
+        if open > 0 {
+            lines.push(format!(
+                "{open} conexão(ões) aberta(s) através dela caem junto."
+            ));
+        }
+        if execution.chart_monitor().is_some() {
             lines.push(
-                "Está rodando agora: para de escutar na hora, e o que estiver ligado a ela cai."
+                "O gráfico dele sai da Visão geral. A linha fica guardada enquanto o monitorzinho estiver aberto, então recriar a mesma medição continua de onde parou."
                     .to_string(),
             );
         }
@@ -2336,8 +2435,8 @@ impl App {
 
     pub fn persist(&self) {
         let mut map = history::HistoryMap::new();
-        for (monitor, history) in self.monitors.iter().zip(self.histories.iter()) {
-            map.insert(monitor.id().to_string(), history.values());
+        for panel in &self.charts {
+            map.insert(panel.monitor.id().to_string(), panel.history.values());
         }
         history::save_all(&map);
     }

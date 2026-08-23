@@ -17,11 +17,11 @@ impl GpuMonitor {
 }
 
 impl Monitor for GpuMonitor {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "gpu"
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> &str {
         "GPU"
     }
 
