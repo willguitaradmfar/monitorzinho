@@ -11,8 +11,8 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, DetailFocus, Focus, MATCH_CONTEXT, ParamField, RulesEditor, RulesMode, ShortcutTarget,
-    Tab, TableFocus, ToolMonitorFocus, ToolWizard, WizardStep,
+    App, DetailFocus, Focus, HandoffPicker, MATCH_CONTEXT, ParamField, RulesEditor, RulesMode,
+    ShortcutTarget, Tab, TableFocus, ToolMonitorFocus, ToolWizard, WizardStep,
 };
 use crate::format;
 use crate::history::History;
@@ -779,10 +779,9 @@ fn render_detail(frame: &mut Frame, area: Rect, focus: &DetailFocus) {
 
 // --- Ferramentas tab ---------------------------------------------------------------
 
-const TOOLS_HEADERS: [&str; 6] = [
+const TOOLS_HEADERS: [&str; 5] = [
     "Ferramenta",
     "Detalhe",
-    "Tempo",
     // Deliberately unnamed: what these two hold is the tool's business, and a tunnel's
     // byte counters and a scan's open-port tally have nothing in common but their place.
     "Resultado",
@@ -860,9 +859,6 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
             UiRow::new(vec![
                 Cell::from(execution.tool),
                 Cell::from(execution.summary.clone()),
-                Cell::from(format::human_duration(
-                    execution.started.elapsed().as_secs(),
-                )),
                 Cell::from(headline),
                 Cell::from(summary),
                 Cell::from(Span::styled(state, style)),
@@ -873,9 +869,8 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
     let widths = [
         Constraint::Length(18),
         Constraint::Fill(1),
-        Constraint::Length(8),
-        Constraint::Length(20),
-        Constraint::Length(34),
+        Constraint::Length(22),
+        Constraint::Length(46),
         Constraint::Length(10),
     ];
     let table = Table::new(body, widths)
@@ -1531,6 +1526,64 @@ fn highlight(text: &str, query: &str, base: Style) -> Vec<Span<'static>> {
 
 /// The live log of one execution, with search, in-place highlighting, and an optional
 /// hex rendering of the payloads.
+/// What this execution found, offered as new executions of another tool.
+fn render_handoffs(frame: &mut Frame, area: Rect, picker: &HandoffPicker) {
+    let width = WIZARD_WIDTH.min(area.width);
+    // Four border-and-padding rows, two for the closing note, and never more than the
+    // screen has: a sweep can turn up dozens of hosts and the box has to stay on it.
+    let room = (area.height as usize).saturating_sub(8).max(1);
+    let visible = picker.rows().min(room);
+    // The window follows the cursor rather than the top of the list, so arrowing past
+    // the bottom scrolls instead of selecting something nobody can see.
+    let first = picker
+        .selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(picker.rows().saturating_sub(visible));
+
+    let mut lines = vec![Line::raw("")];
+    for row in first..first + visible {
+        let selected = row == picker.selected;
+        let style = if selected {
+            Style::default()
+                .fg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let label = match picker.at(row) {
+            Some(offer) => offer.label.clone(),
+            None => format!("todos os {} de uma vez", picker.options.len()),
+        };
+        lines.push(Line::styled(
+            format!(" {}{label}", if selected { "▶ " } else { "  " }),
+            style,
+        ));
+    }
+    if picker.rows() > visible {
+        lines.push(Line::styled(
+            format!("   … {} de {}", picker.selected + 1, picker.rows()),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "   A execução é criada já preenchida, e você cai na lista com ela selecionada.",
+        Style::default().fg(palette::DIM),
+    ));
+
+    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let box_area = centered(area, width, height);
+    let block = Block::default()
+        .title(" Achados desta execução ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::CYAN))
+        .title_bottom(hint_line("↑/↓ escolher · Enter criar · Esc voltar"));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolMonitorFocus) {
     let Some(execution) = app.tools.by_id(monitor.execution_id) else {
         let block = Block::default()
@@ -1596,6 +1649,15 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
         };
         title = format!("{title}— busca: {}{position}{filtered} ", monitor.query);
     }
+    let offers = app
+        .tool_for(execution)
+        .map(|tool| tool.handoffs(execution))
+        .unwrap_or_default();
+    let hint = if offers.is_empty() {
+        hint.to_string()
+    } else {
+        format!("Ctrl+P usar achados · {hint}")
+    };
     let block = outer
         .title(title)
         .border_style(Style::default().fg(if execution.is_running() {
@@ -1603,8 +1665,13 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
         } else {
             palette::DIM
         }))
-        .title_bottom(hint_line(hint));
+        .title_bottom(hint_line(&hint));
     frame.render_widget(block, area);
+
+    if let Some(picker) = &monitor.handoff {
+        render_handoffs(frame, area, picker);
+        return;
+    }
 
     if lines.is_empty() {
         let message = if monitor.query.is_empty() {

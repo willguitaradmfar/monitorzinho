@@ -87,6 +87,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 // The rules screen sits on top of the wizard and takes every key,
                 // including Esc and 'q': in its Edit mode they're just characters.
                 code if app.rules_editor_open() => app.rules_key(code),
+                // Same reason: the hand-off picker sits over a log whose search box
+                // takes every letter, so it has to see the keys first.
+                code if app.handoff_open() => app.handoff_key(code),
                 // A fullscreened table's search box swallows every letter, including
                 // 'q' — so Esc is its only way out, and it first clears an active
                 // query rather than leaving fullscreen outright.
@@ -131,6 +134,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                         && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     app.tool_monitor_toggle_filter();
+                }
+                // Ctrl rather than a bare letter: this log's search box is always on.
+                KeyCode::Char('p')
+                    if matches!(app.focus, Focus::ToolMonitor(_))
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.open_handoffs();
                 }
                 KeyCode::Tab if matches!(app.focus, Focus::ToolMonitor(_)) => {
                     app.tool_monitor_toggle_hex();

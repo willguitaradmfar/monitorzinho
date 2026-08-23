@@ -10,8 +10,12 @@ A lightweight terminal system monitor, written in Rust.
   type, with a per-connection detail view.
 - **Tools** that don't just watch but *run*: a recording TCP/UDP tunnel that
   shows you the payload of a connection, speaks TLS to the target, and can
-  rewrite bytes on the way through; and a port scanner that asks each open
-  port what it is rather than guessing from its number.
+  rewrite bytes on the way through; a port scanner that asks each open port
+  what it is rather than guessing from its number; a DNS investigation that
+  sweeps everything a domain publishes, asks each authoritative server
+  directly, and checks propagation across public resolvers; and a network
+  sweep that finds what's alive on the LAN and hands the addresses straight to
+  the port scanner.
 - History is persisted to disk and restored on restart, so the charts aren't
   empty on launch. Tools come back running too.
 - Small, fast, no garbage collector: a single ~5 MB binary with no runtime to
@@ -164,6 +168,94 @@ and once there's a result `Enter` just shows it again; `r` is how you ask for a
 fresh scan. The list carries how many ports were open and what's listening,
 from the moment there's a first result.
 
+#### Investigação DNS
+
+Everything a domain publishes, and everything the servers behind it say when
+asked directly. `dig` answers one question per invocation; this is the sweep
+you'd otherwise run twenty times and correlate by hand.
+
+The DNS client is written here rather than borrowed: `getaddrinfo` answers only
+"what address is this name", and every other question needs queries built and
+parsed on the wire — with EDNS0 to keep the DNSSEC records in the answer, and a
+TCP fallback when one doesn't fit in a datagram.
+
+One run covers:
+
+- **The apex** — SOA, NS, A, AAAA, MX, TXT, CAA, DNSKEY, printed in `dig` shape.
+- **The authoritative servers, asked one by one.** Each is queried directly for
+  the zone's serial and the answers compared. A secondary that fell behind is
+  invisible through a resolver and obvious here.
+- **Propagation.** The same questions put to a list of resolvers you control —
+  Google, Cloudflare, Quad9, OpenDNS and friends prefilled, editable, saved with
+  the execution — with every answer compared against the majority. Mid-migration
+  divergence is expected; the point is seeing how far along it is and which
+  resolver is the odd one out.
+- **Mail** — MX hosts resolved (a broken one shows up as such), SPF, DMARC,
+  MTA-STS.
+- **DNSSEC** at both ends of the delegation, which is how you catch the two
+  half-signed states that break resolution.
+- **Zone transfer.** AXFR against each nameserver, and it distinguishes a server
+  that answered "no" from one that never answered at all — a firewall doesn't
+  get credit for a policy decision it didn't make. A server that *does* hand the
+  zone over is the finding, and its contents then feed everything below.
+- **WHOIS**, following IANA → the TLD's registry → the registrar. The whole
+  response is shown, minus the terms-of-use boilerplate, rather than the subset
+  a hardcoded field list happens to know the name of.
+- **Reverse DNS** for every address turned up along the way.
+
+##### Finding subdomains
+
+Two ways, and they're different in kind:
+
+**Without guessing** reads names the zone itself publishes. A successful zone
+transfer *is* the list. Failing that, a zone signed with NSEC proves a name
+doesn't exist by naming the next one that does, so following that chain reads
+the zone off the wire name by name — asked of the authoritative servers, since
+a stub resolver answers `SERVFAIL` to NSEC and a server can be configured to
+synthesise a minimal NSEC that says nothing. Every server is tried and the
+longest chain wins, so the result doesn't depend on which one an NS record set
+happened to list first. NSEC3 hashes those names and closes the door, and the
+tool says so instead of pretending. What's left comes from the records
+themselves: nameservers, mail exchangers, CNAME targets, the hosts an SPF record
+authorises, where DMARC reports go.
+
+**The common list** tries around seventy likely names. On a zone with a `*`
+record every one of them "resolves", which would be seventy false positives —
+so the wildcard is detected first, by asking for names that cannot exist, and
+any candidate whose answer is only the wildcard's is dropped and named as such.
+The row says `curinga *` when this is in play.
+
+Every address found is offered to the port scanner: `Ctrl+P` in the log lists
+them, and picking one creates a scan already filled in.
+
+Like the port scanner, it runs on `Enter` and not before.
+
+#### Scanner de rede
+
+What's alive on the local network, with a MAC, a vendor and a name for each.
+
+Without `CAP_NET_RAW` there's no ARP sweep and no raw ICMP, so it uses what a
+normal user actually has, cheapest first:
+
+- **The neighbour table.** Anything this machine has spoken to recently is
+  already in `/proc/net/arp`, with its MAC. Free, and proof the host exists.
+- **ICMP echo through an unprivileged datagram socket** — the mode `ping` uses
+  when it isn't setuid, gated by `net.ipv4.ping_group_range`. Where the kernel
+  declines, the sweep says so once and carries on.
+- **TCP connect.** The point isn't finding a service: a *refused* connection is
+  a reply, and a reply proves the host is there. A host that answers `RST` on
+  every port is as discovered as one running a web server.
+
+Networks come from the kernel's routing table, so a laptop on a VPN with
+container bridges sweeps all of them rather than a guess at `192.168.x`; a CIDR
+can be typed instead. MAC vendors are read from whatever OUI database the
+system ships (`ieee-data`, `nmap`, `wireshark`) — a vendor table baked into the
+binary would be wrong the month after it shipped.
+
+`Ctrl+P` hands the results to the port scanner, one host or **all of them at
+once**, which is the whole point of the pair: find what's out there, then look
+at it properly.
+
 ## Keys
 
 | Key | Where | What |
@@ -178,6 +270,7 @@ from the moment there's a first result.
 | `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart (or re-run) / remove an execution |
 | `Enter` | Ferramentas | open that execution's live log — and run it, for an on-demand tool |
 | `Tab`, `Ctrl+F` | an execution's log | hex view, matches-only filter |
+| `Ctrl+P` | an execution's log | turn what it found into new executions — one, or all of them |
 | `Esc` | anywhere | back one level (clears a search first) |
 | `q` | a tab | quit |
 | `Ctrl+C` twice | anywhere | quit — one press only arms it, so a stray `Ctrl+C` can't kill a session carrying live executions |
@@ -196,13 +289,15 @@ Three small traits drive everything:
 - `Tool` — something that runs: it declares the parameters the wizard should
   ask for, then starts threads and reports back through a shared event log and
   two columns of its execution's row. Say `on_demand()` and it starts nothing
-  until the user opens it. Implement it in `src/tools/<name>.rs` and add it to
+  until the user opens it; return `handoffs()` and what it found becomes
+  another tool's input. Implement it in `src/tools/<name>.rs` and add it to
   `all_tools()`.
 
 There are no bindings crates for the Linux-specific parts: the socket tables
 come from a hand-rolled netlink `SOCK_DIAG` client, names from `getnameinfo`
 through NSS (on background threads, so a slow resolver can't stall the UI),
-and the relays wait on `poll(2)` directly.
+the relays wait on `poll(2)` directly, and DNS queries are built and parsed
+byte by byte.
 
 ### Files on disk
 

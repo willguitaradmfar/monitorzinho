@@ -54,6 +54,15 @@ struct SockaddrIn6 {
 
 /// Blocking PTR lookup for one address — always called on a throwaway thread, never on
 /// the UI thread: a resolver that's slow or unreachable can sit here for seconds.
+/// A reverse lookup right here, blocking until it answers or the resolver gives up.
+///
+/// The `Resolver` above exists because the UI's tick loop must never wait on DNS. A
+/// tool running on its own threads has no such constraint, and wants the answer in the
+/// line it's about to write rather than two ticks later.
+pub fn reverse_now(ip: &str) -> Option<String> {
+    ptr_lookup(ip.parse().ok()?)
+}
+
 fn ptr_lookup(ip: IpAddr) -> Option<String> {
     let mut host = [0u8; HOST_BUF];
     let rc = match ip {

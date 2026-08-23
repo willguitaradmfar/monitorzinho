@@ -10,7 +10,7 @@ use crate::history::{self, CAPACITY, History};
 use crate::monitor::{self, Detail, Monitor, SystemState, TableMonitor, TableRow};
 use crate::tools::persist::ExecutionSpec;
 use crate::tools::rewrite::{self, Rule};
-use crate::tools::{self, Execution, ParamKind, ParamSpec, Tool};
+use crate::tools::{self, Execution, Handoff, ParamKind, ParamSpec, Tool};
 
 /// The top-level views. Each is sampled only while it's the active tab — see
 /// `App::tick` — so switching away from one stops spending resources on it.
@@ -504,6 +504,40 @@ impl RulesEditor {
     }
 }
 
+/// Choosing which of an execution's findings to turn into a new execution.
+pub struct HandoffPicker {
+    pub options: Vec<Handoff>,
+    /// Index into the rendered list, which starts with the "all of them" row whenever
+    /// there's more than one finding — a network sweep turns up thirty hosts, and
+    /// creating thirty executions one keypress at a time is not a facility.
+    pub selected: usize,
+    pub bulk: bool,
+}
+
+impl HandoffPicker {
+    fn new(options: Vec<Handoff>) -> Self {
+        Self {
+            bulk: options.len() > 1,
+            options,
+            selected: 0,
+        }
+    }
+
+    /// How many rows are shown, including the bulk row.
+    pub fn rows(&self) -> usize {
+        self.options.len() + usize::from(self.bulk)
+    }
+
+    /// The finding a row stands for, or `None` for the bulk row.
+    pub fn at(&self, row: usize) -> Option<&Handoff> {
+        match (self.bulk, row) {
+            (true, 0) => None,
+            (true, row) => self.options.get(row - 1),
+            (false, row) => self.options.get(row),
+        }
+    }
+}
+
 /// How many lines of context are kept above a match when jumping to it, so a hit never
 /// lands flush against the top border with nothing before it.
 pub const MATCH_CONTEXT: u16 = 2;
@@ -532,6 +566,8 @@ pub struct ToolMonitorFocus {
     pub follow: bool,
     pub max_scroll: Cell<u16>,
     /// Line indices of the current search's hits, ascending, as of the last frame.
+    /// The hand-off picker, while it's open over the log.
+    pub handoff: Option<HandoffPicker>,
     pub matches: RefCell<Vec<u16>>,
     /// Which of `matches` the view is parked on. `None` means the search hasn't been
     /// navigated yet, which the renderer takes as "jump to the first hit".
@@ -1465,10 +1501,115 @@ impl App {
             scroll: Cell::new(0),
             follow: true,
             max_scroll: Cell::new(0),
+            handoff: None,
             matches: RefCell::new(Vec::new()),
             match_index: Cell::new(None),
             anchor_seq: Cell::new(0),
         });
+    }
+
+    /// Offers what the open execution found as new executions (Ctrl+P). Silent when it
+    /// found nothing another tool could use.
+    pub fn open_handoffs(&mut self) {
+        let Focus::ToolMonitor(monitor) = &self.focus else {
+            return;
+        };
+        let Some(execution) = self.tools.by_id(monitor.execution_id) else {
+            return;
+        };
+        let Some(tool) = self.tool_for(execution) else {
+            return;
+        };
+        let options = tool.handoffs(execution);
+        if options.is_empty() {
+            return;
+        }
+        if let Focus::ToolMonitor(monitor) = &mut self.focus {
+            monitor.handoff = Some(HandoffPicker::new(options));
+        }
+    }
+
+    /// True while the picker is over the log, so keys go there instead of to the search
+    /// box underneath — which would otherwise swallow every letter.
+    pub fn handoff_open(&self) -> bool {
+        matches!(&self.focus, Focus::ToolMonitor(monitor) if monitor.handoff.is_some())
+    }
+
+    pub fn handoff_key(&mut self, code: KeyCode) {
+        let Focus::ToolMonitor(monitor) = &mut self.focus else {
+            return;
+        };
+        let Some(picker) = &mut monitor.handoff else {
+            return;
+        };
+        match code {
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => {
+                picker.selected = (picker.selected + 1).min(picker.rows().saturating_sub(1));
+            }
+            KeyCode::Enter => self.create_from_handoff(),
+            KeyCode::Esc => monitor.handoff = None,
+            _ => {}
+        }
+    }
+
+    /// Builds the offered execution and starts it, leaving the user looking at the list
+    /// with the new row selected — the thing they asked for is the thing they should be
+    /// looking at.
+    fn create_from_handoff(&mut self) {
+        let Focus::ToolMonitor(monitor) = &mut self.focus else {
+            return;
+        };
+        let Some(picker) = &mut monitor.handoff else {
+            return;
+        };
+        // The bulk row creates one execution per finding; any other row creates the one
+        // it names. Both go through the same path.
+        let chosen: Vec<Handoff> = match picker.at(picker.selected) {
+            Some(handoff) => vec![Handoff {
+                label: handoff.label.clone(),
+                tool: handoff.tool,
+                params: handoff.params.clone(),
+            }],
+            None => picker
+                .options
+                .iter()
+                .map(|handoff| Handoff {
+                    label: handoff.label.clone(),
+                    tool: handoff.tool,
+                    params: handoff.params.clone(),
+                })
+                .collect(),
+        };
+        if chosen.is_empty() {
+            return;
+        }
+
+        for handoff in &chosen {
+            let Some(index) = self
+                .tools_available
+                .iter()
+                .position(|tool| tool.id() == handoff.tool)
+            else {
+                continue;
+            };
+            let tool = &self.tools_available[index];
+            // Defaults first, then whatever the offer named — so a tool that grows a
+            // parameter later doesn't leave it empty here.
+            let mut values: HashMap<&'static str, String> = tool
+                .params()
+                .into_iter()
+                .map(|spec| (spec.key, spec.default.to_string()))
+                .collect();
+            for (key, value) in &handoff.params {
+                values.insert(key, value.clone());
+            }
+            let execution = self.tools.launch(tool.as_ref(), values);
+            self.tools.executions.push(execution);
+        }
+        self.tools.selected = self.tools.executions.len().saturating_sub(1);
+        self.tools.persist();
+        self.focus = Focus::None;
     }
 
     /// ↑/↓ in the monitor. With a search active these step between hits instead of

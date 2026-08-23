@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+pub mod dns;
+pub mod net;
 pub mod persist;
 pub mod poll;
 pub mod rewrite;
@@ -132,10 +134,33 @@ pub trait Tool: Send + Sync {
     fn columns(&self, _execution: &Execution) -> (String, String) {
         (String::new(), String::new())
     }
+
+    /// Executions this one's findings suggest creating. A DNS investigation ends
+    /// holding a list of addresses and the port scanner starts by asking for one, so
+    /// the answer to the first is the input to the second — retyping it by hand is
+    /// busywork the tools can spare the user.
+    fn handoffs(&self, _execution: &Execution) -> Vec<Handoff> {
+        Vec::new()
+    }
+}
+
+/// One execution another one is offering to create, already filled in.
+pub struct Handoff {
+    /// Shown in the picker, e.g. `varrer portas de 93.184.216.34`.
+    pub label: String,
+    /// `Tool::id` of what to create.
+    pub tool: &'static str,
+    /// Parameters to pre-fill; anything not named keeps the tool's default.
+    pub params: Vec<(&'static str, String)>,
 }
 
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(tunnel::TunnelTool), Box::new(scan::ScanTool)]
+    vec![
+        Box::new(tunnel::TunnelTool),
+        Box::new(scan::ScanTool),
+        Box::new(dns::DnsTool),
+        Box::new(net::NetTool),
+    ]
 }
 
 /// Live counters for an execution, written by its threads and read by the UI every
@@ -274,6 +299,7 @@ pub struct Recorder {
     started: Instant,
     outcome: Arc<Mutex<(String, String)>>,
     runs: Arc<AtomicU64>,
+    findings: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Recorder {
@@ -320,6 +346,19 @@ impl Recorder {
         self.runs.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records something structured the tool found — an address, a hostname — for
+    /// another tool to be offered. The log is for reading; this is for acting on.
+    pub fn found(&self, kind: &str, value: impl Into<String>) {
+        let mut findings = self
+            .findings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = (kind.to_string(), value.into());
+        if !findings.contains(&entry) {
+            findings.push(entry);
+        }
+    }
+
     /// Whether the execution has been removed and every thread should wind down.
     pub fn stopping(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
@@ -352,6 +391,8 @@ pub struct Execution {
     runs: Arc<AtomicU64>,
     /// The two result columns, written by the tool as it goes.
     outcome: Arc<Mutex<(String, String)>>,
+    /// Structured findings, keyed by kind — what another tool could be pointed at.
+    findings: Arc<Mutex<Vec<(String, String)>>>,
     /// What would recreate this execution on the next run. `None` for one nobody asked
     /// to persist; the tool itself never sets it, since being saved isn't its concern.
     spec: Option<persist::ExecutionSpec>,
@@ -367,6 +408,7 @@ impl Execution {
         let shutdown = Arc::new(AtomicBool::new(false));
         let runs = Arc::new(AtomicU64::new(0));
         let outcome = Arc::new(Mutex::new((String::new(), String::new())));
+        let findings = Arc::new(Mutex::new(Vec::new()));
         let started = Instant::now();
         let recorder = Recorder {
             log: Arc::clone(&log),
@@ -375,6 +417,7 @@ impl Execution {
             started,
             outcome: Arc::clone(&outcome),
             runs: Arc::clone(&runs),
+            findings: Arc::clone(&findings),
         };
         let execution = Self {
             id,
@@ -389,6 +432,7 @@ impl Execution {
             failed: false,
             runs,
             outcome,
+            findings,
             spec: None,
         };
         (execution, recorder)
@@ -411,6 +455,7 @@ impl Execution {
             started: self.started,
             outcome: Arc::clone(&self.outcome),
             runs: Arc::clone(&self.runs),
+            findings: Arc::clone(&self.findings),
         }
     }
 
@@ -442,6 +487,17 @@ impl Execution {
             (false, true) => State::Done,
             (false, false) => State::Ready,
         }
+    }
+
+    /// What the tool found of one kind, in the order it found it.
+    pub fn findings(&self, kind: &str) -> Vec<String> {
+        self.findings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(found, _)| found == kind)
+            .map(|(_, value)| value.clone())
+            .collect()
     }
 
     /// The tool's own two result columns, blank until it has run.
