@@ -78,8 +78,13 @@ metric approaches its natural limit (e.g. memory nearing 100%).
   as a tree: parents expand to their children with `←`/`→`.
 - **SSH Sessions** — who is logged in over SSH, from where, on which TTY,
   since when, and what they're running.
-- **System Info** — host, user, gateway, DNS, and a one-line summary of CPU,
-  memory, disk and GPU: the facts that don't belong on a chart.
+- **System Info** — what this machine *is*: distribution and version, kernel,
+  architecture, make and model, form factor, board, BIOS and its date, uptime,
+  and whether it's running on top of a hypervisor or inside a container. Plus
+  host, user, gateway, DNS and a one-line summary of CPU, memory, disk and GPU.
+  Hardware identity comes from the firmware's own DMI tables and the
+  distribution from `/etc/os-release`, so it's what the machine says about
+  itself rather than anything inferred.
 
 Each panel has a shortcut key in its corner (`1`–`9`, then letters).
 Pressing it fullscreens that panel with every row, not just the top ten the

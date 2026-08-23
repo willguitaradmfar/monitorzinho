@@ -143,6 +143,155 @@ fn outbound_ip() -> Option<Ipv4Addr> {
     ip
 }
 
+/// A DMI field the firmware published about this machine. Most are world-readable;
+/// the serial numbers aren't, and those aren't wanted here anyway.
+fn dmi(field: &str) -> Option<String> {
+    let value = fs::read_to_string(format!("/sys/class/dmi/id/{field}")).ok()?;
+    let value = value.trim();
+    // Boards ship with the field literally set to this when the vendor didn't bother.
+    let empty = value.is_empty()
+        || value.eq_ignore_ascii_case("to be filled by o.e.m.")
+        || value.eq_ignore_ascii_case("default string")
+        || value.eq_ignore_ascii_case("system product name")
+        || value.eq_ignore_ascii_case("unknown");
+    (!empty).then(|| value.to_string())
+}
+
+/// SMBIOS chassis types. A fixed enum from the specification, not a list that goes
+/// stale — the numbers have meant the same thing for twenty years.
+fn chassis() -> Option<&'static str> {
+    Some(match dmi("chassis_type")?.as_str() {
+        "3" | "4" | "6" | "7" | "15" | "24" => "desktop",
+        "5" | "17" | "23" | "25" => "servidor",
+        "8" | "9" | "10" | "14" => "notebook",
+        "11" | "30" | "31" | "32" => "portátil",
+        "13" => "all-in-one",
+        _ => return None,
+    })
+}
+
+/// One value from `/etc/os-release`, unquoted.
+fn os_release(key: &str) -> Option<String> {
+    let content = fs::read_to_string("/etc/os-release")
+        .or_else(|_| fs::read_to_string("/usr/lib/os-release"))
+        .ok()?;
+    content.lines().find_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        (name.trim() == key).then(|| value.trim().trim_matches('"').to_string())
+    })
+}
+
+/// The distribution as it names itself. `NAME` plus `VERSION` rather than `PRETTY_NAME`
+/// because the version field is where the codename lives — "Linux Mint 22.1 (Xia)"
+/// against "Linux Mint 22.1". Falls back through what's actually there.
+fn distribution() -> Option<String> {
+    match (os_release("NAME"), os_release("VERSION")) {
+        (Some(name), Some(version)) => Some(format!("{name} {version}")),
+        (Some(name), None) => Some(name),
+        _ => os_release("PRETTY_NAME"),
+    }
+    .or_else(sysinfo::System::name)
+}
+
+/// Distribution, kernel and architecture on one line — the three things anyone means by
+/// "what is this machine running", and no use to each other apart.
+fn os_summary() -> String {
+    let mut parts = vec![distribution().unwrap_or_else(|| "Linux".to_string())];
+    if let Some(kernel) = sysinfo::System::kernel_version() {
+        parts.push(format!("kernel {kernel}"));
+    }
+    parts.push(sysinfo::System::cpu_arch());
+    parts.join("  ·  ")
+}
+
+/// Make, model, form factor and firmware, as the firmware itself reports them. Empty
+/// when there's no DMI at all, which is normal inside a container.
+fn machine_summary() -> Option<String> {
+    let vendor = dmi("sys_vendor");
+    let product = dmi("product_name");
+    let mut summary = match (vendor, product) {
+        (Some(vendor), Some(product)) => format!("{vendor} {product}"),
+        (Some(one), None) | (None, Some(one)) => one,
+        (None, None) => return None,
+    };
+    if let Some(chassis) = chassis() {
+        summary.push_str(&format!("  ·  {chassis}"));
+    }
+    if let Some(bios) = dmi("bios_version") {
+        summary.push_str(&format!("  ·  BIOS {bios}"));
+        if let Some(date) = dmi("bios_date") {
+            summary.push_str(&format!(" ({})", iso_date(&date)));
+        }
+    }
+    Some(summary)
+}
+
+/// SMBIOS dates are `MM/DD/YYYY` by specification, which reads as the wrong day to
+/// most of the world. Reordering it is a defined transformation, not a guess.
+fn iso_date(date: &str) -> String {
+    let parts: Vec<&str> = date.split('/').collect();
+    match parts.as_slice() {
+        [month, day, year] if year.len() == 4 => format!("{year}-{month:0>2}-{day:0>2}"),
+        _ => date.to_string(),
+    }
+}
+
+/// The board, when it says something the machine name didn't already.
+fn board_summary() -> Option<String> {
+    let name = dmi("board_name")?;
+    let vendor = dmi("board_vendor");
+    let product = dmi("product_name").unwrap_or_default();
+    if name == product {
+        return None;
+    }
+    Some(match vendor {
+        Some(vendor) if !product.starts_with(&vendor) => format!("{vendor} {name}"),
+        _ => name,
+    })
+}
+
+/// Whether this is running on top of something else, and what. Worth a line only when
+/// the answer is yes — on bare metal the absence is the answer.
+fn virtualization() -> Option<String> {
+    if fs::metadata("/.dockerenv").is_ok() {
+        return Some("contêiner Docker".to_string());
+    }
+    if let Ok(cgroup) = fs::read_to_string("/proc/1/cgroup") {
+        for (marker, name) in [
+            ("docker", "contêiner Docker"),
+            ("lxc", "contêiner LXC"),
+            ("kubepods", "pod Kubernetes"),
+        ] {
+            if cgroup.contains(marker) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    // The hypervisor writes its own name into the DMI the guest sees.
+    let hint = format!(
+        "{} {}",
+        dmi("sys_vendor").unwrap_or_default(),
+        dmi("product_name").unwrap_or_default()
+    );
+    for (marker, name) in [
+        ("KVM", "KVM"),
+        ("QEMU", "QEMU"),
+        ("VirtualBox", "VirtualBox"),
+        ("VMware", "VMware"),
+        ("Hyper-V", "Hyper-V"),
+        ("Virtual Machine", "Hyper-V"),
+        ("Xen", "Xen"),
+        ("Parallels", "Parallels"),
+        ("Amazon EC2", "Amazon EC2"),
+        ("Google", "Google Compute Engine"),
+    ] {
+        if hint.contains(marker) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 fn cpu_summary(state: &SystemState) -> String {
     let cpus = state.sys.cpus();
     match cpus.first() {
@@ -187,8 +336,18 @@ impl SummaryMonitor {
     }
 
     fn rows(&self, state: &SystemState) -> Vec<TableRow> {
-        let mut rows = vec![
-            row("Host", hostname()),
+        let mut rows = vec![row("Host", hostname()), row("OS", os_summary())];
+        if let Some(machine) = machine_summary() {
+            rows.push(row("Machine", machine));
+        }
+        if let Some(board) = board_summary() {
+            rows.push(row("Board", board));
+        }
+        if let Some(virtual_on) = virtualization() {
+            rows.push(row("Virtual", virtual_on));
+        }
+        rows.extend([
+            row("Uptime", format::human_duration(sysinfo::System::uptime())),
             row("User", current_user()),
             row(
                 "IP",
@@ -209,7 +368,7 @@ impl SummaryMonitor {
                 format::human_bytes(state.sys.total_memory() as f64),
             ),
             row("Disk", disk_summary(state)),
-        ];
+        ]);
         if let Some(gpu) = self.nvml.as_ref().and_then(gpu_summary) {
             rows.push(row("GPU", gpu));
         }
@@ -232,12 +391,12 @@ impl TableMonitor for SummaryMonitor {
         &HEADERS
     }
 
-    fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
-        let mut rows = self.rows(state);
-        if let Some(n) = limit {
-            rows.truncate(n);
-        }
-        rows
+    /// Deliberately ignores `limit`. It exists so a ranked table shows its top N in the
+    /// compact grid, and this table isn't ranked — it's a fixed set of facts where the
+    /// eleventh is no less true than the first. The panel shows what fits and
+    /// fullscreening it shows the rest.
+    fn sample(&mut self, state: &SystemState, _limit: Option<usize>) -> Vec<TableRow> {
+        self.rows(state)
     }
 
     fn refresh_values(&mut self, state: &SystemState, rows: &mut [TableRow]) {
