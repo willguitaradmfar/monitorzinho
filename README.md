@@ -288,6 +288,28 @@ them, and picking one creates a scan already filled in.
 
 Like the port scanner, it runs on `Enter` and not before.
 
+#### Inspetor de certificado
+
+Everything a TLS certificate says about itself, from a host name or a bare
+address. `openssl s_client` shows you the same bytes and leaves the reading to
+you; this does the reading.
+
+The whole chain the server sent, each certificate's names, dates, key, usages and
+revocation endpoints laid out in order; the two questions a browser actually asks
+— does the name match, does the chain lead to a root this machine trusts —
+answered separately; and a closing list of what is wrong with it: expired, about
+to expire, self-signed, a name it doesn't cover, an RSA key too small, a SHA-1
+signature, a lifetime past what browsers accept, an intermediate the server
+forgot to send.
+
+It connects twice on purpose. The first handshake accepts anything, because a
+certificate that fails verification is precisely the one worth reading; the
+second verifies properly, and its error message is the verdict.
+
+`STARTTLS` covers the ports that begin in plaintext and upgrade on request —
+SMTP, IMAP, POP3 — so a mail server's certificate reads the same way a web
+server's does.
+
 #### Scanner de rede
 
 What's alive on the local network, with a MAC, a vendor and a name for each.

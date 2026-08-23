@@ -15,21 +15,57 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// What we read out of a certificate. Every field is optional because a malformed or
-/// merely unusual certificate should cost the caller one missing line, not the whole
-/// reading.
+/// What we read out of a certificate. Every field is optional or empty-able because a
+/// malformed or merely unusual certificate should cost the caller one missing line, not
+/// the whole reading.
 #[derive(Default)]
 pub struct Cert {
+    /// X.509 version as a number: 3 for anything issued this century.
+    pub version: u8,
+    /// Serial as the issuer wrote it, in the colon-separated hex everyone else prints.
+    pub serial: String,
     /// Common Name of the subject — the name the certificate is *for*.
     pub subject: Option<String>,
     /// Common Name of the issuer, falling back to its Organization: "R11" says less
     /// than "Let's Encrypt", and some CAs put the recognisable half in only one of them.
     pub issuer: Option<String>,
+    /// Every attribute of the subject and issuer names, in the order they appear, so a
+    /// full report can show the distinguished name rather than one field of it.
+    pub subject_parts: Vec<(String, String)>,
+    pub issuer_parts: Vec<(String, String)>,
     pub not_before: Option<u64>,
     pub not_after: Option<u64>,
     /// dNSName entries from subjectAltName. Modern verifiers ignore CN entirely and
     /// match against these, so a certificate's real coverage is here.
     pub dns_names: Vec<String>,
+    /// iPAddress entries from the same extension — what a certificate issued to a bare
+    /// address is valid for.
+    pub ip_addresses: Vec<String>,
+    /// How the issuer signed it, e.g. `ecdsa-with-SHA256`. A SHA-1 signature here is
+    /// the certificate telling you how old it is.
+    pub signature_algorithm: Option<String>,
+    /// Public key algorithm and strength, e.g. `RSA 2048 bits` or `ECDSA P-256`.
+    pub public_key: Option<String>,
+    /// `keyUsage`, spelled out.
+    pub key_usage: Vec<String>,
+    /// `extendedKeyUsage`, spelled out: what the key is allowed to be used *for*.
+    pub extended_key_usage: Vec<String>,
+    /// From `basicConstraints`: whether this certificate may sign others, and how deep.
+    pub is_ca: bool,
+    pub path_len: Option<u64>,
+    /// Subject and authority key identifiers, in hex — what links a certificate to the
+    /// one above it when several share a name.
+    pub subject_key_id: Option<String>,
+    pub authority_key_id: Option<String>,
+    /// Where to ask whether it has been revoked, and where to fetch the issuer.
+    pub ocsp: Vec<String>,
+    pub ca_issuers: Vec<String>,
+    pub crl: Vec<String>,
+    /// Whether it carries embedded Certificate Transparency proofs. Public CAs have
+    /// been required to for years; a certificate without them is internal or old.
+    pub has_sct: bool,
+    /// SHA-256 over the whole DER — the fingerprint every other tool prints.
+    pub fingerprint: String,
 }
 
 impl Cert {
@@ -37,6 +73,29 @@ impl Cert {
     pub fn days_left(&self) -> Option<i64> {
         let not_after = self.not_after?;
         Some((not_after as i64 - now() as i64) / 86_400)
+    }
+
+    /// Whether the certificate signed itself — the definition of self-signed, and what
+    /// separates a root or a home-made certificate from one somebody vouched for.
+    pub fn self_signed(&self) -> bool {
+        !self.subject_parts.is_empty() && self.subject_parts == self.issuer_parts
+    }
+
+    /// The distinguished name as `CN=x, O=y`, which is how every other tool prints it.
+    pub fn subject_dn(&self) -> String {
+        distinguished(&self.subject_parts)
+    }
+
+    pub fn issuer_dn(&self) -> String {
+        distinguished(&self.issuer_parts)
+    }
+
+    /// Whether `host` is one of the names this certificate is valid for, by the rule
+    /// browsers use: subjectAltName only, with a wildcard matching exactly one label.
+    pub fn covers(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.dns_names.iter().any(|name| matches_name(name, &host))
+            || self.ip_addresses.iter().any(|ip| ip == &host)
     }
 
     /// One line for a scan row: what it's for, who signed it, how long it has left.
@@ -66,6 +125,40 @@ impl Cert {
     }
 }
 
+/// An epoch second as a UTC date, spelled out. Certificates are UTC by specification —
+/// the trailing `Z` — so this is exact without a timezone database, and it says "UTC"
+/// so nobody has to wonder whether it was converted.
+pub fn utc(epoch: u64) -> String {
+    let days = (epoch / 86_400) as i64;
+    let seconds = epoch % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+/// The inverse of `days_from_civil`, by the same algorithm read backwards.
+fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u64;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u64;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -93,6 +186,132 @@ const DNS_NAME: u8 = 0x82;
 const OID_CN: &[u8] = &[0x55, 0x04, 0x03]; // 2.5.4.3
 const OID_ORG: &[u8] = &[0x55, 0x04, 0x0A]; // 2.5.4.10
 const OID_SAN: &[u8] = &[0x55, 0x1D, 0x11]; // 2.5.29.17
+
+/// Name attributes, by their short form — the one that appears in a distinguished
+/// name. Anything not here is printed by its dotted OID rather than dropped.
+const ATTRIBUTES: &[(&[u8], &str)] = &[
+    (&[0x55, 0x04, 0x03], "CN"),
+    (&[0x55, 0x04, 0x06], "C"),
+    (&[0x55, 0x04, 0x07], "L"),
+    (&[0x55, 0x04, 0x08], "ST"),
+    (&[0x55, 0x04, 0x0A], "O"),
+    (&[0x55, 0x04, 0x0B], "OU"),
+    (&[0x55, 0x04, 0x05], "serialNumber"),
+    (
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x01],
+        "emailAddress",
+    ),
+];
+
+/// Signature and public-key algorithms. The names are the ones OpenSSL prints, since
+/// that's what anyone comparing two readings will have in front of them.
+const ALGORITHMS: &[(&[u8], &str)] = &[
+    (
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01],
+        "RSA",
+    ),
+    (
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05],
+        "sha1WithRSA",
+    ),
+    (
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B],
+        "sha256WithRSA",
+    ),
+    (
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C],
+        "sha384WithRSA",
+    ),
+    (
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D],
+        "sha512WithRSA",
+    ),
+    (
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A],
+        "RSASSA-PSS",
+    ),
+    (&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01], "ECDSA"),
+    (
+        &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02],
+        "ecdsa-with-SHA256",
+    ),
+    (
+        &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03],
+        "ecdsa-with-SHA384",
+    ),
+    (
+        &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04],
+        "ecdsa-with-SHA512",
+    ),
+    (&[0x2B, 0x65, 0x70], "Ed25519"),
+];
+
+/// Named curves, by the size people call them.
+const CURVES: &[(&[u8], &str)] = &[
+    (&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07], "P-256"),
+    (&[0x2B, 0x81, 0x04, 0x00, 0x22], "P-384"),
+    (&[0x2B, 0x81, 0x04, 0x00, 0x23], "P-521"),
+];
+
+/// What an extendedKeyUsage OID permits.
+const PURPOSES: &[(&[u8], &str)] = &[
+    (
+        &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01],
+        "servidor TLS",
+    ),
+    (
+        &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02],
+        "cliente TLS",
+    ),
+    (
+        &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03],
+        "assinatura de código",
+    ),
+    (
+        &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x04],
+        "proteção de e-mail",
+    ),
+    (
+        &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08],
+        "carimbo de tempo",
+    ),
+    (
+        &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09],
+        "assinatura OCSP",
+    ),
+];
+
+/// `keyUsage` is a BIT STRING whose bits are named in this order by RFC 5280.
+const KEY_USAGES: &[&str] = &[
+    "assinatura digital",
+    "não repúdio",
+    "cifrar chave",
+    "cifrar dados",
+    "acordo de chaves",
+    "assinar certificados",
+    "assinar CRL",
+    "só cifrar",
+    "só decifrar",
+];
+
+const OID_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x0F]; // 2.5.29.15
+const OID_EKU: &[u8] = &[0x55, 0x1D, 0x25]; // 2.5.29.37
+const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1D, 0x13]; // 2.5.29.19
+const OID_SKI: &[u8] = &[0x55, 0x1D, 0x0E]; // 2.5.29.14
+const OID_AKI: &[u8] = &[0x55, 0x1D, 0x23]; // 2.5.29.35
+const OID_CRL: &[u8] = &[0x55, 0x1D, 0x1F]; // 2.5.29.31
+const OID_AIA: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01]; // 1.3.6.1.5.5.7.1.1
+const OID_OCSP: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
+const OID_CA_ISSUERS: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02];
+/// Embedded signed certificate timestamps — 1.3.6.1.4.1.11129.2.4.2.
+const OID_SCT: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0xD6, 0x79, 0x02, 0x04, 0x02];
+
+const BIT_STRING: u8 = 0x03;
+const INTEGER: u8 = 0x02;
+const BOOLEAN: u8 = 0x01;
+/// `uniformResourceIdentifier` in a GeneralName, and `iPAddress`.
+const URI: u8 = 0x86;
+const IP_ADDRESS: u8 = 0x87;
 
 /// A cursor over DER, handing back one tag-length-value at a time.
 struct Der<'a> {
@@ -145,31 +364,46 @@ impl<'a> Der<'a> {
     }
 }
 
-/// Reads the certificate's four interesting fields out of its DER.
+/// Reads a certificate out of its DER — everything this app knows how to say about one.
 pub fn parse(der: &[u8]) -> Option<Cert> {
     let certificate = Der::new(der).expect(SEQUENCE)?;
     let mut top = Der::new(certificate);
     let tbs = top.expect(SEQUENCE)?;
     let mut fields = Der::new(tbs);
 
+    let mut cert = Cert {
+        version: 1,
+        fingerprint: fingerprint(der),
+        ..Default::default()
+    };
+
     // `version` is `[0] EXPLICIT` and defaults to v1 by being absent, so it's peeked at
     // rather than required — a v1 certificate starts straight at the serial number.
     let mut rest = Der::new(fields.bytes);
-    if let Some((CONTEXT_0, _)) = rest.next() {
+    if let Some((CONTEXT_0, value)) = rest.next() {
         fields.next();
+        // Stored zero-based in the encoding: the byte 2 means v3.
+        cert.version = Der::new(value)
+            .expect(INTEGER)
+            .and_then(|v| v.first().copied())
+            .map(|v| v + 1)
+            .unwrap_or(1);
     }
-    fields.next()?; // serialNumber
-    fields.expect(SEQUENCE)?; // signature algorithm
+    cert.serial = fields
+        .next()
+        .map(|(_, value)| hex(value))
+        .unwrap_or_default();
+    cert.signature_algorithm = fields.expect(SEQUENCE).and_then(algorithm_name);
     let issuer = fields.expect(SEQUENCE)?;
     let validity = fields.expect(SEQUENCE)?;
     let subject = fields.expect(SEQUENCE)?;
-    fields.expect(SEQUENCE)?; // subjectPublicKeyInfo
+    let spki = fields.expect(SEQUENCE)?;
 
-    let mut cert = Cert {
-        subject: name_attribute(subject, OID_CN),
-        issuer: name_attribute(issuer, OID_CN).or_else(|| name_attribute(issuer, OID_ORG)),
-        ..Default::default()
-    };
+    cert.subject_parts = name_parts(subject);
+    cert.issuer_parts = name_parts(issuer);
+    cert.subject = name_attribute(subject, OID_CN);
+    cert.issuer = name_attribute(issuer, OID_CN).or_else(|| name_attribute(issuer, OID_ORG));
+    cert.public_key = public_key(spki);
 
     let mut times = Der::new(validity);
     cert.not_before = times.next().and_then(|(tag, value)| time(tag, value));
@@ -180,7 +414,7 @@ pub fn parse(der: &[u8]) -> Option<Cert> {
     while !fields.is_empty() {
         match fields.next() {
             Some((CONTEXT_3, value)) => {
-                cert.dns_names = subject_alt_names(value).unwrap_or_default();
+                extensions(&mut cert, value);
                 break;
             }
             Some(_) => continue,
@@ -188,6 +422,322 @@ pub fn parse(der: &[u8]) -> Option<Cert> {
         }
     }
     Some(cert)
+}
+
+/// Walks the extension list once, filling in whatever it recognises. An extension we
+/// don't know is skipped in silence — there are hundreds, and a certificate carrying an
+/// exotic one is not a certificate we failed to read.
+fn extensions(cert: &mut Cert, extensions: &[u8]) {
+    let Some(list) = Der::new(extensions).expect(SEQUENCE) else {
+        return;
+    };
+    let mut entries = Der::new(list);
+    while let Some((SEQUENCE, extension)) = entries.next() {
+        let mut parts = Der::new(extension);
+        let Some(oid) = parts.expect(OID) else {
+            continue;
+        };
+        // `critical` is a BOOLEAN with a default, so it may or may not be there; the
+        // OCTET STRING that follows is what matters either way.
+        let mut contents = None;
+        while let Some((tag, value)) = parts.next() {
+            match tag {
+                BOOLEAN => continue,
+                OCTET_STRING => {
+                    contents = Some(value);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let Some(contents) = contents else { continue };
+
+        match oid {
+            _ if oid == OID_SAN => {
+                let (names, ips) = alt_names(contents);
+                cert.dns_names = names;
+                cert.ip_addresses = ips;
+            }
+            _ if oid == OID_KEY_USAGE => cert.key_usage = key_usage(contents),
+            _ if oid == OID_EKU => cert.extended_key_usage = purposes(contents),
+            _ if oid == OID_BASIC_CONSTRAINTS => {
+                if let Some(inner) = Der::new(contents).expect(SEQUENCE) {
+                    let mut parts = Der::new(inner);
+                    while let Some((tag, value)) = parts.next() {
+                        match tag {
+                            BOOLEAN => cert.is_ca = value.first().copied().unwrap_or(0) != 0,
+                            INTEGER => cert.path_len = Some(be_number(value)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ if oid == OID_SKI => {
+                cert.subject_key_id = Der::new(contents).expect(OCTET_STRING).map(hex);
+            }
+            _ if oid == OID_AKI => {
+                // The identifier is `[0]` inside a SEQUENCE, alongside optional issuer
+                // name and serial that nothing here needs.
+                if let Some(inner) = Der::new(contents).expect(SEQUENCE) {
+                    let mut parts = Der::new(inner);
+                    while let Some((tag, value)) = parts.next() {
+                        if tag == 0x80 {
+                            cert.authority_key_id = Some(hex(value));
+                            break;
+                        }
+                    }
+                }
+            }
+            _ if oid == OID_AIA => {
+                let (ocsp, issuers) = access_descriptions(contents);
+                cert.ocsp = ocsp;
+                cert.ca_issuers = issuers;
+            }
+            _ if oid == OID_CRL => cert.crl = uris(contents),
+            _ if oid == OID_SCT => cert.has_sct = true,
+            _ => {}
+        }
+    }
+}
+
+/// Every attribute of a Name, in order, as (short name, value).
+fn name_parts(name: &[u8]) -> Vec<(String, String)> {
+    let mut parts = Vec::new();
+    let mut rdns = Der::new(name);
+    while let Some((SET, rdn)) = rdns.next() {
+        let mut attributes = Der::new(rdn);
+        while let Some((SEQUENCE, attribute)) = attributes.next() {
+            let mut fields = Der::new(attribute);
+            let Some(oid) = fields.expect(OID) else {
+                continue;
+            };
+            let Some((_, value)) = fields.next() else {
+                continue;
+            };
+            let label = ATTRIBUTES
+                .iter()
+                .find(|(known, _)| *known == oid)
+                .map(|(_, name)| (*name).to_string())
+                .unwrap_or_else(|| dotted(oid));
+            parts.push((label, printable(value)));
+        }
+    }
+    parts
+}
+
+fn distinguished(parts: &[(String, String)]) -> String {
+    parts
+        .iter()
+        .map(|(label, value)| format!("{label}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Algorithm name from an AlgorithmIdentifier — the OID it starts with.
+fn algorithm_name(algorithm: &[u8]) -> Option<String> {
+    let oid = Der::new(algorithm).expect(OID)?;
+    Some(
+        ALGORITHMS
+            .iter()
+            .find(|(known, _)| *known == oid)
+            .map(|(_, name)| (*name).to_string())
+            .unwrap_or_else(|| dotted(oid)),
+    )
+}
+
+/// Algorithm and strength of the public key: the modulus length for RSA, the curve for
+/// ECDSA. Both are what someone means when they ask how strong a certificate is.
+fn public_key(spki: &[u8]) -> Option<String> {
+    let mut parts = Der::new(spki);
+    let algorithm = parts.expect(SEQUENCE)?;
+    let key = parts.expect(BIT_STRING)?;
+    let mut identifier = Der::new(algorithm);
+    let oid = identifier.expect(OID)?;
+    let name = ALGORITHMS
+        .iter()
+        .find(|(known, _)| *known == oid)
+        .map(|(_, name)| *name)
+        .unwrap_or("chave");
+
+    if name == "ECDSA" {
+        let curve = identifier
+            .expect(OID)
+            .and_then(|oid| {
+                CURVES
+                    .iter()
+                    .find(|(known, _)| *known == oid)
+                    .map(|(_, name)| (*name).to_string())
+            })
+            .unwrap_or_else(|| "curva desconhecida".to_string());
+        return Some(format!("ECDSA {curve}"));
+    }
+    if name == "RSA" {
+        // A BIT STRING's first byte counts the unused bits at the end; the RSAPublicKey
+        // SEQUENCE starts after it.
+        let inner = Der::new(key.get(1..)?).expect(SEQUENCE)?;
+        let modulus = Der::new(inner).expect(INTEGER)?;
+        // DER integers are signed, so a modulus with its top bit set carries a leading
+        // zero byte that is padding rather than key material.
+        let bytes = modulus.iter().skip_while(|b| **b == 0).count();
+        return Some(format!("RSA {} bits", bytes * 8));
+    }
+    Some(name.to_string())
+}
+
+/// The named bits of `keyUsage`, in RFC order.
+fn key_usage(contents: &[u8]) -> Vec<String> {
+    let Some(bits) = Der::new(contents).expect(BIT_STRING) else {
+        return Vec::new();
+    };
+    let Some((unused, bytes)) = bits.split_first() else {
+        return Vec::new();
+    };
+    let total = bytes.len() * 8 - *unused as usize;
+    (0..total.min(KEY_USAGES.len()))
+        .filter(|bit| bytes[bit / 8] & (0x80 >> (bit % 8)) != 0)
+        .map(|bit| KEY_USAGES[bit].to_string())
+        .collect()
+}
+
+/// What extendedKeyUsage permits, named.
+fn purposes(contents: &[u8]) -> Vec<String> {
+    let Some(list) = Der::new(contents).expect(SEQUENCE) else {
+        return Vec::new();
+    };
+    let mut entries = Der::new(list);
+    let mut found = Vec::new();
+    while let Some((OID, oid)) = entries.next() {
+        found.push(
+            PURPOSES
+                .iter()
+                .find(|(known, _)| *known == oid)
+                .map(|(_, name)| (*name).to_string())
+                .unwrap_or_else(|| dotted(oid)),
+        );
+    }
+    found
+}
+
+/// dNSName and iPAddress entries of a subjectAltName.
+fn alt_names(contents: &[u8]) -> (Vec<String>, Vec<String>) {
+    let Some(list) = Der::new(contents).expect(SEQUENCE) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut names = Der::new(list);
+    let (mut dns, mut ips) = (Vec::new(), Vec::new());
+    while let Some((tag, value)) = names.next() {
+        match tag {
+            DNS_NAME => dns.push(printable(value)),
+            // Four bytes for IPv4, sixteen for IPv6 — the address as the kernel would
+            // hold it, not as text.
+            IP_ADDRESS => ips.push(match value.len() {
+                4 => std::net::Ipv4Addr::from([value[0], value[1], value[2], value[3]]).to_string(),
+                16 => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(value);
+                    std::net::Ipv6Addr::from(octets).to_string()
+                }
+                _ => hex(value),
+            }),
+            _ => {}
+        }
+    }
+    (dns, ips)
+}
+
+/// OCSP responders and issuer locations out of authorityInfoAccess.
+fn access_descriptions(contents: &[u8]) -> (Vec<String>, Vec<String>) {
+    let Some(list) = Der::new(contents).expect(SEQUENCE) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut entries = Der::new(list);
+    let (mut ocsp, mut issuers) = (Vec::new(), Vec::new());
+    while let Some((SEQUENCE, description)) = entries.next() {
+        let mut parts = Der::new(description);
+        let Some(method) = parts.expect(OID) else {
+            continue;
+        };
+        let Some((URI, location)) = parts.next() else {
+            continue;
+        };
+        let url = printable(location);
+        if method == OID_OCSP {
+            ocsp.push(url);
+        } else if method == OID_CA_ISSUERS {
+            issuers.push(url);
+        }
+    }
+    (ocsp, issuers)
+}
+
+/// Every URI buried anywhere in a structure of nested SEQUENCEs and context tags —
+/// which is what a CRL distribution point is, and its shape varies enough that walking
+/// for the URIs beats spelling out the grammar.
+fn uris(contents: &[u8]) -> Vec<String> {
+    let mut found = Vec::new();
+    collect_uris(contents, 0, &mut found);
+    found
+}
+
+fn collect_uris(bytes: &[u8], depth: usize, found: &mut Vec<String>) {
+    if depth > 6 {
+        return;
+    }
+    let mut reader = Der::new(bytes);
+    while let Some((tag, value)) = reader.next() {
+        if tag == URI {
+            found.push(printable(value));
+        } else if tag & 0x20 != 0 {
+            // Constructed: something is nested inside it.
+            collect_uris(value, depth + 1, found);
+        }
+    }
+}
+
+/// Whether a certificate name matches a host, by the browser rule: exact, or a leading
+/// `*` standing for exactly one label.
+fn matches_name(name: &str, host: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(suffix) = name.strip_prefix("*.") {
+        return host.split_once('.').is_some_and(|(_, rest)| rest == suffix);
+    }
+    name == host
+}
+
+/// SHA-256 of the whole certificate, in the colon-separated hex every other tool prints.
+fn fingerprint(der: &[u8]) -> String {
+    hex(ring::digest::digest(&ring::digest::SHA256, der).as_ref())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// An OID back as dotted arcs, for the ones no table here names. The first byte packs
+/// two arcs; the rest are base-128 with a continuation bit.
+fn dotted(oid: &[u8]) -> String {
+    let Some((&first, rest)) = oid.split_first() else {
+        return String::new();
+    };
+    let mut arcs = vec![(first / 40).to_string(), (first % 40).to_string()];
+    let mut value: u64 = 0;
+    for byte in rest {
+        value = (value << 7) | (byte & 0x7F) as u64;
+        if byte & 0x80 == 0 {
+            arcs.push(value.to_string());
+            value = 0;
+        }
+    }
+    arcs.join(".")
+}
+
+/// A DER INTEGER's value, for the small ones (path lengths, versions).
+fn be_number(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0u64, |acc, b| (acc << 8) | *b as u64)
 }
 
 /// The first value of `wanted` in a Name — walking RDNSequence → RDN → AttributeTypeAndValue.
@@ -208,40 +758,6 @@ fn name_attribute(name: &[u8], wanted: &[u8]) -> Option<String> {
                 return Some(printable(value));
             }
         }
-    }
-    None
-}
-
-/// dNSName entries of the subjectAltName extension, if it has one.
-fn subject_alt_names(extensions: &[u8]) -> Option<Vec<String>> {
-    let mut wrapper = Der::new(extensions);
-    let list = wrapper.expect(SEQUENCE)?;
-    let mut entries = Der::new(list);
-    while let Some((SEQUENCE, extension)) = entries.next() {
-        let mut parts = Der::new(extension);
-        let Some(oid) = parts.expect(OID) else {
-            continue;
-        };
-        if oid != OID_SAN {
-            continue;
-        }
-        // `critical` is a BOOLEAN with a default, so it may or may not be there; the
-        // OCTET STRING that follows is what matters either way.
-        let contents = loop {
-            match parts.next() {
-                Some((OCTET_STRING, value)) => break value,
-                Some(_) => continue,
-                None => return None,
-            }
-        };
-        let mut names = Der::new(Der::new(contents).expect(SEQUENCE)?);
-        let mut found = Vec::new();
-        while let Some((tag, value)) = names.next() {
-            if tag == DNS_NAME {
-                found.push(printable(value));
-            }
-        }
-        return Some(found);
     }
     None
 }
@@ -335,6 +851,22 @@ mod tests {
         assert!(parse(&EXAMPLE_COM[..EXAMPLE_COM.len() / 2]).is_none());
         assert!(parse(b"").is_none());
         assert!(parse(b"\x30\x82\xff\xff").is_none());
+    }
+
+    #[test]
+    fn utc_round_trips_through_the_civil_calendar() {
+        assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc(1_793_139_441), "2026-10-27 22:17:21 UTC");
+        // A leap day, which is where a calendar that cuts corners goes wrong.
+        assert_eq!(utc(1_709_164_800), "2024-02-29 00:00:00 UTC");
+    }
+
+    #[test]
+    fn wildcards_cover_one_label_and_no_more() {
+        assert!(matches_name("*.example.com", "api.example.com"));
+        assert!(!matches_name("*.example.com", "a.b.example.com"));
+        assert!(!matches_name("*.example.com", "example.com"));
+        assert!(matches_name("Example.COM", "example.com"));
     }
 
     #[test]

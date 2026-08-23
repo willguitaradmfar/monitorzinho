@@ -780,13 +780,14 @@ dependencies = [
 
 [[package]]
 name = "monitorzinho"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "crossterm",
  "dirs",
  "nvml-wrapper",
  "ratatui",
  "regex",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",

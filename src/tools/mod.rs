@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+pub mod cert;
 pub mod dns;
 pub mod net;
 pub mod persist;
@@ -160,6 +161,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(tunnel::TunnelTool),
         Box::new(scan::ScanTool),
         Box::new(dns::DnsTool),
+        Box::new(cert::CertTool),
         Box::new(net::NetTool),
     ]
 }
