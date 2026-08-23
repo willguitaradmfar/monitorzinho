@@ -4,7 +4,7 @@ use std::fs;
 use std::net::Ipv4Addr;
 
 use nvml_wrapper::Nvml;
-use sysinfo::{Disks, Networks};
+use sysinfo::Disks;
 
 use super::disk::primary_disk;
 use super::iface;
@@ -342,6 +342,27 @@ fn row(field: &str, value: String) -> TableRow {
 /// A general "who/what is this machine" summary, laid out beside SSH Sessions since
 /// both answer the same question at different scopes: this panel is about the host
 /// itself, that one's about who's connected to it.
+/// The facts about a machine that cannot change while it is running: what it is, what
+/// it boots, who made it. Read once at startup instead of on every tick — they involve a
+/// dozen files under /sys and /etc, and the answer at 3pm is the answer from boot.
+struct Fixed {
+    os: String,
+    machine: Option<String>,
+    board: Option<String>,
+    virtualization: Option<String>,
+}
+
+impl Fixed {
+    fn read() -> Self {
+        Self {
+            os: os_summary(),
+            machine: machine_summary(),
+            board: board_summary(),
+            virtualization: virtualization(),
+        }
+    }
+}
+
 pub struct SummaryMonitor {
     /// Probed once at startup — `None` on any machine without a working NVIDIA driver,
     /// same fallback as `gpu::GpuMonitor`. A fresh, independent handle rather than
@@ -354,6 +375,7 @@ pub struct SummaryMonitor {
     /// there at all. Interfaces need no such handling: the Processes tab refreshes them
     /// every tick for the Interfaces panel next door.
     disks: Disks,
+    fixed: Fixed,
 }
 
 impl SummaryMonitor {
@@ -361,19 +383,20 @@ impl SummaryMonitor {
         Self {
             nvml: Nvml::init().ok(),
             disks: Disks::new_with_refreshed_list(),
+            fixed: Fixed::read(),
         }
     }
 
     fn rows(&self, state: &SystemState) -> Vec<TableRow> {
-        let mut rows = vec![row("Host", hostname()), row("OS", os_summary())];
-        if let Some(machine) = machine_summary() {
-            rows.push(row("Machine", machine));
+        let mut rows = vec![row("Host", hostname()), row("OS", self.fixed.os.clone())];
+        if let Some(machine) = &self.fixed.machine {
+            rows.push(row("Machine", machine.clone()));
         }
-        if let Some(board) = board_summary() {
-            rows.push(row("Board", board));
+        if let Some(board) = &self.fixed.board {
+            rows.push(row("Board", board.clone()));
         }
-        if let Some(virtual_on) = virtualization() {
-            rows.push(row("Virtual", virtual_on));
+        if let Some(virtual_on) = &self.fixed.virtualization {
+            rows.push(row("Virtual", virtual_on.clone()));
         }
         rows.extend([
             row("Uptime", format::human_duration(sysinfo::System::uptime())),
@@ -922,9 +945,9 @@ fn disk_section(disks: &Disks) -> DetailSection {
 /// Every interface with what it is and where it is, for the rows that are about the
 /// machine's place on the network. The Interfaces panel next door goes deeper on one;
 /// this is the whole list at a glance.
-fn network_section(networks: &Networks) -> DetailSection {
+fn network_section(interfaces: &[iface::Interface]) -> DetailSection {
     let mut section = DetailSection::new("Interfaces");
-    for interface in iface::interfaces(networks) {
+    for interface in interfaces {
         let mut value = format!("{}  ·  {}", interface.address_summary(), interface.kind);
         if let Some(mac) = &interface.mac {
             value.push_str(&format!("  ·  {mac}"));
@@ -1047,8 +1070,8 @@ impl SummaryMonitor {
             }
             "Uptime" => vec![uptime_section()],
             "User" => vec![user_section()],
-            "IP" | "Interfaces" => vec![network_section(&state.networks), gateway_section()],
-            "Gateway" => vec![gateway_section(), network_section(&state.networks)],
+            "IP" | "Interfaces" => vec![network_section(state.interfaces()), gateway_section()],
+            "Gateway" => vec![gateway_section(), network_section(state.interfaces())],
             "DNS" => vec![dns_section()],
             "CPU" => vec![cpu_section(state), uptime_section()],
             "Memory" => vec![memory_section()],

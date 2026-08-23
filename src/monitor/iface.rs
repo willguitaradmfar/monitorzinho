@@ -29,7 +29,7 @@ const HEADERS: [&str; 4] = ["Iface", "State", "Address", "Rate"];
 const SYSFS_NET: &str = "/sys/class/net";
 
 /// One interface, as complete a picture as the kernel gives without privileges.
-pub(super) struct Interface {
+pub(crate) struct Interface {
     pub name: String,
     pub kind: &'static str,
     /// `up`, `down`, `unknown` — the kernel's own word. A tunnel or loopback interface

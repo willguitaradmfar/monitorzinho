@@ -1,3 +1,5 @@
+use std::cell::OnceCell;
+use std::collections::HashMap;
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::tools::Handoff;
@@ -21,6 +23,25 @@ pub struct SystemState {
     pub sys: System,
     pub disks: Disks,
     pub networks: Networks,
+    /// Answers several panels each used to work out for themselves, computed at most
+    /// once per tick.
+    ///
+    /// Mapping socket inodes to the processes holding them means reading every
+    /// `/proc/<pid>/fd` on the machine — thousands of syscalls on a busy server — and
+    /// three panels wanted that same map in the same tick, each paying for it again.
+    /// Same for the socket tables and the interface list. They are the shape of the
+    /// system at the moment of the tick, so there is exactly one right answer per tick
+    /// and this is where it lives.
+    scratch: Scratch,
+}
+
+/// Per-tick memoisation. Cleared at the start of every refresh, so nothing here is ever
+/// older than the tick that is being drawn.
+#[derive(Default)]
+struct Scratch {
+    inode_to_pid: OnceCell<HashMap<u64, u32>>,
+    sockets: OnceCell<Vec<ports::SocketRow>>,
+    interfaces: OnceCell<Vec<iface::Interface>>,
 }
 
 impl SystemState {
@@ -29,13 +50,39 @@ impl SystemState {
             sys: System::new_all(),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
+            scratch: Scratch::default(),
         }
+    }
+
+    /// Which process holds each open socket, by inode. Read once per tick however many
+    /// panels ask for it.
+    pub(crate) fn inode_to_pid(&self) -> &HashMap<u64, u32> {
+        self.scratch.inode_to_pid.get_or_init(ports::inode_to_pid)
+    }
+
+    /// Every socket the kernel will show us, in this namespace.
+    pub(crate) fn sockets(&self) -> &[ports::SocketRow] {
+        self.scratch.sockets.get_or_init(ports::socket_table)
+    }
+
+    /// The machine's network interfaces, with their addresses.
+    pub(crate) fn interfaces(&self) -> &[iface::Interface] {
+        self.scratch
+            .interfaces
+            .get_or_init(|| iface::interfaces(&self.networks))
+    }
+
+    /// Forgets everything memoised for the previous tick. Called at the start of each
+    /// refresh, which is the only moment at which any of it could still be true.
+    fn start_tick(&mut self) {
+        self.scratch = Scratch::default();
     }
 
     /// Refreshes what the chart panels (Overview tab) need. Split from
     /// `refresh_processes` so each tab only pays for the sysinfo work its own
     /// monitors actually use.
     pub fn refresh_overview(&mut self) {
+        self.start_tick();
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
         self.disks.refresh(true);
@@ -46,6 +93,7 @@ impl SystemState {
     /// interface list that tab's network panels read. This is the most expensive part
     /// of a tick, so it only runs while that tab is focused.
     pub fn refresh_processes(&mut self) {
+        self.start_tick();
         // Interfaces and their addresses: cheap next to the process walk below, and
         // every network panel on this tab is wrong without them — an address that
         // changed when a VPN came up would otherwise stay as it was at launch.

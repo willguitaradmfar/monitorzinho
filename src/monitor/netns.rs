@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::time::{Duration, Instant};
 
 /// A namespace, named as well as we can name it from `/proc` alone.
 pub(super) struct Namespace {
@@ -43,6 +44,13 @@ const MAX_PIDS: usize = 8192;
 /// Also returns how many namespaces exist but could not be opened — root-owned
 /// containers seen from a normal user — because a count of what is missing is the
 /// difference between an incomplete answer and a wrong one.
+///
+/// The order of the work matters more than it looks. A machine running Kubernetes has
+/// hundreds of processes across dozens of namespaces, and the first version of this
+/// tested readability by *reading a socket table per process* — seven hundred kernel
+/// socket walks a tick on a node with forty-four namespaces, which is what took this
+/// panel from a fifth of a core to a whole one. Namespaces are grouped by their inode
+/// first, from the one cheap call, and only one pid per namespace is ever opened.
 pub(super) fn namespaces() -> (Vec<Namespace>, usize) {
     let Ok(own) = fs::read_link("/proc/self/ns/net") else {
         return (Vec::new(), 0);
@@ -51,19 +59,17 @@ pub(super) fn namespaces() -> (Vec<Namespace>, usize) {
         return (Vec::new(), 0);
     };
 
-    let mut found: HashMap<u64, Namespace> = HashMap::new();
+    // One pass, one readlink per process, no file reads: just which namespace each pid
+    // is in and which is the first pid we saw for it.
+    let mut first_pid: HashMap<u64, u32> = HashMap::new();
     let mut unreadable: Vec<String> = Vec::new();
-
     for entry in entries.flatten().take(MAX_PIDS) {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let link = format!("/proc/{pid}/ns/net");
-        let Ok(target) = fs::read_link(&link) else {
+        let Ok(target) = fs::read_link(format!("/proc/{pid}/ns/net")) else {
             // Someone else's process — root's, most likely, which on a machine running
-            // ordinary Docker is every container. We can't read its namespace, and a
-            // count of what was missed is the difference between an incomplete answer
-            // and a wrong one.
+            // ordinary Docker is every container.
             if let Some(id) = unreadable_container(pid)
                 && !unreadable.contains(&id)
             {
@@ -74,26 +80,63 @@ pub(super) fn namespaces() -> (Vec<Namespace>, usize) {
         if target == own {
             continue;
         }
-        let Some(id) = inode_of(&target) else {
-            continue;
-        };
-        // Tried rather than asked about: the file exists for every process, and
-        // whether it opens is the whole question. A namespace we can name but not read
-        // would be a row that is always empty.
-        if fs::read_to_string(format!("/proc/{pid}/net/tcp")).is_err() {
-            continue;
+        if let Some(id) = inode_of(&target) {
+            first_pid.entry(id).or_insert(pid);
         }
-        found.entry(id).or_insert_with(|| Namespace {
+    }
+
+    // Now the expensive part, once per namespace rather than once per process: can its
+    // socket table actually be opened, and what should it be called.
+    let mut list: Vec<Namespace> = first_pid
+        .into_iter()
+        .filter(|(_, pid)| fs::read_to_string(format!("/proc/{pid}/net/tcp")).is_ok())
+        .map(|(id, pid)| Namespace {
             id,
             label: label_for(pid),
             pid,
-        });
-    }
-
-    let mut list: Vec<Namespace> = found.into_values().collect();
+        })
+        .collect();
     // Stable order, so rows don't dance between ticks.
     list.sort_by(|a, b| a.label.cmp(&b.label).then(a.id.cmp(&b.id)));
     (list, unreadable.len())
+}
+
+/// The namespace list, re-enumerated no more often than it can meaningfully change.
+///
+/// Containers come and go on the scale of deployments, not of ticks, and walking every
+/// process to find that out twice a second is work that answers the same thing every
+/// time. The socket tables themselves are still read fresh on every sample — those do
+/// change constantly, and they are what the panel is actually about.
+pub(super) struct Watcher {
+    namespaces: Vec<Namespace>,
+    unreadable: usize,
+    refreshed: Option<Instant>,
+}
+
+/// How stale the namespace list may get. A container that started a moment ago shows up
+/// within five seconds, which is faster than anybody notices and
+/// far cheaper than looking every tick.
+const REFRESH: Duration = Duration::from_secs(5);
+
+impl Watcher {
+    pub fn new() -> Self {
+        Self {
+            namespaces: Vec::new(),
+            unreadable: 0,
+            refreshed: None,
+        }
+    }
+
+    pub fn current(&mut self) -> (&[Namespace], usize) {
+        let stale = self.refreshed.is_none_or(|at| at.elapsed() >= REFRESH);
+        if stale {
+            let (namespaces, unreadable) = namespaces();
+            self.namespaces = namespaces;
+            self.unreadable = unreadable;
+            self.refreshed = Some(Instant::now());
+        }
+        (&self.namespaces, self.unreadable)
+    }
 }
 
 /// `net:[4026532448]` → `4026532448`.

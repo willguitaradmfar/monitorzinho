@@ -192,7 +192,17 @@ Pointing a client at the tunnel instead of straight at the server is the one
 way to read a connection's actual payload without `CAP_NET_RAW`, because the
 bytes pass through this process rather than past it.
 
-Three things it does beyond relaying:
+Four things it does beyond relaying:
+
+- **Proxy mode.** Instead of one fixed target, it takes the destination from
+  each request: point a client's `http_proxy` and `https_proxy` at it and every
+  host it talks to shows up, which is what you want when the client is a program
+  you didn't write. A plain request is logged whole, rewritten if there are
+  rules, and forwarded with its request line put back into the origin form a
+  server expects; a `CONNECT` is relayed byte for byte with only its volume
+  counted, because what crosses it is TLS this process has no certificate to
+  impersonate. Recording that payload was the first implementation, and it
+  buried every readable line under thousands of bytes of ciphertext.
 
 - **TLS to the target.** The client still speaks plain TCP to the tunnel while
   the tunnel does the handshake with the real server, so what gets logged is
@@ -537,6 +547,22 @@ up, and it is always worth scanning and always worth reading a certificate off.
 So a tool records what it found — `found("ip", …)`, `found("dominio", …)`,
 `found("porta-tls", …)` — and is wired into every other tool for free; a new tool
 that consumes addresses becomes reachable from every existing one at once.
+
+Work that several panels need is done once per tick, not once per panel. Mapping
+socket inodes to the processes holding them means reading every `/proc/<pid>/fd`
+on the machine — thousands of syscalls on a busy server — and three panels want
+that same map in the same tick; `SystemState` computes it, the socket tables and
+the interface list at most once per tick and hands out the same answer. The
+container namespace list is re-enumerated at most every five seconds, since
+containers appear on the scale of deployments rather than of ticks, while their
+socket tables are read fresh every tick because that is what the panel is about.
+Facts that cannot change while the machine is running — DMI, kernel, model — are
+read once at startup.
+
+On a Kubernetes node with 789 processes and 44 network namespaces, the Processes
+tab costs about a fifth of one core; getting there meant finding that the first
+version of the namespace scan read a socket table *per process* to test whether it
+could, which cost a whole core on its own.
 
 There are no bindings crates for the Linux-specific parts: the socket tables
 come from a hand-rolled netlink `SOCK_DIAG` client and from `/proc/net/{tcp,udp}`

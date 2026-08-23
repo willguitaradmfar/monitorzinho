@@ -713,6 +713,11 @@ fn report(
             )),
         );
         rec.found("ip", host.address.to_string());
+        if let Some(mac) = mac {
+            // Published so a machine found now can be woken later: the MAC is the only
+            // address it still answers to once it is off.
+            rec.found("mac", mac.clone());
+        }
     }
 
     let with_ports = found.iter().filter(|host| !host.ports.is_empty()).count();

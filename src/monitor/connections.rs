@@ -8,7 +8,7 @@ use sysinfo::Pid;
 
 use super::iface;
 use super::netns;
-use super::ports::{self, inode_to_pid};
+use super::ports;
 use super::process::{command_of, describe_owner, kill_danger};
 use super::resolve::{Lookup, Resolver, Services, user_name};
 use super::{Danger, Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow};
@@ -548,23 +548,23 @@ fn parse_dump(data: &[u8], protocol: u8, out: &mut Vec<RawConn>) -> bool {
 /// pid's namespace, and needs nothing but permission to read the process. What it does
 /// not carry is `tcp_info`, so these connections have endpoints, state and queues but no
 /// byte counters — and the row says so rather than showing a zero.
-fn namespace_connections() -> (Vec<RawConn>, usize) {
-    let (namespaces, unreadable) = netns::namespaces();
+fn namespace_connections(watcher: &mut netns::Watcher) -> (Vec<RawConn>, usize) {
+    let (namespaces, unreadable) = watcher.current();
     let mut found = Vec::new();
     for namespace in namespaces {
         for (proto, family, path) in netns::socket_tables(namespace.pid) {
-            for row in ports::parse_table(proto, family, &path) {
-                let tcp = proto == "TCP";
-                let open = if tcp {
-                    TCP_OPEN_STATES & (1 << row.state as u32) != 0
+            let tcp = proto == "TCP";
+            // Same rule as the host's dump: what's listening belongs to the Ports panel,
+            // and the post-close states are noise nobody owns. Applied while parsing, so
+            // a table that is nine-tenths listeners costs a tenth of the formatting.
+            let wanted = move |state: u8| {
+                if tcp {
+                    TCP_OPEN_STATES & (1 << state as u32) != 0
                 } else {
-                    row.state as u32 == TCP_ESTABLISHED
-                };
-                // Same rule as the host's dump: what's listening belongs to the Ports
-                // panel, and the post-close states are noise nobody owns.
-                if !open {
-                    continue;
+                    state as u32 == TCP_ESTABLISHED
                 }
+            };
+            for row in ports::parse_table_where(proto, family, &path, wanted) {
                 found.push(RawConn {
                     protocol: if tcp { IPPROTO_TCP } else { IPPROTO_UDP },
                     family: if family == "IPv4" { AF_INET } else { AF_INET6 },
@@ -633,6 +633,10 @@ fn format_rate(down_per_sec: f64, up_per_sec: f64) -> String {
 /// unconnected sockets, which the Ports panel already covers. UDP carries no byte
 /// counter in the kernel, so its connections always report zero traffic/rate.
 pub struct ConnectionsMonitor {
+    /// The container namespaces, re-enumerated only every few seconds: walking every
+    /// process to find them is the single most expensive thing this panel could do, and
+    /// the answer changes when a container starts, not twice a second.
+    namespaces: netns::Watcher,
     /// Namespaces that exist and could not be read — root-owned containers seen from a
     /// normal user. Counted rather than ignored: an incomplete answer that says how
     /// incomplete it is remains an answer.
@@ -653,6 +657,7 @@ pub struct ConnectionsMonitor {
 impl ConnectionsMonitor {
     pub fn new() -> Self {
         Self {
+            namespaces: netns::Watcher::new(),
             unreadable_namespaces: 0,
             history: HashMap::new(),
             resolver: Resolver::new(),
@@ -670,7 +675,7 @@ impl ConnectionsMonitor {
         // Containers. Without these the panel is confidently wrong on any machine
         // running them: it answers "who is talking to whom" with the host's own
         // sockets and calls that the whole picture.
-        let (containers, unreadable) = namespace_connections();
+        let (containers, unreadable) = namespace_connections(&mut self.namespaces);
         raw.extend(containers);
         self.unreadable_namespaces = unreadable;
 
@@ -1033,11 +1038,11 @@ impl TableMonitor for ConnectionsMonitor {
         // until the next one.
         entries.sort_by(|(_, ad, au), (_, bd, bu)| (bd + bu).total_cmp(&(ad + au)));
 
-        let owners = inode_to_pid();
+        let owners = state.inode_to_pid();
         entries
             .into_iter()
             .take(limit.unwrap_or(usize::MAX))
-            .map(|(c, down, up)| build_row(state, &owners, &c, down, up))
+            .map(|(c, down, up)| build_row(state, owners, &c, down, up))
             .collect()
     }
 
@@ -1053,7 +1058,7 @@ impl TableMonitor for ConnectionsMonitor {
 
     fn refresh_values(&mut self, state: &SystemState, rows: &mut [TableRow]) {
         let snapshot = self.refresh_snapshot();
-        let owners = inode_to_pid();
+        let owners = state.inode_to_pid();
         for row in rows.iter_mut() {
             // A connection that's since closed just keeps showing its last known
             // values — same "stale beats missing" tradeoff as a dead pid elsewhere.
@@ -1112,7 +1117,11 @@ impl TableMonitor for ConnectionsMonitor {
         // detail it got and flags it, rather than the view blanking out.
         let (c, down, up) = snapshot.get(&row.key)?;
         let (down, up) = (*down, *up);
-        let pid = inode_to_pid().get(&(c.inode as u64)).copied().unwrap_or(0);
+        let pid = state
+            .inode_to_pid()
+            .get(&(c.inode as u64))
+            .copied()
+            .unwrap_or(0);
         Some(self.build_detail(state, c, down, up, pid))
     }
 }

@@ -35,7 +35,7 @@ const TABLES: [(&str, &str, &str); 4] = [
 /// no privileges — which is why three panels read them for three different questions:
 /// which ports are listening, which sockets a process holds, and where a login came
 /// from. Parsed once into this shape rather than three times into three.
-pub(super) struct SocketRow {
+pub(crate) struct SocketRow {
     pub proto: &'static str,
     pub family: &'static str,
     pub local_ip: String,
@@ -103,6 +103,21 @@ fn parse_endpoint(field: &str) -> Option<(String, u16)> {
 /// `/proc/<pid>/net/tcp` — the same format, for another network namespace — is the
 /// reason this takes a path rather than knowing its own.
 pub(super) fn parse_table(proto: &'static str, family: &'static str, path: &str) -> Vec<SocketRow> {
+    parse_table_where(proto, family, path, |_| true)
+}
+
+/// The same, keeping only the rows whose state `wanted` accepts.
+///
+/// The filter is applied *before* the addresses are turned into text, which is the whole
+/// reason it exists: on a busy machine most of a socket table is listeners and
+/// time-waits, and formatting two addresses per row for something about to be discarded
+/// is most of the cost of reading the table at all.
+pub(super) fn parse_table_where(
+    proto: &'static str,
+    family: &'static str,
+    path: &str,
+    wanted: impl Fn(u8) -> bool,
+) -> Vec<SocketRow> {
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -111,6 +126,10 @@ pub(super) fn parse_table(proto: &'static str, family: &'static str, path: &str)
         .skip(1)
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
+            let state = u8::from_str_radix(fields.get(3)?, 16).ok()?;
+            if !wanted(state) {
+                return None;
+            }
             let (local_ip, local_port) = parse_endpoint(fields.get(1)?)?;
             let (remote_ip, remote_port) = parse_endpoint(fields.get(2)?)?;
             let (tx_queue, rx_queue) = fields.get(4)?.split_once(':')?;
@@ -121,7 +140,7 @@ pub(super) fn parse_table(proto: &'static str, family: &'static str, path: &str)
                 local_port,
                 remote_ip,
                 remote_port,
-                state: u8::from_str_radix(fields.get(3)?, 16).ok()?,
+                state,
                 uid: fields.get(7)?.parse().ok()?,
                 inode: fields.get(9)?.parse().ok()?,
                 rx_queue: u64::from_str_radix(rx_queue, 16).unwrap_or(0),
@@ -199,8 +218,8 @@ pub(super) fn socket_inodes(pid: u32) -> HashSet<u64> {
 /// ascending — a port whose owner we can't resolve sinks to the bottom, since we have
 /// no age to rank it by). Ties keep TCP before UDP.
 fn sample_ports(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
-    let owners = inode_to_pid();
-    let mut rows: Vec<(&'static str, u16, u32)> = listening_ports(&socket_table())
+    let owners = state.inode_to_pid();
+    let mut rows: Vec<(&'static str, u16, u32)> = listening_ports(state.sockets())
         .into_iter()
         .map(|((proto, port), inode)| (proto, port, owners.get(&inode).copied().unwrap_or(0)))
         .collect();
@@ -238,7 +257,7 @@ fn bound_interfaces(state: &SystemState, sockets: &[&SocketRow]) -> String {
         .iter()
         .any(|row| row.local_ip == "0.0.0.0" || row.local_ip == "::")
     {
-        let all = iface::interfaces(&state.networks);
+        let all = state.interfaces();
         let names: Vec<&str> = all
             .iter()
             .filter(|interface| interface.is_up() && !interface.addresses.is_empty())
@@ -322,7 +341,7 @@ impl PortsMonitor {
     }
 
     fn build_detail(&self, state: &SystemState, proto: &str, port: u16) -> Option<Detail> {
-        let sockets = socket_table();
+        let sockets = state.sockets();
         let bound: Vec<&SocketRow> = sockets
             .iter()
             .filter(|row| row.proto == proto && row.local_port == port && row.is_listening())
@@ -373,7 +392,7 @@ impl PortsMonitor {
                 .join(" · "),
         );
 
-        let pid = inode_to_pid().get(&first.inode).copied().unwrap_or(0);
+        let pid = state.inode_to_pid().get(&first.inode).copied().unwrap_or(0);
         let owner = owner_section(
             state,
             pid,
@@ -382,7 +401,7 @@ impl PortsMonitor {
 
         let mut sections = vec![socket, owner];
         if is_tcp {
-            sections.push(clients(&sockets, port));
+            sections.push(clients(sockets, port));
         }
 
         Some(Detail {
@@ -390,7 +409,7 @@ impl PortsMonitor {
             gone_note: "não está mais em escuta",
             sections,
             rates: None,
-            handoffs: record_traffic(proto, port, &mut listening_port_set(&sockets)),
+            handoffs: record_traffic(proto, port, &mut listening_port_set(sockets)),
             handoff_title: "Gravar o tráfego desta porta",
         })
     }

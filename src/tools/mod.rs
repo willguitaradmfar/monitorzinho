@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub mod cert;
 pub mod dns;
+pub mod egress;
 pub mod http;
 pub mod icmp;
 pub mod listen;
@@ -22,9 +23,11 @@ pub mod rewrite;
 pub mod rota;
 pub mod scan;
 pub mod smtp;
+pub mod stun;
 pub mod tail;
 pub mod tls;
 pub mod tunnel;
+pub mod wol;
 pub mod x509;
 
 /// How one parameter is edited in the add-execution wizard.
@@ -223,6 +226,7 @@ pub struct Handoff {
 /// * `porta` — `host:porta`, open, plaintext as far as anyone knows
 /// * `porta-tls` — `host:porta`, open and answered a TLS handshake
 /// * `rede` — a CIDR
+/// * `mac` — a hardware address, from the neighbour table
 pub fn offers_for(kind: &str, value: &str) -> Vec<Handoff> {
     match kind {
         "ip" => vec![
@@ -328,6 +332,12 @@ pub fn offers_for(kind: &str, value: &str) -> Vec<Handoff> {
             tool: "net",
             params: vec![("rede", value.to_string())],
         }],
+        // A MAC is the one address a machine still answers to when it is switched off.
+        "mac" => vec![Handoff {
+            label: format!("acordar {value} (Wake-on-LAN)"),
+            tool: "wol",
+            params: vec![("mac", value.to_string())],
+        }],
         _ => Vec::new(),
     }
 }
@@ -364,6 +374,9 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(smtp::SmtpTool),
         Box::new(net::NetTool),
         Box::new(rota::RotaTool),
+        Box::new(stun::StunTool),
+        Box::new(egress::EgressTool),
+        Box::new(wol::WolTool),
     ]
 }
 
