@@ -7,7 +7,7 @@ use sysinfo::Pid;
 use super::iface;
 use super::process::{describe_owner, kill_danger, owner_section};
 use super::resolve::{Services, user_name};
-use super::{Danger, Detail, DetailSection, SystemState, TableMonitor, TableRow};
+use super::{Danger, Detail, DetailSection, SystemState, TableMonitor, TableRow, mark};
 use crate::tools::Handoff;
 
 /// TCP_LISTEN, per include/net/tcp_states.h — shared by /proc/net/tcp{,6}.
@@ -492,12 +492,35 @@ impl Default for PortsMonitor {
 }
 
 impl TableMonitor for PortsMonitor {
+    fn id(&self) -> &'static str {
+        "ports"
+    }
+
     fn title(&self) -> &'static str {
         "Ports"
     }
 
     fn headers(&self) -> &'static [&'static str] {
         &HEADERS
+    }
+
+    /// A port is a number and a process is a command: the two things anybody would
+    /// point at in this table.
+    fn mark_kinds(&self) -> &'static [mark::MarkKind] {
+        &[
+            mark::MarkKind {
+                name: "porta",
+                column: 1,
+                numeric: true,
+                help: "o número da porta, exato",
+            },
+            mark::MarkKind {
+                name: "processo",
+                column: 2,
+                numeric: false,
+                help: "trecho do comando, ou uma expressão regular",
+            },
+        ]
     }
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {

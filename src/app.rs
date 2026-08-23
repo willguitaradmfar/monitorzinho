@@ -8,7 +8,10 @@ use sysinfo::{Pid, Signal};
 
 use crate::format;
 use crate::history::{self, CAPACITY, History};
-use crate::monitor::{self, Danger, Detail, Monitor, SystemState, TableMonitor, TableRow};
+use crate::monitor::mark::{self, Mark};
+use crate::monitor::{
+    self as monitors, Danger, Detail, Monitor, SystemState, TableMonitor, TableRow,
+};
 use crate::tools::persist::ExecutionSpec;
 use crate::tools::rewrite::{self, Rule};
 use crate::tools::{self, Execution, Handoff, ParamKind, ParamSpec, State, Tool};
@@ -216,7 +219,7 @@ impl TableFocus {
 /// magnitude between a laptop and a node running hundreds of containers.
 pub fn bench() {
     let mut state = SystemState::new();
-    let mut monitors = monitor::all_table_monitors();
+    let mut monitors = monitors::all_table_monitors();
 
     println!(
         "monitorzinho {} — amostragem da aba Processos",
@@ -265,6 +268,48 @@ pub fn bench() {
         );
         println!();
     }
+}
+
+/// What to put in the box when it opens over a given row: the port under the cursor,
+/// the command under the cursor, the user under the cursor.
+///
+/// For a numeric kind it is the first number in the cell, which is the port itself
+/// rather than the address around it. For a text one it is the cell, trimmed of the
+/// container label and the tree drawing that belong to the display and not to the value.
+fn suggested_value(row: &TableRow, kind: &mark::MarkKind) -> String {
+    let Some(cell) = row.cells.get(kind.column) else {
+        return String::new();
+    };
+    if kind.numeric {
+        return cell
+            .split(|c: char| !c.is_ascii_digit())
+            .find(|part| !part.is_empty())
+            .unwrap_or_default()
+            .to_string();
+    }
+    let text = cell.trim();
+    // A command line is long and its first word is what anyone would type.
+    match text.split_whitespace().next() {
+        Some(first) if text.len() > 40 => first.to_string(),
+        _ => text.to_string(),
+    }
+}
+
+/// The little form that writes one mark: what kind of thing to watch, the value, and —
+/// where the table is a tree — whether the children come along.
+///
+/// It opens over a fullscreened table with the fields already filled from the row under
+/// the cursor, because that is where the answer almost always is: you are looking at the
+/// thing you want to follow when you decide to follow it.
+pub struct MarkEditor {
+    pub table_index: usize,
+    /// Which of the table's kinds is selected, as an index into `mark_kinds()`.
+    pub kind: usize,
+    pub value: String,
+    pub subtree: bool,
+    /// Whether the table has a tree to extend a mark down — only then is the third
+    /// field shown, since offering it on a flat list would be a question with one answer.
+    pub tree: bool,
 }
 
 /// One row of a table, opened with Enter for everything its monitor knows about it —
@@ -836,6 +881,10 @@ pub struct App {
     pub capacities: Vec<Option<f64>>,
     pub table_monitors: Vec<Box<dyn TableMonitor>>,
     pub table_rows: Vec<Vec<TableRow>>,
+    /// What the user asked to keep an eye on, across restarts — see `monitor::mark`.
+    pub marks: mark::Marks,
+    /// The mark being written, while its box is open.
+    pub mark_editor: Option<MarkEditor>,
     pub tools_available: Vec<Box<dyn Tool>>,
     pub tools: ToolsState,
     pub focus: Focus,
@@ -877,7 +926,7 @@ pub enum PendingAction {
 
 impl App {
     pub fn new() -> Self {
-        let monitors = monitor::all_monitors();
+        let monitors = monitors::all_monitors();
         let saved = history::load_all();
         let histories = monitors
             .iter()
@@ -889,8 +938,9 @@ impl App {
         let extras = monitors.iter().map(|_| None).collect();
         let capacities = monitors.iter().map(|_| None).collect();
 
-        let table_monitors = monitor::all_table_monitors();
+        let table_monitors = monitors::all_table_monitors();
         let table_rows = table_monitors.iter().map(|_| Vec::new()).collect();
+        let marks = mark::Marks::load();
 
         // Executions come back up before the first frame: whatever was listening when
         // the app was last closed is listening again by the time the user sees the tab.
@@ -915,6 +965,8 @@ impl App {
             capacities,
             table_monitors,
             table_rows,
+            marks,
+            mark_editor: None,
             tools_available,
             tools,
             focus: Focus::None,
@@ -1044,7 +1096,11 @@ impl App {
                     }
                     let monitor = self.table_monitors[idx].as_mut();
                     match &mut self.focus {
-                        Focus::Table(tf) => monitor.refresh_values(&self.state, &mut tf.rows),
+                        Focus::Table(tf) => {
+                            monitor.refresh_values(&self.state, &mut tf.rows);
+                            self.marks
+                                .apply(monitor.id(), monitor.mark_kinds(), &mut tf.rows);
+                        }
                         // Rebuilt rather than patched in place: a detail is a few dozen
                         // formatted strings, cheap enough that tracking which of them
                         // changed would cost more than just building them again.
@@ -1073,6 +1129,7 @@ impl App {
                 {
                     if Some(i) != frozen_idx {
                         *rows = monitor.sample(&self.state, Some(OVERVIEW_TABLE_ROWS));
+                        self.marks.apply(monitor.id(), monitor.mark_kinds(), rows);
                     }
                 }
             }
@@ -1135,7 +1192,10 @@ impl App {
                 // Fullscreen shows every ranked row, not just the compact grid panel's
                 // top `OVERVIEW_TABLE_ROWS` — take a fresh, uncapped sample rather than
                 // reusing the already-truncated `table_rows` snapshot.
-                let rows = self.table_monitors[idx].sample(&self.state, None);
+                let mut rows = self.table_monitors[idx].sample(&self.state, None);
+                let monitor = self.table_monitors[idx].as_ref();
+                self.marks
+                    .apply(monitor.id(), monitor.mark_kinds(), &mut rows);
                 // Roots open by default (showing their direct children), everything
                 // deeper closed — same "2nd level" policy the compact panel uses.
                 let expanded = rows
@@ -1252,6 +1312,106 @@ impl App {
         }
         let last = indices.len() as i32 - 1;
         tf.selected = (tf.selected as i32 + delta).clamp(0, last) as usize;
+    }
+
+    /// Opens the mark box for the selected row, or clears the marks that already match
+    /// it — pressing the same key on something already followed means stop following it.
+    pub fn toggle_mark(&mut self) {
+        let Focus::Table(tf) = &self.focus else {
+            return;
+        };
+        let index = tf.table_index;
+        let monitor = self.table_monitors[index].as_ref();
+        let kinds = monitor.mark_kinds();
+        if kinds.is_empty() {
+            return;
+        }
+        let Some(&row_idx) = tf.visible_indices().get(tf.selected) else {
+            return;
+        };
+        let Some(row) = tf.rows.get(row_idx).cloned() else {
+            return;
+        };
+        if self.marks.hit(monitor.id(), kinds, &row).is_some() {
+            self.marks.remove_matching(monitor.id(), kinds, &row);
+            self.reapply_marks();
+            return;
+        }
+        // Filled in from the row: the value someone wants is almost always the one they
+        // are looking at.
+        let tree = tf.rows.iter().any(|row| row.child_count > 0);
+        let value = suggested_value(&row, &kinds[0]);
+        self.mark_editor = Some(MarkEditor {
+            table_index: index,
+            kind: 0,
+            value,
+            subtree: tree,
+            tree,
+        });
+    }
+
+    pub fn mark_editor_open(&self) -> bool {
+        self.mark_editor.is_some()
+    }
+
+    /// Keys while the mark box is open. Same shape as every other small form here:
+    /// ←/→ change the kind, typing edits the value, Enter saves, Esc gives up.
+    pub fn mark_key(&mut self, code: KeyCode) {
+        let Some(editor) = &mut self.mark_editor else {
+            return;
+        };
+        let kinds = self.table_monitors[editor.table_index].mark_kinds();
+        match code {
+            KeyCode::Left | KeyCode::Right => {
+                let delta = if code == KeyCode::Right { 1 } else { -1 };
+                let count = kinds.len() as i32;
+                editor.kind = (editor.kind as i32 + delta).rem_euclid(count) as usize;
+                // The value follows the kind: switching from "porta" to "processo" with
+                // a port number still in the box would save a mark that matches nothing.
+                if let Focus::Table(tf) = &self.focus
+                    && let Some(&row_idx) = tf.visible_indices().get(tf.selected)
+                    && let Some(row) = tf.rows.get(row_idx)
+                {
+                    editor.value = suggested_value(row, &kinds[editor.kind]);
+                }
+            }
+            KeyCode::Up | KeyCode::Down if editor.tree => editor.subtree = !editor.subtree,
+            KeyCode::Char(c) => editor.value.push(c),
+            KeyCode::Backspace => {
+                editor.value.pop();
+            }
+            KeyCode::Enter => {
+                let mark = Mark {
+                    table: self.table_monitors[editor.table_index].id().to_string(),
+                    kind: kinds[editor.kind].name.to_string(),
+                    value: editor.value.trim().to_string(),
+                    subtree: editor.tree && editor.subtree,
+                };
+                if !mark.value.is_empty() {
+                    self.marks.add(mark);
+                }
+                self.mark_editor = None;
+                self.reapply_marks();
+            }
+            KeyCode::Esc => self.mark_editor = None,
+            _ => {}
+        }
+    }
+
+    /// Re-runs the marks over whatever rows are on screen, so a mark added or dropped
+    /// shows up now rather than at the next tick.
+    fn reapply_marks(&mut self) {
+        for (index, monitor) in self.table_monitors.iter().enumerate() {
+            let kinds = monitor.mark_kinds();
+            if let Some(rows) = self.table_rows.get_mut(index) {
+                self.marks.apply(monitor.id(), kinds, rows);
+            }
+        }
+        if let Focus::Table(tf) = &mut self.focus {
+            let monitor = self.table_monitors[tf.table_index].as_ref();
+            self.marks
+                .apply(monitor.id(), monitor.mark_kinds(), &mut tf.rows);
+        }
     }
 
     /// What `Del` would do to the selected row, or `None` where it would do nothing —

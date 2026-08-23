@@ -169,6 +169,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     // screen, including the rules one — nothing underneath may act on
                     // the key that answers it.
                     code if app.confirm_open() => app.confirm_key(code),
+                    // The mark box sits over a fullscreened table, whose every letter is
+                    // search input — so like the others, it has to see the keys first.
+                    code if app.mark_editor_open() => app.mark_key(code),
                     // The rules screen sits on top of the wizard and takes every key,
                     // including Esc and 'q': in its Edit mode they're just characters.
                     code if app.rules_editor_open() => app.rules_key(code),
@@ -322,6 +325,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     }
                     KeyCode::Delete if matches!(app.focus, Focus::Table(_)) => {
                         app.request_kill_selected();
+                    }
+                    // Ctrl+E, not a bare letter: in a fullscreened table every letter is
+                    // search input, and marking has to work *while* searching, since
+                    // finding the row is usually how you got to it. Not Ctrl+M either —
+                    // a terminal sends the same byte for that as for Enter.
+                    KeyCode::Char('e')
+                        if matches!(app.focus, Focus::Table(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.toggle_mark();
                     }
                     KeyCode::Backspace if matches!(app.focus, Focus::Table(_)) => {
                         app.search_backspace();

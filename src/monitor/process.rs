@@ -7,7 +7,7 @@ use sysinfo::{Pid, Process};
 
 use super::ports::{listening_port_set, record_traffic, socket_inodes, socket_table};
 use super::resolve::user_name;
-use super::{Danger, Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow};
+use super::{Danger, Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow, mark};
 use crate::format;
 use crate::tools::Handoff;
 
@@ -146,6 +146,7 @@ fn flatten(
         depth,
         is_last_sibling,
         guides: guides.clone(),
+        marked: false,
         child_count: kids.len(),
         descendant_pids: descendants.get(&pid).cloned().unwrap_or_default(),
         key: String::new(),
@@ -702,12 +703,27 @@ pub struct TopCpuMonitor {
 }
 
 impl TableMonitor for TopCpuMonitor {
+    fn id(&self) -> &'static str {
+        "top-cpu"
+    }
+
     fn title(&self) -> &'static str {
         "Top CPU"
     }
 
     fn headers(&self) -> &'static [&'static str] {
         &HEADERS
+    }
+
+    /// A process is its command line, and a marked process usually means the tree under
+    /// it too — a build that matters is the build plus everything it spawned.
+    fn mark_kinds(&self) -> &'static [mark::MarkKind] {
+        &[mark::MarkKind {
+            name: "comando",
+            column: 0,
+            numeric: false,
+            help: "trecho do comando, ou uma expressão regular",
+        }]
     }
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
@@ -745,12 +761,27 @@ pub struct TopMemMonitor {
 }
 
 impl TableMonitor for TopMemMonitor {
+    fn id(&self) -> &'static str {
+        "top-mem"
+    }
+
     fn title(&self) -> &'static str {
         "Top Memory"
     }
 
     fn headers(&self) -> &'static [&'static str] {
         &HEADERS
+    }
+
+    /// A process is its command line, and a marked process usually means the tree under
+    /// it too — a build that matters is the build plus everything it spawned.
+    fn mark_kinds(&self) -> &'static [mark::MarkKind] {
+        &[mark::MarkKind {
+            name: "comando",
+            column: 0,
+            numeric: false,
+            help: "trecho do comando, ou uma expressão regular",
+        }]
     }
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {

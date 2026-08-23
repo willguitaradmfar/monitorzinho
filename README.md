@@ -106,6 +106,20 @@ metric approaches its natural limit (e.g. memory nearing 100%).
   distribution from `/etc/os-release`, so it's what the machine says about
   itself rather than anything inferred.
 
+Every table re-ranks on every tick, which is right and makes following one
+particular row impossible: you find the connection you care about, look away, and
+it has moved. `Ctrl+E` on a row **marks** it — it keeps whatever position the
+ranking gives it and wears a ★ wherever it lands, in the compact panel as well as
+fullscreen, across restarts.
+
+What a mark is *about* differs by table, because the subject does: a port is a
+number, a process is a command line, a session is a person. Ports and connections
+mark by port (compared as a number, so `443` never catches `4433`), address or
+process; the process tables mark by command, with the option to extend the mark to
+everything below it in the tree; SSH sessions by user, origin or command. Typing
+`postgres` doesn't require knowing what a regular expression is, and typing
+`^ssh(d)?$` isn't taken literally. `Ctrl+E` again stops following.
+
 Each panel has a shortcut key in its corner (`1`–`9`, then letters).
 Pressing it fullscreens that panel with every row, not just the top ten the
 compact grid shows. In a fullscreened table, typing searches immediately —
@@ -517,6 +531,7 @@ at it properly.
 | `Enter` | a fullscreened table | open the row's detail view |
 | `PgUp` / `PgDn` | any list or log | move ten rows / scroll fast, stopping at the ends |
 | `←` / `→` | process tree | collapse/expand |
+| `Ctrl+E` | a fullscreened table | mark the row so it stays findable while the list reorders; again to unmark |
 | `Del` | a fullscreened table | what it kills depends on the table — the confirmation says so before anything happens |
 | any letter | a fullscreened table | search, live |
 | `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart (or re-run) / remove an execution |
@@ -612,6 +627,7 @@ directory):
 | `history.json` | chart history, so the sparklines survive a restart |
 | `tools.json` | the executions to bring back on launch, and their parameters |
 | `rewrites.json` | every rewrite rule ever written, offered as suggestions |
+| `marks.json` | the rows you asked to keep an eye on, per table |
 
 ## License
 

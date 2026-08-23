@@ -431,6 +431,10 @@ impl Default for SummaryMonitor {
 }
 
 impl TableMonitor for SummaryMonitor {
+    fn id(&self) -> &'static str {
+        "system"
+    }
+
     fn title(&self) -> &'static str {
         "System Info"
     }

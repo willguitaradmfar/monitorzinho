@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use sysinfo::Networks;
 
-use super::{Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow};
+use super::{Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow, mark};
 use crate::format;
 
 // No column for the kind: the name carries it in practice (`wlp3s0`, `docker0`,
@@ -388,12 +388,25 @@ impl Default for InterfacesMonitor {
 }
 
 impl TableMonitor for InterfacesMonitor {
+    fn id(&self) -> &'static str {
+        "interfaces"
+    }
+
     fn title(&self) -> &'static str {
         "Interfaces"
     }
 
     fn headers(&self) -> &'static [&'static str] {
         &HEADERS
+    }
+
+    fn mark_kinds(&self) -> &'static [mark::MarkKind] {
+        &[mark::MarkKind {
+            name: "interface",
+            column: 0,
+            numeric: false,
+            help: "nome da interface, ou uma expressão regular",
+        }]
     }
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {

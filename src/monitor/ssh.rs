@@ -8,7 +8,7 @@ use super::iface;
 use super::ports::{SocketRow, TCP_ESTABLISHED, socket_inodes, socket_table};
 use super::process::{command_of, kill_danger};
 use super::resolve::user_name;
-use super::{Danger, Detail, DetailSection, SystemState, TableMonitor, TableRow};
+use super::{Danger, Detail, DetailSection, SystemState, TableMonitor, TableRow, mark};
 use crate::format;
 
 const HEADERS: [&str; 6] = ["User", "Host", "TTY", "Time", "Folder", "Command"];
@@ -217,6 +217,7 @@ fn build_row(state: &SystemState, entry: &UtmpEntry, now: u64) -> TableRow {
         depth: 0,
         is_last_sibling: true,
         guides: Vec::new(),
+        marked: false,
         child_count: 0,
         descendant_pids: kill_targets(state, entry.pid, &subtree),
         key: String::new(),
@@ -456,12 +457,41 @@ fn build_detail(state: &SystemState, entry: &UtmpEntry, now: u64) -> Detail {
 pub struct SshSessionsMonitor;
 
 impl TableMonitor for SshSessionsMonitor {
+    fn id(&self) -> &'static str {
+        "ssh"
+    }
+
     fn title(&self) -> &'static str {
         "SSH Sessions"
     }
 
     fn headers(&self) -> &'static [&'static str] {
         &HEADERS
+    }
+
+    /// A session is a person, first of all — and the origin matters when the same
+    /// person is logged in from three places.
+    fn mark_kinds(&self) -> &'static [mark::MarkKind] {
+        &[
+            mark::MarkKind {
+                name: "usuário",
+                column: 0,
+                numeric: false,
+                help: "o login, exato ou como expressão regular",
+            },
+            mark::MarkKind {
+                name: "origem",
+                column: 1,
+                numeric: false,
+                help: "de onde a sessão veio",
+            },
+            mark::MarkKind {
+                name: "comando",
+                column: 5,
+                numeric: false,
+                help: "o que a sessão está rodando",
+            },
+        ]
     }
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {

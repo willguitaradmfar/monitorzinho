@@ -11,8 +11,8 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, DetailFocus, Focus, HandoffPicker, MATCH_CONTEXT, ParamField, RulesEditor, RulesMode,
-    ShortcutTarget, Tab, TableFocus, ToolMonitorFocus, ToolWizard, WizardStep,
+    App, DetailFocus, Focus, HandoffPicker, MATCH_CONTEXT, MarkEditor, ParamField, RulesEditor,
+    RulesMode, ShortcutTarget, Tab, TableFocus, ToolMonitorFocus, ToolWizard, WizardStep,
 };
 use crate::format;
 use crate::history::History;
@@ -101,6 +101,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_screen(frame, area, app);
     // Drawn last and over everything: a question about something irreversible has no
     // business sharing the screen with the thing it's about to do.
+    if let Some(editor) = &app.mark_editor {
+        render_mark_editor(frame, area, app, editor);
+    }
     if let Some(pending) = &app.pending {
         render_confirm(frame, area, &pending.danger);
     }
@@ -133,6 +136,7 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
                 monitor.headers(),
                 TableChrome {
                     has_detail: monitor.has_detail(),
+                    marks: !monitor.mark_kinds().is_empty(),
                     note: monitor.note(),
                     // Asked of the rows rather than of the monitor: the two top-N
                     // tables are trees only when fullscreened, which is exactly here.
@@ -212,6 +216,69 @@ fn render_confirm(frame: &mut Frame, area: Rect, danger: &Danger) {
     frame.render_widget(Clear, box_area);
     frame.render_widget(block, box_area);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The box that writes one mark: what kind of thing to follow, the value, and — on a
+/// tree — whether the children come along.
+fn render_mark_editor(frame: &mut Frame, area: Rect, app: &App, editor: &MarkEditor) {
+    let monitor = app.table_monitors[editor.table_index].as_ref();
+    let kinds = monitor.mark_kinds();
+    let Some(kind) = kinds.get(editor.kind) else {
+        return;
+    };
+
+    let width = MARK_BOX_WIDTH.min(area.width);
+    let mut lines = vec![Line::raw("")];
+    lines.push(field_line(
+        "Seguir por",
+        &format!("◂ {} ▸", kind.name),
+        true,
+    ));
+    lines.push(field_line("Valor", &format!("{}▏", editor.value), false));
+    if editor.tree {
+        lines.push(field_line(
+            "Incluir a árvore",
+            if editor.subtree { "sim" } else { "não" },
+            false,
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("   {}", kind.help),
+        Style::default().fg(palette::DIM),
+    ));
+    lines.push(Line::styled(
+        "   A marca fica salva e vale entre execuções do app.",
+        Style::default().fg(palette::DIM),
+    ));
+
+    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let box_area = centered(area, width, height);
+    let hint = if editor.tree {
+        "←/→ tipo · ↑/↓ árvore · digite o valor · Enter marcar · Esc cancelar"
+    } else {
+        "←/→ tipo · digite o valor · Enter marcar · Esc cancelar"
+    };
+    let block = Block::default()
+        .title(format!(" Marcar em {} ", monitor.title()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::YELLOW))
+        .title_bottom(hint_line(hint));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One `label   value` line of the mark box, laid out like the wizard's fields.
+fn field_line(label: &str, value: &str, first: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" {} {label:<18}", if first { "▶" } else { " " }),
+            Style::default().fg(palette::DIM),
+        ),
+        Span::styled(value.to_string(), Style::default().fg(palette::YELLOW)),
+    ])
 }
 
 /// Slim header showing the two tabs (the active one highlighted), plus the app
@@ -503,6 +570,25 @@ fn render_panel(
 /// (Command/Time/Usage) want Command to take the leftover space with Time/Usage
 /// fixed-width, while the ports table (Proto/Port/Process) wants Proto/Port fixed and
 /// Process filling the rest.
+/// Two columns' worth of room at the front of every table for the mark: a star where a
+/// row is being followed, blank where it isn't. Always present, so marking something
+/// never shifts the table sideways under the reader.
+const MARK_WIDTH: u16 = 2;
+
+/// The mark cell for one row.
+fn mark_cell(row: &TableRow) -> Cell<'static> {
+    if row.marked {
+        Cell::from(Span::styled(
+            "★",
+            Style::default()
+                .fg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Cell::from(" ")
+    }
+}
+
 fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
     match headers {
         ["Proto", "Port", "Process", "Age"] => vec![
@@ -573,11 +659,20 @@ fn tree_row(row: &TableRow, next: Option<&TableRow>) -> UiRow<'static> {
     });
     prefix.push(' ');
 
-    let mut cells = row.cells.clone();
-    if let Some(first) = cells.first_mut() {
+    let mut cells: Vec<Cell> = vec![mark_cell(row)];
+    let mut own = row.cells.clone();
+    if let Some(first) = own.first_mut() {
         *first = format!("{}{}", prefix, first);
     }
-    UiRow::new(cells)
+    cells.extend(own.into_iter().map(Cell::from));
+    let ui_row = UiRow::new(cells);
+    // A followed row is coloured as well as starred: the star says which one, the colour
+    // is what the eye catches when the list reorders under it.
+    if row.marked {
+        ui_row.style(Style::default().fg(palette::YELLOW))
+    } else {
+        ui_row
+    }
 }
 
 fn render_table_panel(
@@ -604,16 +699,26 @@ fn render_table_panel(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let header = UiRow::new(headers.iter().map(|h| Cell::from(*h)).collect::<Vec<_>>())
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = UiRow::new(
+        std::iter::once(Cell::from(" "))
+            .chain(headers.iter().map(|h| Cell::from(*h)))
+            .collect::<Vec<_>>(),
+    )
+    .style(Style::default().add_modifier(Modifier::BOLD));
     let body: Vec<UiRow> = rows
         .iter()
         .enumerate()
         .map(|(i, r)| tree_row(r, rows.get(i + 1)))
         .collect();
 
-    let table = Table::new(body, table_col_widths(headers)).header(header);
+    let table = Table::new(body, with_mark_column(table_col_widths(headers))).header(header);
     frame.render_widget(table, inner);
+}
+
+/// The table's own columns, with the mark column in front.
+fn with_mark_column(mut widths: Vec<Constraint>) -> Vec<Constraint> {
+    widths.insert(0, Constraint::Length(MARK_WIDTH));
+    widths
 }
 
 /// What the footer of a fullscreened table is allowed to offer — every part of it
@@ -621,6 +726,9 @@ fn render_table_panel(
 /// worse than no hint at all.
 struct TableChrome {
     has_detail: bool,
+    /// Whether this table takes marks — a list of facts about the machine has no row
+    /// worth following, and offering the key there would be offering nothing.
+    marks: bool,
     /// What the table has to say about its own completeness — see `TableMonitor::note`.
     note: Option<String>,
     /// Whether any row has children. `←`/`→` collapse and expand a tree; on a flat
@@ -655,6 +763,11 @@ fn render_fullscreen_table(
     if chrome.has_detail {
         parts.push("Enter detalhar".to_string());
     }
+    if chrome.marks {
+        // Named for what it does rather than for the key: "marcar" is the verb, and the
+        // star it leaves is what the reader will be looking for afterwards.
+        parts.push("Ctrl+E marcar ★".to_string());
+    }
     if table_focus.query.is_empty() {
         parts.push("↑/↓ navegar".to_string());
         parts.push("PgUp/PgDn saltar".to_string());
@@ -686,8 +799,12 @@ fn render_fullscreen_table(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let header = UiRow::new(headers.iter().map(|h| Cell::from(*h)).collect::<Vec<_>>())
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = UiRow::new(
+        std::iter::once(Cell::from(" "))
+            .chain(headers.iter().map(|h| Cell::from(*h)))
+            .collect::<Vec<_>>(),
+    )
+    .style(Style::default().add_modifier(Modifier::BOLD));
     let visible = table_focus.visible_indices();
     // Peek at the *next visible* row, not the next row in the underlying full list —
     // a collapsed node's real children are still present right after it in the full,
@@ -701,7 +818,7 @@ fn render_fullscreen_table(
         })
         .collect();
 
-    let table = Table::new(body, table_col_widths(headers))
+    let table = Table::new(body, with_mark_column(table_col_widths(headers)))
         .header(header)
         .row_highlight_style(
             Style::default()
@@ -1426,6 +1543,8 @@ const PARAM_LABEL_WIDTH: usize = 20;
 /// Narrower than the wizard: a confirmation is a short question, and a wide box for
 /// three lines reads as a form to fill in rather than a thing to answer.
 const CONFIRM_WIDTH: u16 = 76;
+/// The mark box: three short fields and two lines of explanation.
+const MARK_BOX_WIDTH: u16 = 72;
 const WIZARD_WIDTH: u16 = 92;
 /// Borders plus the indent the wizard's prose sits at — subtracted from the box width
 /// to get the column that help text and descriptions wrap to.

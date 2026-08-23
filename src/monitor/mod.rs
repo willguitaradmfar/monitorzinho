@@ -9,6 +9,7 @@ pub mod cpu;
 pub mod disk;
 pub mod gpu;
 pub mod iface;
+pub mod mark;
 pub mod memory;
 pub mod netns;
 pub mod network;
@@ -200,6 +201,9 @@ pub struct TableRow {
     /// child of its own siblings (draw blank space at that column), `false` if it had
     /// a later sibling (draw a continuing `│`).
     pub guides: Vec<bool>,
+    /// Whether a mark is watching this row — see `mark`. Set after sampling, from
+    /// state the monitor itself knows nothing about.
+    pub marked: bool,
     /// Number of direct children. 0 means this row is a leaf.
     pub child_count: usize,
     /// Every pid in this row's subtree (not including its own pid) — used for
@@ -221,6 +225,7 @@ impl TableRow {
             depth: 0,
             is_last_sibling: true,
             guides: Vec::new(),
+            marked: false,
             child_count: 0,
             descendant_pids: Vec::new(),
             key: String::new(),
@@ -306,7 +311,17 @@ pub struct Danger {
 /// One "monitorzinho" that shows a ranked snapshot list instead of a time series
 /// (e.g. top processes). No history/persistence — it's a live snapshot.
 pub trait TableMonitor: Send {
+    /// Stable key for anything saved about this table — never change one once shipped,
+    /// same rule as `Monitor::id`. The title is free to change; this isn't.
+    fn id(&self) -> &'static str;
     fn title(&self) -> &'static str;
+
+    /// What a mark on this table can be about, in the order the picker offers them.
+    /// Empty means the table takes no marks — a list of facts about the machine has no
+    /// row worth following.
+    fn mark_kinds(&self) -> &'static [mark::MarkKind] {
+        &[]
+    }
     /// Column headers; each `TableRow::cells` must have the same length as this.
     fn headers(&self) -> &'static [&'static str];
     /// Ranked rows, capped to `limit` entries — or every ranked entry when `None`

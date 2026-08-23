@@ -11,7 +11,7 @@ use super::netns;
 use super::ports;
 use super::process::{command_of, describe_owner, kill_danger};
 use super::resolve::{Lookup, Resolver, Services, user_name};
-use super::{Danger, Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow};
+use super::{Danger, Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow, mark};
 use crate::app::TICK_RATE;
 use crate::format;
 use crate::tools::Handoff;
@@ -1085,12 +1085,41 @@ fn path_section(info: &TcpInfo) -> DetailSection {
 }
 
 impl TableMonitor for ConnectionsMonitor {
+    fn id(&self) -> &'static str {
+        "connections"
+    }
+
     fn title(&self) -> &'static str {
         "Connections"
     }
 
     fn headers(&self) -> &'static [&'static str] {
         &HEADERS
+    }
+
+    /// Either end of the connection is a number, the far side is an address, and the
+    /// owner is a command — a connection is worth following by any of the three.
+    fn mark_kinds(&self) -> &'static [mark::MarkKind] {
+        &[
+            mark::MarkKind {
+                name: "porta",
+                column: 2,
+                numeric: true,
+                help: "qualquer uma das duas portas da conexão, exata",
+            },
+            mark::MarkKind {
+                name: "endereço",
+                column: 2,
+                numeric: false,
+                help: "trecho do endereço, ou uma expressão regular",
+            },
+            mark::MarkKind {
+                name: "processo",
+                column: 1,
+                numeric: false,
+                help: "trecho do comando dono da conexão, ou uma expressão regular",
+            },
+        ]
     }
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
