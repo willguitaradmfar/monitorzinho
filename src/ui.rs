@@ -1039,17 +1039,20 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
             // instead of moving the wizard along.
             {
                 let mut parts = vec!["↑/↓ campo"];
-                match wizard
-                    .fields
-                    .get(wizard.field)
-                    .map(|field| &field.spec.kind)
-                {
+                let field = wizard.fields.get(wizard.field);
+                match field.map(|field| &field.spec.kind) {
                     Some(ParamKind::Choice(_)) => {
                         parts.push("←/→ alternar opção");
                         parts.push("Enter continuar");
                     }
                     Some(ParamKind::Rules) => parts.push("Enter abre a lista de regras"),
                     _ => {
+                        // A suggested value is a shortcut, not a replacement: the field
+                        // still takes anything typed, so it's offered as one more key
+                        // rather than in place of the typing.
+                        if field.is_some_and(|field| !field.spec.suggestions.is_empty()) {
+                            parts.push("←/→ sugestões");
+                        }
                         parts.push("digite para editar");
                         parts.push("Enter continuar");
                     }
@@ -1345,14 +1348,15 @@ fn wizard_param_lines(wizard: &ToolWizard, text_width: usize) -> Vec<Line<'stati
         } else {
             Style::default().fg(palette::DIM)
         };
-        lines.push(Line::from(vec![
+        let mut row = vec![
             Span::styled(format!(" {marker}"), label_style),
             Span::styled(
                 format!("{:width$}  ", field.spec.label, width = PARAM_LABEL_WIDTH),
                 label_style,
             ),
-            Span::styled(field_value(field, focused), value_style(focused)),
-        ]));
+        ];
+        row.extend(field_value(field, focused));
+        lines.push(Line::from(row));
     }
     // The focused field's help sits below the whole form rather than beside its row, so
     // a long explanation never pushes the value column around as focus moves.
@@ -1381,14 +1385,42 @@ fn wizard_param_lines(wizard: &ToolWizard, text_width: usize) -> Vec<Line<'stati
 }
 
 /// A choice shows its arrows so it's visibly cycled rather than typed; a text field
-/// shows a caret while focused so it's visibly editable.
-fn field_value(field: &ParamField, focused: bool) -> String {
+/// shows a caret while focused so it's visibly editable. A text field with suggestions
+/// is both, and shows both — plus, when the value is one of them, the note that says
+/// what it is: the whole point of offering the machine's own networks is that a CIDR
+/// alone doesn't say which one is the wifi.
+fn field_value(field: &ParamField, focused: bool) -> Vec<Span<'static>> {
+    let value = |text: String| Span::styled(text, value_style(focused));
     match field.spec.kind {
-        ParamKind::Choice(_) => format!("◂ {} ▸", field.value),
-        ParamKind::Rules => rules_summary(&field.value),
-        ParamKind::Text if focused => format!("{}▏", field.value),
-        ParamKind::Text => field.value.clone(),
+        ParamKind::Choice(_) => vec![value(format!("◂ {} ▸", field.value))],
+        ParamKind::Rules => vec![value(rules_summary(&field.value))],
+        ParamKind::Text if field.spec.suggestions.is_empty() && focused => {
+            vec![value(format!("{}▏", field.value))]
+        }
+        ParamKind::Text if field.spec.suggestions.is_empty() => vec![value(field.value.clone())],
+        ParamKind::Text => {
+            let caret = if focused { "▏" } else { "" };
+            let mut spans = vec![value(format!("◂ {}{caret} ▸", field.value))];
+            if let Some(note) = suggestion_note(field) {
+                spans.push(Span::styled(
+                    format!("   {note}"),
+                    Style::default().fg(palette::DIM),
+                ));
+            }
+            spans
+        }
     }
+}
+
+/// What the field's current value *is*, when it's one of the offered ones. `None` for
+/// anything typed, which stands for itself.
+fn suggestion_note(field: &ParamField) -> Option<&str> {
+    field
+        .spec
+        .suggestions
+        .iter()
+        .find(|suggestion| suggestion.value == field.value)
+        .map(|suggestion| suggestion.note.as_str())
 }
 
 /// A rules field shows its size, not its contents — the list lives on its own screen.
@@ -1455,12 +1487,16 @@ fn wizard_confirm_lines(app: &App, wizard: &ToolWizard) -> Vec<Line<'static>> {
                 ),
                 Style::default().fg(palette::DIM),
             ),
-            if field.value.is_empty() {
+            match (field.value.as_str(), suggestion_note(field)) {
+                // Blank means something on a field that offers blank as an option —
+                // this is the last screen before anything runs, so it says what.
+                ("", Some(note)) => {
+                    Span::styled(format!("({note})"), Style::default().fg(palette::DIM))
+                }
                 // An optional field left blank still gets a line, so the confirmation
                 // shows the whole form rather than quietly hiding part of it.
-                Span::styled("(vazio)", Style::default().fg(palette::DIM))
-            } else {
-                Span::raw(field.value.clone())
+                ("", None) => Span::styled("(vazio)", Style::default().fg(palette::DIM)),
+                (value, _) => Span::raw(value.to_string()),
             },
         ]));
     }

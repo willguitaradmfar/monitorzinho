@@ -344,16 +344,31 @@ pub struct ParamField {
 }
 
 impl ParamField {
-    /// Moves a `Choice` field to the next/previous option, wrapping. No-op on a text
-    /// field, which is edited by typing instead.
+    /// Moves a `Choice` field to the next/previous option, wrapping — and a text field
+    /// that has suggestions through those, since walking a list the machine already
+    /// knows beats typing it back in. A text field with nothing to suggest is edited by
+    /// typing instead, and ←/→ do nothing to it.
     fn cycle(&mut self, delta: i32) {
-        let ParamKind::Choice(options) = self.spec.kind else {
+        if let ParamKind::Choice(options) = self.spec.kind {
+            let current = options.iter().position(|o| *o == self.value).unwrap_or(0);
+            let len = options.len() as i32;
+            let next = (current as i32 + delta).rem_euclid(len) as usize;
+            self.value = options[next].to_string();
             return;
+        }
+        if !matches!(self.spec.kind, ParamKind::Text) || self.spec.suggestions.is_empty() {
+            return;
+        }
+        let suggestions = &self.spec.suggestions;
+        // The value may well be something typed rather than picked, in which case there
+        // is no position in the list to move from: → enters it at the top and ← at the
+        // bottom, so a suggestion is always one keypress away from anything typed.
+        let next = match suggestions.iter().position(|s| s.value == self.value) {
+            Some(current) => (current as i32 + delta).rem_euclid(suggestions.len() as i32) as usize,
+            None if delta >= 0 => 0,
+            None => suggestions.len() - 1,
         };
-        let current = options.iter().position(|o| *o == self.value).unwrap_or(0);
-        let len = options.len() as i32;
-        let next = (current as i32 + delta).rem_euclid(len) as usize;
-        self.value = options[next].to_string();
+        self.value = suggestions[next].value.clone();
     }
 }
 
@@ -1268,8 +1283,9 @@ impl App {
         }
     }
 
-    /// ←/→ on a multiple-choice parameter. Nothing else in the wizard uses them, so a
-    /// stray press on a text field is simply ignored.
+    /// ←/→ on a multiple-choice parameter, or on a text field with suggestions to walk
+    /// them. Nothing else in the wizard uses them, so a stray press elsewhere is simply
+    /// ignored.
     pub fn wizard_cycle(&mut self, delta: i32) {
         if let Focus::Wizard(wizard) = &mut self.focus
             && wizard.step == WizardStep::Params

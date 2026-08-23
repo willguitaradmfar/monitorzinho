@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub mod cert;
 pub mod dns;
+pub mod listen;
 pub mod net;
 pub mod persist;
 pub mod poll;
@@ -33,6 +34,28 @@ pub enum ParamKind {
     Rules,
 }
 
+/// One ready-made value a text field offers alongside what can be typed into it.
+///
+/// The `value` is what the field becomes when this one is picked; the `note` is never
+/// stored, only shown — it's the answer to "which of these is my wifi", which a bare
+/// CIDR can't give. An empty `value` is a legitimate suggestion: it's how a field whose
+/// blank state *means* something ("all of them") can offer that meaning as an option
+/// instead of leaving the user to guess it.
+#[derive(Clone)]
+pub struct Suggestion {
+    pub value: String,
+    pub note: String,
+}
+
+impl Suggestion {
+    pub fn new(value: impl Into<String>, note: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            note: note.into(),
+        }
+    }
+}
+
 /// One thing a tool needs to know before it can start.
 #[derive(Clone)]
 pub struct ParamSpec {
@@ -43,6 +66,11 @@ pub struct ParamSpec {
     pub help: &'static str,
     pub default: &'static str,
     pub kind: ParamKind,
+    /// Values the machine already knows are plausible, walked with ←/→. Only a text
+    /// field uses these, and having them never stops it being typed into: a suggestion
+    /// is a shortcut past looking something up elsewhere, not a fixed set of answers.
+    /// Empty for every field that has nothing to suggest.
+    pub suggestions: Vec<Suggestion>,
 }
 
 impl ParamSpec {
@@ -58,7 +86,15 @@ impl ParamSpec {
             help,
             default,
             kind: ParamKind::Text,
+            suggestions: Vec::new(),
         }
+    }
+
+    /// Offers `suggestions` on a text field. Put the value the field means when it's
+    /// left alone first, so walking the list from the top starts where the user is.
+    pub fn suggesting(mut self, suggestions: Vec<Suggestion>) -> Self {
+        self.suggestions = suggestions;
+        self
     }
 
     pub fn rules(key: &'static str, label: &'static str, help: &'static str) -> Self {
@@ -68,6 +104,7 @@ impl ParamSpec {
             help,
             default: "",
             kind: ParamKind::Rules,
+            suggestions: Vec::new(),
         }
     }
 
@@ -83,6 +120,7 @@ impl ParamSpec {
             help,
             default: options[0],
             kind: ParamKind::Choice(options),
+            suggestions: Vec::new(),
         }
     }
 }
@@ -311,6 +349,7 @@ pub fn offers_from(execution: &Execution) -> Vec<Handoff> {
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(tunnel::TunnelTool),
+        Box::new(listen::ListenTool),
         Box::new(scan::ScanTool),
         Box::new(dns::DnsTool),
         Box::new(cert::CertTool),

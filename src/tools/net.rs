@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::monitor::resolve;
 
-use super::{EventKind, Execution, ParamSpec, Recorder, Tool};
+use super::{EventKind, Execution, ParamSpec, Recorder, Suggestion, Tool};
 
 /// Ports probed to provoke *any* answer. Chosen to cover the things that tend to be
 /// listening on a LAN, but a refusal from a closed one counts just as much.
@@ -71,8 +71,10 @@ impl Tool for NetTool {
                 "rede",
                 "Rede",
                 "",
-                "Vazio varre as redes locais detectadas nas rotas. Aceita CIDR: 192.168.1.0/24",
-            ),
+                "←/→ escolhe uma das redes desta máquina, ou digite um CIDR: 192.168.1.0/24. \
+                 Vazio varre todas as redes locais detectadas nas rotas",
+            )
+            .suggesting(suggested_networks()),
             ParamSpec::text(
                 "portas",
                 "Portas de sondagem",
@@ -362,6 +364,22 @@ fn local_networks() -> Vec<(Network, String)> {
         }
     }
     networks
+}
+
+/// The networks offered in the wizard: blank for all of them, then one per network this
+/// machine is attached to, named by the interface that reaches it.
+///
+/// Same list the blank value sweeps — the point isn't a different set of networks, it's
+/// that picking one of them shouldn't mean reading a CIDR off `ip addr` and typing it
+/// back in. Networks too wide to sweep are left out here for the same reason they're
+/// left out of a blank sweep: offering a /8 as a one-keypress option is offering 16
+/// million addresses the scanner would then refuse.
+fn suggested_networks() -> Vec<Suggestion> {
+    let mut suggestions = vec![Suggestion::new("", "todas as redes locais detectadas")];
+    for (network, interface) in local_networks() {
+        suggestions.push(Suggestion::new(network.to_string(), interface));
+    }
+    suggestions
 }
 
 /// The kernel's neighbour table: address, MAC, and which interface saw it.
