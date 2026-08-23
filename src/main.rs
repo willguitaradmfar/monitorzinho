@@ -38,7 +38,52 @@ fn install_panic_hook() {
     }));
 }
 
+/// The two flags a program is expected to answer before it does anything else. There is
+/// no configuration on the command line — everything monitorzinho does is decided from
+/// inside it — but "which version is installed" is a question asked by installers,
+/// scripts and bug reports alike, and a program that can only answer it by opening a
+/// full-screen interface is a program that cannot answer it.
+fn handle_flags() -> bool {
+    let Some(flag) = std::env::args().nth(1) else {
+        return false;
+    };
+    match flag.as_str() {
+        "--version" | "-V" => println!("monitorzinho {}", env!("CARGO_PKG_VERSION")),
+        "--help" | "-h" => {
+            println!("monitorzinho {}", env!("CARGO_PKG_VERSION"));
+            println!();
+            println!("Monitor de terminal: CPU, memória, disco, rede e GPU em gráficos;");
+            println!("processos, portas, conexões, sessões SSH e interfaces em tabelas;");
+            println!("e ferramentas que rodam — túnel, scanner de portas, investigação");
+            println!("DNS, scanner de rede, inspetor de certificado, receptor de");
+            println!("requisições e seguidor de arquivo.");
+            println!();
+            println!("uso: monitorzinho [--version] [--help]");
+            println!();
+            println!("Não há opções de configuração na linha de comando: tudo é escolhido");
+            println!("de dentro, e as teclas de cada tela estão no rodapé dela. Tab troca");
+            println!("de aba, Ctrl+C duas vezes sai.");
+        }
+        other => {
+            eprintln!("monitorzinho: opção desconhecida «{other}» — tente --help");
+            std::process::exit(2);
+        }
+    }
+    true
+}
+
 fn main() -> io::Result<()> {
+    if handle_flags() {
+        return Ok(());
+    }
+    // A full-screen interface needs somewhere to draw. Without this the failure is
+    // `Os { code: 6, kind: Uncategorized }` from deep inside the terminal setup, which
+    // tells a person piping the output nothing at all about what they did wrong.
+    if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+        eprintln!("monitorzinho precisa de um terminal — a saída está redirecionada.");
+        eprintln!("Para saber a versão instalada: monitorzinho --version");
+        std::process::exit(1);
+    }
     install_panic_hook();
 
     enable_raw_mode()?;

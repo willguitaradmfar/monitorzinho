@@ -49,6 +49,9 @@ cargo build --release
 
 or just `cargo run --release` during development.
 
+`monitorzinho --version` prints the installed version and `--help` a short
+description; everything else is chosen from inside the program.
+
 ## Tabs
 
 `Tab` / `Shift+Tab` cycle between three tabs. Everything samples every 2
