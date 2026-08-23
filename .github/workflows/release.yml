@@ -39,12 +39,27 @@ jobs:
       - name: Build release binary
         run: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.17
 
+      # A second binary for machines with no glibc at all — Alpine and friends, which
+      # includes plenty of containers. The glibc build there doesn't merely misbehave,
+      # it cannot start: the loader it names isn't on the system, and the shell reports
+      # that as "not found". This one is statically linked and needs no loader.
+      #
+      # It is the *second* asset, not the only one, because static musl cannot dlopen:
+      # nvml-wrapper loads libnvidia-ml.so at runtime, so the GPU panel is missing from
+      # this build. Every machine that has glibc gets the glibc binary and keeps it.
+      - name: Build musl release binary
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo zigbuild --release --locked --target x86_64-unknown-linux-musl
+
       - name: Package
         run: |
           mkdir -p dist
           cp target/x86_64-unknown-linux-gnu/release/monitorzinho dist/monitorzinho-linux-x86_64
-          chmod +x dist/monitorzinho-linux-x86_64
+          cp target/x86_64-unknown-linux-musl/release/monitorzinho dist/monitorzinho-linux-x86_64-musl
+          chmod +x dist/monitorzinho-linux-x86_64 dist/monitorzinho-linux-x86_64-musl
           (cd dist && sha256sum monitorzinho-linux-x86_64 > monitorzinho-linux-x86_64.sha256)
+          (cd dist && sha256sum monitorzinho-linux-x86_64-musl > monitorzinho-linux-x86_64-musl.sha256)
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -52,6 +67,8 @@ jobs:
           files: |
             dist/monitorzinho-linux-x86_64
             dist/monitorzinho-linux-x86_64.sha256
+            dist/monitorzinho-linux-x86_64-musl
+            dist/monitorzinho-linux-x86_64-musl.sha256
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

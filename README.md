@@ -31,12 +31,26 @@ The interface is in Portuguese; this README is not.
 curl -fsSL https://raw.githubusercontent.com/willguitaradmfar/monitorzinho/main/install.sh | sh
 ```
 
-Downloads the latest release binary to `~/.local/bin/monitorzinho` (Linux
-x86_64 only for now). Then just run:
+Downloads the latest release binary to `~/.local/bin/monitorzinho`, or to
+`/usr/local/bin` when run as root (Linux x86_64 only for now). Then just run:
 
 ```sh
 monitorzinho
 ```
+
+Two builds are published, and the script picks by what the machine has:
+
+| Asset | For | Note |
+| --- | --- | --- |
+| `monitorzinho-linux-x86_64` | glibc (Debian, Ubuntu, Fedora, RHEL…) | baseline glibc 2.17, so it runs on anything from RHEL 7 onwards |
+| `monitorzinho-linux-x86_64-musl` | musl (Alpine, and many containers) | statically linked; no GPU panel, since NVML is `dlopen`ed and a static binary can't |
+
+The distinction matters more than it looks: a glibc binary on Alpine installs
+fine and then refuses to start, because the loader it names isn't there — and
+the shell reports that as `not found`, pointing at the program rather than at
+what is missing. The installer decides before downloading, and runs what it
+downloaded before replacing anything, so it can't report success over a binary
+that cannot execute here.
 
 ### Build from source
 
