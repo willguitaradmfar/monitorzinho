@@ -600,6 +600,19 @@ impl Recorder {
         self.chunk(conn, dir, chunk, Stage::Wire);
     }
 
+    /// Counts a chunk without keeping any of it. For traffic there is no point in
+    /// showing: what crosses a `CONNECT` tunnel is TLS this process has no key for, and
+    /// a log full of ciphertext hides the lines that mean something under thousands of
+    /// bytes that never will.
+    pub fn count_only(&self, dir: Direction, len: usize) {
+        let counter = match dir {
+            Direction::ToTarget => &self.stats.to_target,
+            Direction::FromTarget => &self.stats.from_target,
+        };
+        counter.fetch_add(len as u64, Ordering::Relaxed);
+        ACTIVITY.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Records a chunk a rule changed: what arrived, which rules fired, and what left.
     ///
     /// Three events rather than one, in that order — the monitor shows newest first, so

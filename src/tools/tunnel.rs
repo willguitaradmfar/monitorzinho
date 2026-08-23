@@ -45,6 +45,9 @@ const PROTOCOLS: &[&str] = &["TCP", "UDP"];
 /// Saved verbatim into `tools.json`, so these strings are part of the on-disk format:
 /// change the wording and a saved execution silently falls back to the first option.
 const TLS_MODES: &[&str] = &["não", "sim", "sim, sem validar certificado"];
+/// What the listening side is: a relay to one fixed place, or a proxy that takes the
+/// destination from each request.
+const MODES: &[&str] = &["destino fixo", "proxy HTTP"];
 
 pub struct TunnelTool;
 
@@ -63,6 +66,12 @@ impl Tool for TunnelTool {
 
     fn params(&self) -> Vec<ParamSpec> {
         vec![
+            ParamSpec::choice(
+                "modo",
+                "Modo",
+                MODES,
+                "«destino fixo» encaminha tudo para um host:porta. «proxy HTTP» tira o destino de cada requisição — aponte http_proxy para cá e veja todos os destinos",
+            ),
             ParamSpec::choice(
                 "proto",
                 "Protocolo",
@@ -113,6 +122,9 @@ impl Tool for TunnelTool {
             1 => "  ·  1 regra".to_string(),
             n => format!("  ·  {n} regras"),
         };
+        if is_proxy(params) {
+            return format!("proxy HTTP em {}{rules}", get("listen"));
+        }
         format!(
             "{} {} → {tls}{}{rules}",
             get("proto"),
@@ -158,9 +170,22 @@ impl Tool for TunnelTool {
         )?);
 
         let listen_addr = resolve(listen, "endereço de escuta")?;
-        // Resolved here purely to fail early on a typo'd host; the relay reconnects by
-        // name so a target behind a changing DNS record still works.
-        resolve(target, "destino")?;
+        let proxy = is_proxy(params);
+        if proxy {
+            if proto == "UDP" {
+                return Err("proxy HTTP só faz sentido em TCP".to_string());
+            }
+            if mode != TlsMode::Off {
+                return Err(
+                    "proxy HTTP não usa a opção de TLS: cada destino tem o seu, e o CONNECT passa cifrado de ponta a ponta"
+                        .to_string(),
+                );
+            }
+        } else {
+            // Resolved here purely to fail early on a typo'd host; the relay reconnects
+            // by name so a target behind a changing DNS record still works.
+            resolve(target, "destino")?;
+        }
 
         if mode != TlsMode::Off && proto == "UDP" {
             return Err("TLS só vale para TCP — para UDP, desligue a opção".to_string());
@@ -201,7 +226,11 @@ impl Tool for TunnelTool {
                     .set_nonblocking(true)
                     .map_err(|e| format!("não consegui configurar o socket: {e}"))?;
                 thread::spawn(move || {
-                    serve_tcp(listener, target, tls_client, rules, &recorder);
+                    if proxy {
+                        serve_proxy(listener, rules, &recorder);
+                    } else {
+                        serve_tcp(listener, target, tls_client, rules, &recorder);
+                    }
                     finished.store(true, Ordering::Relaxed);
                 });
             }
@@ -219,6 +248,11 @@ enum TlsMode {
     Verified,
     /// TLS with certificate checking turned off, for self-signed and internal CAs.
     Unverified,
+}
+
+/// Whether this execution is a proxy rather than a relay to a fixed target.
+fn is_proxy(params: &HashMap<&'static str, String>) -> bool {
+    params.get("modo").map(String::as_str) == Some(MODES[1])
 }
 
 fn tls_mode(params: &HashMap<&'static str, String>) -> TlsMode {
@@ -298,6 +332,235 @@ fn serve_tcp(
 
 /// Handles one accepted connection: dial the target, then copy in both directions until
 /// either side hangs up.
+/// The proxy: one listener, and the destination comes from each request.
+///
+/// A relay to a fixed target answers "what is this client saying to that server". A
+/// proxy answers a bigger question — *everything* a client is saying, to everyone —
+/// which is what you want when the client is a program you didn't write and the list of
+/// hosts it talks to is the thing you're after.
+///
+/// Two shapes arrive here. A plain request carries an absolute URL (`GET
+/// http://host/path`), and that one is readable: it is logged, rewritten if there are
+/// rules, and forwarded with the request line put back into the form an origin server
+/// expects. A `CONNECT host:port` is a tunnel request, and what flows after it is TLS
+/// that we have no certificate to impersonate — so it is relayed byte for byte and the
+/// log says which host it was for and how much crossed, which is the honest half of
+/// what can be known without becoming a CA.
+fn serve_proxy(listener: TcpListener, rules: Arc<Rules>, rec: &Recorder) {
+    rec.record(
+        0,
+        EventKind::Note(
+            "proxy HTTP no ar — aponte http_proxy/https_proxy do cliente para este endereço"
+                .to_string(),
+        ),
+    );
+    let mut next_conn: u64 = 0;
+    while !rec.stopping() {
+        match listener.accept() {
+            Ok((client, peer)) => {
+                next_conn += 1;
+                let conn = next_conn;
+                rec.stats().connections.fetch_add(1, Ordering::Relaxed);
+                rec.stats().active.fetch_add(1, Ordering::Relaxed);
+                let (rec, rules) = (rec.clone(), rules.clone());
+                thread::spawn(move || {
+                    proxy_connection(client, peer, &rules, conn, &rec);
+                    rec.stats().active.fetch_sub(1, Ordering::Relaxed);
+                });
+            }
+            Err(e) if is_timeout(&e) => {
+                poll::readable(listener.as_raw_fd(), poll::TIMEOUT_MS);
+            }
+            Err(e) => {
+                rec.record(0, EventKind::Error(format!("accept falhou: {e}")));
+                break;
+            }
+        }
+    }
+    rec.record(0, EventKind::Note("proxy encerrado".to_string()));
+}
+
+/// Reads the first request off a proxied connection and hands it to whichever of the
+/// two paths it belongs to.
+fn proxy_connection(client: TcpStream, peer: SocketAddr, rules: &Rules, conn: u64, rec: &Recorder) {
+    rec.record(
+        conn,
+        EventKind::Opened {
+            peer: peer.to_string(),
+        },
+    );
+    let _ = client.set_nodelay(true);
+    let head = match read_head(&client) {
+        Ok(head) if !head.is_empty() => head,
+        Ok(_) => {
+            rec.record(
+                conn,
+                EventKind::Closed {
+                    reason: "conectou e não pediu nada".to_string(),
+                },
+            );
+            return;
+        }
+        Err(e) => {
+            rec.record(conn, EventKind::Error(format!("erro ao ler o pedido: {e}")));
+            return;
+        }
+    };
+
+    let request_line = String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut parts = request_line.split_whitespace();
+    let (method, target) = (
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+    );
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        proxy_connect(client, target, conn, rec);
+        return;
+    }
+    proxy_plain(client, &head, &request_line, rules, conn, rec);
+}
+
+/// `CONNECT host:port` — open the pipe, say 200, and get out of the way.
+fn proxy_connect(client: TcpStream, target: &str, conn: u64, rec: &Recorder) {
+    let target = if target.contains(':') {
+        target.to_string()
+    } else {
+        format!("{target}:443")
+    };
+    rec.record(
+        conn,
+        EventKind::Note(format!(
+            "CONNECT {target} — daqui em diante é TLS de ponta a ponta, só o volume é visível"
+        )),
+    );
+    let upstream = match TcpStream::connect(&target) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let _ = (&client).write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            rec.record(
+                conn,
+                EventKind::Error(format!("não conectou em {target}: {e}")),
+            );
+            let _ = client.shutdown(Shutdown::Both);
+            return;
+        }
+    };
+    if (&client)
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .is_err()
+    {
+        return;
+    }
+    let _ = upstream.set_nodelay(true);
+    pump_both(client, upstream, &Rules::default(), conn, rec, true);
+}
+
+/// A plain proxied request: readable, so it is read.
+fn proxy_plain(
+    client: TcpStream,
+    head: &[u8],
+    request_line: &str,
+    rules: &Rules,
+    conn: u64,
+    rec: &Recorder,
+) {
+    let Some((host, port, path)) = absolute_target(request_line) else {
+        let _ = (&client).write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+        rec.record(
+            conn,
+            EventKind::Error(format!("pedido que não é de proxy: {request_line}")),
+        );
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    };
+    rec.record(
+        conn,
+        EventKind::Note(format!("{request_line}  →  {host}:{port}")),
+    );
+
+    let upstream = match TcpStream::connect((host.as_str(), port)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let _ = (&client).write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            rec.record(
+                conn,
+                EventKind::Error(format!("não conectou em {host}:{port}: {e}")),
+            );
+            let _ = client.shutdown(Shutdown::Both);
+            return;
+        }
+    };
+    let _ = upstream.set_nodelay(true);
+
+    // The request line is rewritten from the absolute form a proxy receives to the
+    // origin form a server expects — the one part of a proxied request that has to
+    // change, and the reason this can't just be a byte pump from the first byte.
+    let rest = head.split_at(request_line.len()).1;
+    let mut forwarded = format!("{} {} HTTP/1.1", first_word(request_line), path).into_bytes();
+    forwarded.extend_from_slice(rest);
+    let forwarded = match rules.apply(&forwarded) {
+        Some((rewritten, which)) => {
+            rec.record_rewrite(conn, Direction::ToTarget, &forwarded, &rewritten, &which);
+            rewritten
+        }
+        None => {
+            rec.record_data(conn, Direction::ToTarget, &forwarded);
+            forwarded
+        }
+    };
+    if (&upstream).write_all(&forwarded).is_err() {
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    }
+    pump_both(client, upstream, rules, conn, rec, false);
+}
+
+/// `GET http://host:port/path HTTP/1.1` → the three parts a connection needs.
+fn absolute_target(request_line: &str) -> Option<(String, u16, String)> {
+    let url = request_line.split_whitespace().nth(1)?;
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host.to_string(), port.parse().unwrap_or(80)),
+        None => (authority.to_string(), 80),
+    };
+    (!host.is_empty()).then_some((host, port, path.to_string()))
+}
+
+fn first_word(line: &str) -> &str {
+    line.split_whitespace().next().unwrap_or("GET")
+}
+
+/// Reads up to the end of the request head, which is where a proxy has to stop and
+/// decide. Anything after it belongs to the body and is pumped like everything else.
+fn read_head(client: &TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut head = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    let mut client = client;
+    while head.len() < 16 * 1024 {
+        match client.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
+                    break;
+                }
+            }
+            Err(ref e) if is_timeout(e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(head)
+}
+
 fn relay_tcp(
     client: TcpStream,
     peer: SocketAddr,
@@ -350,6 +613,20 @@ fn relay_tcp(
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
 
+    pump_both(client, upstream, rules, conn, rec, false);
+}
+
+/// Runs both directions of a plain relay until either side is done. Shared by the fixed
+/// relay and by both halves of the proxy, since "copy these two sockets into each other
+/// and write down what crosses" is the same job however the pair was chosen.
+fn pump_both(
+    client: TcpStream,
+    upstream: TcpStream,
+    rules: &Rules,
+    conn: u64,
+    rec: &Recorder,
+    opaque: bool,
+) {
     // Each direction needs its own handle on both sockets: one to read from, one to
     // write to, and `shutdown` on either end unblocks whichever side is still reading.
     let (Ok(client_r), Ok(upstream_r)) = (client.try_clone(), upstream.try_clone()) else {
@@ -363,7 +640,15 @@ fn relay_tcp(
     let back = {
         let rec = rec.clone();
         thread::spawn(move || {
-            pump(upstream_r, client, Direction::FromTarget, None, conn, &rec);
+            pump(
+                upstream_r,
+                client,
+                Direction::FromTarget,
+                None,
+                conn,
+                &rec,
+                opaque,
+            );
         })
     };
     // Only this direction gets the rules: they exist to fix up what the client sends.
@@ -374,6 +659,7 @@ fn relay_tcp(
         Some(rules),
         conn,
         rec,
+        opaque,
     );
     let _ = back.join();
 
@@ -395,6 +681,7 @@ fn pump(
     rules: Option<&Rules>,
     conn: u64,
     rec: &Recorder,
+    opaque: bool,
 ) {
     let _ = from.set_read_timeout(Some(POLL));
     let mut buf = vec![0u8; RELAY_BUF];
@@ -402,8 +689,18 @@ fn pump(
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let payload = rewritten(rules, &buf[..n], dir, conn, rec);
-                if let Err(e) = to.write_all(&payload) {
+                // An opaque tunnel carries somebody else's TLS: there is nothing to
+                // rewrite and nothing worth keeping, so the bytes go straight across and
+                // only the counters move. The row still shows the volume; the log stays
+                // readable instead of filling with ciphertext.
+                let written = if opaque {
+                    rec.count_only(dir, n);
+                    to.write_all(&buf[..n])
+                } else {
+                    let payload = rewritten(rules, &buf[..n], dir, conn, rec);
+                    to.write_all(&payload)
+                };
+                if let Err(e) = written {
                     rec.record(conn, EventKind::Error(format!("escrita falhou: {e}")));
                     break;
                 }
