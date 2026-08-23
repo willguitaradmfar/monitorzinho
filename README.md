@@ -416,6 +416,23 @@ Three probes a hop, a silent router shown as `* * *` without ending the trace,
 and five silent hops in a row called what it is — a wall — instead of thirty
 lines of stars.
 
+#### Sonda SMTP
+
+What a mail server says about itself before anyone tries to send anything through
+it. The certificate reader already speaks STARTTLS, so "is the certificate fine"
+is answered next door; what's left is everything else a mail server announces and
+nobody checks — which extensions it offers, whether it will take a password over
+a plaintext connection, how big a message it accepts, whether the name it greets
+you with is its own, and whether it will relay mail for a stranger, which is the
+one question whose wrong answer ends up on a blocklist.
+
+The STARTTLS upgrade is real: the connection is taken over by TLS and the
+conversation continues encrypted, with a second EHLO — because the extension list
+changes once the connection is private, and `AUTH` usually only appears there.
+
+Nothing is ever sent. The relay test stops at `RCPT TO` and resets, which is
+after the server has already decided and before anybody gets an email.
+
 #### Scanner de rede
 
 What's alive on the local network, with a MAC, a vendor and a name for each.

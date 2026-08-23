@@ -20,6 +20,7 @@ pub mod poll;
 pub mod rewrite;
 pub mod rota;
 pub mod scan;
+pub mod smtp;
 pub mod tail;
 pub mod tls;
 pub mod tunnel;
@@ -359,6 +360,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(scan::ScanTool),
         Box::new(dns::DnsTool),
         Box::new(cert::CertTool),
+        Box::new(smtp::SmtpTool),
         Box::new(net::NetTool),
         Box::new(rota::RotaTool),
     ]
