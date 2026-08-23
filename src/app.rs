@@ -239,6 +239,8 @@ pub struct DetailFocus {
     /// The table view this was opened from, put back intact on Esc: same selection,
     /// same query, same expanded nodes.
     pub parent: TableFocus,
+    /// The hand-off picker, while it's open over the detail.
+    pub handoff: Option<HandoffPicker>,
 }
 
 /// The executions started from the Ferramentas tab, and which one is selected on it.
@@ -506,18 +508,25 @@ impl RulesEditor {
 
 /// Choosing which of an execution's findings to turn into a new execution.
 pub struct HandoffPicker {
+    /// Named by whichever view opened it, since "what these offers are" differs: a
+    /// sweep's addresses and a connection's two ends are not the same kind of thing.
+    pub title: &'static str,
     pub options: Vec<Handoff>,
-    /// Index into the rendered list, which starts with the "all of them" row whenever
-    /// there's more than one finding — a network sweep turns up thirty hosts, and
-    /// creating thirty executions one keypress at a time is not a facility.
+    /// Index into the rendered list, which starts with the "all of them" row when there
+    /// are enough offers for that to save anything.
     pub selected: usize,
     pub bulk: bool,
 }
 
+/// Offers below this many aren't worth a bulk row: picking one of two is already one
+/// keypress, and the row would only push the real choices down.
+const BULK_THRESHOLD: usize = 3;
+
 impl HandoffPicker {
-    fn new(options: Vec<Handoff>) -> Self {
+    fn new(title: &'static str, options: Vec<Handoff>) -> Self {
         Self {
-            bulk: options.len() > 1,
+            title,
+            bulk: options.len() >= BULK_THRESHOLD,
             options,
             selected: 0,
         }
@@ -574,11 +583,25 @@ pub struct ToolMonitorFocus {
     pub match_index: Cell<Option<usize>>,
     /// Sequence number of the newest event at the last frame — see `Event::seq`.
     pub anchor_seq: Cell<u64>,
+    /// How many lines into the anchored event's block the viewport top sits, so a block
+    /// several lines tall is put back exactly rather than approximately.
+    pub anchor_offset: Cell<u16>,
 }
 
 impl ToolMonitorFocus {
     /// Moves to the next (`delta > 0`, further down the screen and so further back in
     /// time) or previous hit, wrapping at either end. No-op with nothing to jump to.
+    /// Puts the viewport somewhere on purpose.
+    ///
+    /// Clearing the anchor is the point: the anchor exists to hold the view still while
+    /// the *content* moves underneath it, and without dropping it here the next frame
+    /// would faithfully restore the position the key just moved away from.
+    fn move_to(&self, position: u16) {
+        self.scroll.set(position.min(self.max_scroll.get()));
+        self.anchor_seq.set(0);
+        self.anchor_offset.set(0);
+    }
+
     fn jump_match(&mut self, delta: i32) {
         let matches = self.matches.borrow();
         if matches.is_empty() {
@@ -593,9 +616,8 @@ impl ToolMonitorFocus {
             None => (len - 1) as usize,
         };
         self.match_index.set(Some(next));
-        let target = matches[next].saturating_sub(MATCH_CONTEXT);
-        self.scroll.set(target.min(self.max_scroll.get()));
         self.follow = false;
+        self.move_to(matches[next].saturating_sub(MATCH_CONTEXT));
     }
 
     /// Forgets where the search was, so the next frame re-anchors on the first hit.
@@ -683,6 +705,13 @@ impl App {
             state: SystemState::new(),
             ticks_since_save: 0,
         }
+    }
+
+    /// Whether what's on screen is fed by the tools' own threads. Decides whether their
+    /// writing something is worth a redraw between samples — anywhere else the next
+    /// tick is soon enough, because nothing on screen changed.
+    pub fn shows_tools(&self) -> bool {
+        self.tab == Tab::Tools || matches!(self.focus, Focus::ToolMonitor(_))
     }
 
     /// Switches to `tab` and immediately samples it (rather than waiting for the next
@@ -906,6 +935,7 @@ impl App {
             scroll: 0,
             max_scroll: Cell::new(0),
             parent,
+            handoff: None,
         }));
     }
 
@@ -1505,41 +1535,74 @@ impl App {
             matches: RefCell::new(Vec::new()),
             match_index: Cell::new(None),
             anchor_seq: Cell::new(0),
+            anchor_offset: Cell::new(0),
         });
     }
 
-    /// Offers what the open execution found as new executions (Ctrl+P). Silent when it
-    /// found nothing another tool could use.
+    /// Where the picker lives for whichever view is open. Two surfaces offer the
+    /// gesture — an execution's log, and a table row's detail — and everything below
+    /// works the same on both.
+    fn handoff_slot(&mut self) -> Option<&mut Option<HandoffPicker>> {
+        match &mut self.focus {
+            Focus::ToolMonitor(monitor) => Some(&mut monitor.handoff),
+            Focus::Detail(detail) => Some(&mut detail.handoff),
+            _ => None,
+        }
+    }
+
+    /// Offers what the open view found as new executions (Ctrl+P). Silent when there's
+    /// nothing another tool could be pointed at.
     pub fn open_handoffs(&mut self) {
-        let Focus::ToolMonitor(monitor) = &self.focus else {
-            return;
+        let title = match &self.focus {
+            Focus::Detail(_) => "Túnel a partir desta conexão",
+            _ => "Achados desta execução",
         };
-        let Some(execution) = self.tools.by_id(monitor.execution_id) else {
-            return;
+        let options = match &self.focus {
+            Focus::ToolMonitor(monitor) => self
+                .tools
+                .by_id(monitor.execution_id)
+                .and_then(|execution| {
+                    self.tool_for(execution)
+                        .map(|tool| tool.handoffs(execution))
+                })
+                .unwrap_or_default(),
+            // A connection detail already names both ends and the protocol, which is a
+            // tunnel's whole configuration.
+            Focus::Detail(detail) => detail
+                .detail
+                .handoffs
+                .iter()
+                .map(|offer| Handoff {
+                    label: offer.label.clone(),
+                    tool: offer.tool,
+                    params: offer.params.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
         };
-        let Some(tool) = self.tool_for(execution) else {
-            return;
-        };
-        let options = tool.handoffs(execution);
         if options.is_empty() {
             return;
         }
-        if let Focus::ToolMonitor(monitor) = &mut self.focus {
-            monitor.handoff = Some(HandoffPicker::new(options));
+        if let Some(slot) = self.handoff_slot() {
+            *slot = Some(HandoffPicker::new(title, options));
         }
     }
 
-    /// True while the picker is over the log, so keys go there instead of to the search
-    /// box underneath — which would otherwise swallow every letter.
+    /// True while the picker is open, so keys go there rather than to whatever is
+    /// underneath — a log's search box would otherwise swallow every letter.
     pub fn handoff_open(&self) -> bool {
-        matches!(&self.focus, Focus::ToolMonitor(monitor) if monitor.handoff.is_some())
+        match &self.focus {
+            Focus::ToolMonitor(monitor) => monitor.handoff.is_some(),
+            Focus::Detail(detail) => detail.handoff.is_some(),
+            _ => false,
+        }
     }
 
     pub fn handoff_key(&mut self, code: KeyCode) {
-        let Focus::ToolMonitor(monitor) = &mut self.focus else {
+        let Some(slot) = self.handoff_slot() else {
             return;
         };
-        let Some(picker) = &mut monitor.handoff else {
+        let Some(picker) = slot else {
             return;
         };
         match code {
@@ -1548,7 +1611,7 @@ impl App {
                 picker.selected = (picker.selected + 1).min(picker.rows().saturating_sub(1));
             }
             KeyCode::Enter => self.create_from_handoff(),
-            KeyCode::Esc => monitor.handoff = None,
+            KeyCode::Esc => *slot = None,
             _ => {}
         }
     }
@@ -1557,10 +1620,10 @@ impl App {
     /// with the new row selected — the thing they asked for is the thing they should be
     /// looking at.
     fn create_from_handoff(&mut self) {
-        let Focus::ToolMonitor(monitor) = &mut self.focus else {
+        let Some(slot) = self.handoff_slot() else {
             return;
         };
-        let Some(picker) = &mut monitor.handoff else {
+        let Some(picker) = slot else {
             return;
         };
         // The bulk row creates one execution per finding; any other row creates the one
@@ -1609,7 +1672,10 @@ impl App {
         }
         self.tools.selected = self.tools.executions.len().saturating_sub(1);
         self.tools.persist();
+        // Land on what was just created rather than on the view it came from — getting
+        // to the new execution is the point of the gesture.
         self.focus = Focus::None;
+        self.switch_tab(Tab::Tools);
     }
 
     /// ↑/↓ in the monitor. With a search active these step between hits instead of
@@ -1623,9 +1689,9 @@ impl App {
             }
             let limit = monitor.max_scroll.get() as i32;
             let next = (monitor.scroll.get() as i32 + delta).clamp(0, limit) as u16;
-            monitor.scroll.set(next);
-            // Newest-first, so the live edge is the top: following means being there.
-            monitor.follow = next == 0;
+            monitor.move_to(next);
+            // Oldest-first, so the live edge is the bottom: following means being there.
+            monitor.follow = next as i32 == limit;
         }
     }
 
@@ -1633,9 +1699,32 @@ impl App {
     pub fn tool_monitor_follow(&mut self) {
         if let Focus::ToolMonitor(monitor) = &mut self.focus {
             monitor.follow = true;
-            monitor.scroll.set(0);
+            monitor.move_to(monitor.max_scroll.get());
             monitor.match_index.set(None);
         }
+    }
+
+    /// Throws away what this execution has logged so far (Ctrl+L).
+    ///
+    /// Counters are left alone: they describe the execution's whole life, while the log
+    /// is a scrollback, and someone clearing it wants a clean surface to watch the next
+    /// request on — not their traffic totals reset.
+    pub fn tool_monitor_clear(&mut self) {
+        let Focus::ToolMonitor(monitor) = &mut self.focus else {
+            return;
+        };
+        let Some(execution) = self.tools.by_id(monitor.execution_id) else {
+            return;
+        };
+        let mut log = tools::lock_log(&execution.log);
+        log.clear();
+        log.note(execution.started.elapsed(), "log limpo".to_string());
+        drop(log);
+        monitor.scroll.set(0);
+        monitor.follow = true;
+        monitor.anchor_seq.set(0);
+        monitor.anchor_offset.set(0);
+        monitor.match_index.set(None);
     }
 
     pub fn tool_monitor_toggle_hex(&mut self) {

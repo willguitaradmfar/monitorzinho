@@ -97,6 +97,13 @@ reverse-DNS names and service names, the owning process, throughput, and — for
 TCP — what the kernel knows about the path itself (RTT and its variance,
 congestion window, retransmits, MSS, and so on, read straight from `tcp_info`).
 
+From there, `Ctrl+P` turns the connection into a **tunnel**. A connection
+already names both ends and the protocol, which is the tunnel tool's entire
+configuration, so it offers to relay to either end — listening on the same port
+locally, so a client's config usually needs only its host changed to
+`127.0.0.1`. Close the original connection, point the client at the tunnel, and
+the same conversation now goes through something that writes it down.
+
 ### Ferramentas — the tools
 
 Things monitorzinho runs, rather than watches. An execution keeps working while
@@ -115,9 +122,14 @@ the row stands: `pronta` for an on-demand execution nobody has asked anything
 of yet, `rodando`, `concluída` once there's a result to read, `parada` for one
 that was stopped or never started.
 
-`Enter` opens an execution's live log — every chunk in both directions, newest
-at the top, as text or hex (`Tab`), with type-to-search, `↑`/`↓` to jump
-between matches, and `Ctrl+F` to hide everything that doesn't match.
+`Enter` opens an execution's live log — every chunk in both directions, oldest
+first with new traffic appending at the bottom, as text or hex (`Tab`), with
+type-to-search, `↑`/`↓` to jump between matches, `Ctrl+F` to hide everything
+that doesn't match, and `Ctrl+L` to clear the scrollback. Scrolling with the
+arrows or `PgUp`/`PgDn` stops following the live edge and `End` resumes it; the
+corner says which of the two it currently is. Paused, the view is anchored to
+the event under its top line, so it holds still whether traffic arrives below
+it or the oldest events fall off the buffer above it.
 
 #### Túnel TCP/UDP
 
@@ -142,8 +154,11 @@ Three things it does beyond relaying:
   it leaves for the target — the reason it exists is a header that has to
   change for the far side to accept the connection at all, like
   `Host: note:8080` becoming `Host: google.com.br`. Rules run in order, over
-  the raw bytes, so they work on binary payloads too, and the log shows a note
-  naming whichever ones fired. Every rule you write is kept in a shared
+  the raw bytes, so they work on binary payloads too. When one fires, the log
+  shows **both** versions of the chunk — what arrived, which rules fired, and
+  what left — with the lines that actually changed marked, because a rule whose
+  effect you can't see is a rule you can't tell is working. A chunk no rule
+  touched is logged once, as before. Every rule you write is kept in a shared
   history, per machine and not per execution: removing the execution leaves it
   there to pick again.
 - **UDP.** Same idea, one flow per source address.
@@ -275,6 +290,8 @@ at it properly.
 | `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart (or re-run) / remove an execution |
 | `Enter` | Ferramentas | open that execution's live log — and run it, for an on-demand tool |
 | `Tab`, `Ctrl+F` | an execution's log | hex view, matches-only filter |
+| `Ctrl+L`, `End` | an execution's log | clear the scrollback, jump back to the live edge |
+| `Ctrl+P` | a connection's detail | turn the connection into a tunnel to either end |
 | `Ctrl+P` | an execution's log | turn what it found into new executions — one, or all of them |
 | `Esc` | anywhere | back one level (clears a search first) |
 | `q` | a tab | quit |

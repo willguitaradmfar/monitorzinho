@@ -402,8 +402,7 @@ fn pump(
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let payload = rewritten(rules, &buf[..n], conn, rec);
-                rec.record_data(conn, dir, &payload);
+                let payload = rewritten(rules, &buf[..n], dir, conn, rec);
                 if let Err(e) = to.write_all(&payload) {
                     rec.record(conn, EventKind::Error(format!("escrita falhou: {e}")));
                     break;
@@ -470,8 +469,7 @@ fn serve_udp(socket: UdpSocket, target: String, rules: Arc<Rules>, rec: &Recorde
         }
 
         let (conn, upstream) = &clients[&peer];
-        let payload = rewritten(Some(&rules), &buf[..n], *conn, rec);
-        rec.record_data(*conn, Direction::ToTarget, &payload);
+        let payload = rewritten(Some(&rules), &buf[..n], Direction::ToTarget, *conn, rec);
         if let Err(e) = upstream.send(&payload) {
             rec.record(*conn, EventKind::Error(format!("envio falhou: {e}")));
         }

@@ -1,5 +1,7 @@
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+use crate::tools::Handoff;
+
 pub mod connections;
 pub mod cpu;
 pub mod disk;
@@ -189,6 +191,10 @@ pub struct Detail {
     /// Current download/upload throughput in bytes/s, when the subject has one — the
     /// app feeds these into a pair of `History`s so the view can sparkline them.
     pub rates: Option<(f64, f64)>,
+    /// Executions this subject suggests creating. A connection to a database is the
+    /// exact configuration of a tunnel to that database, and retyping the address into
+    /// a form while looking straight at it is work the app can do.
+    pub handoffs: Vec<Handoff>,
 }
 
 /// One "monitorzinho" that shows a ranked snapshot list instead of a time series

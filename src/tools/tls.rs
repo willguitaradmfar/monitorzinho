@@ -311,8 +311,7 @@ pub fn relay(
                 Ok(n) => {
                     // Rewriting happens on the plaintext, before rustls encrypts it —
                     // the whole reason a rule can touch a TLS target at all.
-                    let payload = rewritten(Some(rules), &buf[..n], conn, rec);
-                    rec.record_data(conn, Direction::ToTarget, &payload);
+                    let payload = rewritten(Some(rules), &buf[..n], Direction::ToTarget, conn, rec);
                     let _ = tls.writer().write_all(&payload);
                     busy = true;
                 }

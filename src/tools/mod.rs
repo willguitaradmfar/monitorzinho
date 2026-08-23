@@ -4,7 +4,7 @@
 //! adds an execution from the Ferramentas tab, it keeps working while they go look at
 //! something else, and it stops when they remove it or the app exits.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -209,10 +209,61 @@ pub enum EventKind {
         dir: Direction,
         len: usize,
         preview: Vec<u8>,
+        stage: Stage,
     },
     /// Something the tool itself wants to say — started, stopped, limit hit.
     Note(String),
     Error(String),
+}
+
+/// Which version of a chunk an event is showing. Only matters where a rewrite rule
+/// changed something: then the log carries both, because a rule you can't see the
+/// effect of is a rule you can't tell is working.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Stage {
+    /// What crossed, with no rule involved. The ordinary case.
+    Wire,
+    /// What arrived, before the rules touched it.
+    Original,
+    /// What left, after the rules touched it, carrying the indices of the lines that
+    /// actually differ. Two near-identical blocks with one changed header between them
+    /// is precisely the thing an eye slides over, so the renderer marks the difference
+    /// rather than leaving it to be found.
+    Rewritten { changed: Vec<usize> },
+}
+
+impl Stage {
+    /// Suffix on the size line, so the two halves of a rewrite can't be confused.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Stage::Wire => "",
+            Stage::Original => "  antes do replace",
+            Stage::Rewritten { .. } => "  depois do replace",
+        }
+    }
+
+    /// Whether this line of the payload is one a rule changed.
+    pub fn changed(&self, line: usize) -> bool {
+        match self {
+            Stage::Rewritten { changed } => changed.contains(&line),
+            _ => false,
+        }
+    }
+}
+
+/// Lines of `rewritten` that don't appear in `original` — what the rules produced.
+///
+/// Compared by content rather than position: a rule that changes a header's value
+/// leaves every other line where it was, and a rule that adds or removes one shifts
+/// everything after it without changing any of it.
+fn changed_lines(original: &[u8], rewritten: &[u8]) -> Vec<usize> {
+    let before: HashSet<&[u8]> = original.split(|byte| *byte == b'\n').collect();
+    rewritten
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+        .filter(|(_, line)| !before.contains(line))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 pub struct Event {
@@ -264,10 +315,24 @@ impl EventLog {
         });
     }
 
-    /// The concrete deque iterator rather than `impl Iterator`, so the monitor can
-    /// `.rev()` it — it renders newest-first.
     pub fn iter(&self) -> std::collections::vec_deque::Iter<'_, Event> {
         self.events.iter()
+    }
+
+    /// Empties the scrollback on request. The sequence counter keeps running, so a
+    /// viewport anchored to an event it can no longer find knows it's gone rather than
+    /// finding a different event wearing the same number.
+    pub fn clear(&mut self) {
+        self.events.clear();
+        // What fell off the end is no longer a fact about this log: the buffer is empty
+        // because someone asked, not because it overflowed.
+        self.dropped = 0;
+    }
+
+    /// A note from outside the tool's own threads. Clearing the log is the app's doing,
+    /// and a screen that simply goes blank reads as broken rather than as cleared.
+    pub fn note(&mut self, at: Duration, text: String) {
+        self.push(at, 0, EventKind::Note(text));
     }
 
     pub fn dropped(&self) -> u64 {
@@ -302,9 +367,22 @@ pub struct Recorder {
     findings: Arc<Mutex<Vec<(String, String)>>>,
 }
 
+/// Bumped whenever any tool writes something. The UI blocks waiting for input between
+/// samples, and a relay thread appending to a log has no way to knock on that door —
+/// without this the screen would only catch up on the next tick, which is a visible
+/// delay on a live log.
+static ACTIVITY: AtomicU64 = AtomicU64::new(0);
+
+/// How much the tools have written. Compared against the last value drawn: different
+/// means there's something new on screen to show.
+pub fn activity() -> u64 {
+    ACTIVITY.load(Ordering::Relaxed)
+}
+
 impl Recorder {
     pub fn record(&self, conn: u64, kind: EventKind) {
         lock_log(&self.log).push(self.started.elapsed(), conn, kind);
+        ACTIVITY.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records a chunk of relayed data, keeping at most `PREVIEW_BYTES` of it and
@@ -315,12 +393,48 @@ impl Recorder {
             Direction::FromTarget => &self.stats.from_target,
         };
         counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        self.chunk(conn, dir, chunk, Stage::Wire);
+    }
+
+    /// Records a chunk a rule changed: what arrived, which rules fired, and what left.
+    ///
+    /// Three events rather than one, in that order — the monitor shows newest first, so
+    /// they read top-down as the result, the reason, and the input. Only the bytes that
+    /// actually left count towards the traffic figures; the original is there to be
+    /// compared against, not to be counted twice.
+    pub fn record_rewrite(
+        &self,
+        conn: u64,
+        dir: Direction,
+        original: &[u8],
+        rewritten: &[u8],
+        fired: &str,
+    ) {
+        self.chunk(conn, dir, original, Stage::Original);
+        self.record(conn, EventKind::Note(format!("reescrito por {fired}")));
+        let counter = match dir {
+            Direction::ToTarget => &self.stats.to_target,
+            Direction::FromTarget => &self.stats.from_target,
+        };
+        counter.fetch_add(rewritten.len() as u64, Ordering::Relaxed);
+        self.chunk(
+            conn,
+            dir,
+            rewritten,
+            Stage::Rewritten {
+                changed: changed_lines(original, rewritten),
+            },
+        );
+    }
+
+    fn chunk(&self, conn: u64, dir: Direction, bytes: &[u8], stage: Stage) {
         self.record(
             conn,
             EventKind::Data {
                 dir,
-                len: chunk.len(),
-                preview: chunk[..chunk.len().min(PREVIEW_BYTES)].to_vec(),
+                len: bytes.len(),
+                preview: bytes[..bytes.len().min(PREVIEW_BYTES)].to_vec(),
+                stage,
             },
         );
     }
@@ -338,12 +452,15 @@ impl Recorder {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *slot = (headline.into(), summary.into());
+        drop(slot);
+        ACTIVITY.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Marks one piece of on-demand work as finished. What separates "never run" from
     /// "run, and this is the answer" in the list.
     pub fn ran(&self) {
         self.runs.fetch_add(1, Ordering::Relaxed);
+        ACTIVITY.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records something structured the tool found — an address, a hostname — for

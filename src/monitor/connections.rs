@@ -11,6 +11,7 @@ use super::process::{command_of, describe_owner};
 use super::resolve::{Lookup, Resolver, Services, user_name};
 use super::{Detail, DetailSection, SystemState, TableMonitor, TableRow};
 use crate::format;
+use crate::tools::Handoff;
 
 const HEADERS: [&str; 6] = ["Proto", "Process", "Connection", "Age", "Traffic", "Rate"];
 
@@ -368,6 +369,49 @@ impl RawConn {
 
 /// `ip:port`, bracketing an IPv6 address so its own colons stay visually separate from
 /// the one before the port.
+/// The tunnels this connection describes.
+///
+/// A connection already names both ends and the protocol, which is everything the
+/// tunnel tool asks for — so the offer is to relay to one of those ends, listening on
+/// the same port locally. Point the client at localhost instead of at the far side and
+/// the same conversation goes through a process that writes it down.
+///
+/// Both ends are offered because which one is the server depends on which way the
+/// connection was opened, and reading that off the port numbers would be guessing. They
+/// are labelled as what they are, and identical ends collapse to one.
+fn tunnels(c: &RawConn, proto: &str) -> Vec<Handoff> {
+    let mut offers: Vec<Handoff> = Vec::new();
+    for (side, ip, port) in [
+        ("o outro lado", &c.remote_ip, c.remote_port),
+        ("este lado", &c.local_ip, c.local_port),
+    ] {
+        if port == 0 || ip.is_empty() {
+            continue;
+        }
+        let target = endpoint(ip, port);
+        if offers.iter().any(|offer| {
+            offer
+                .params
+                .iter()
+                .any(|(key, value)| *key == "target" && value == &target)
+        }) {
+            continue;
+        }
+        offers.push(Handoff {
+            label: format!("túnel {proto} para {target} ({side})"),
+            tool: "tunnel",
+            params: vec![
+                ("proto", proto.to_string()),
+                // The same port locally, so a client's configuration usually needs only
+                // its host changed to 127.0.0.1.
+                ("listen", format!("127.0.0.1:{port}")),
+                ("target", target),
+            ],
+        });
+    }
+    offers
+}
+
 fn endpoint(ip: &str, port: u16) -> String {
     if ip.contains(':') {
         format!("[{ip}]:{port}")
@@ -706,6 +750,7 @@ impl ConnectionsMonitor {
             // A flat zero line would be worse than no sparkline at all, and UDP never
             // reports bytes.
             rates: is_tcp.then_some((down, up)),
+            handoffs: tunnels(c, proto),
         }
     }
 

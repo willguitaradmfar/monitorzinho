@@ -20,7 +20,7 @@ use std::fs;
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 
-use super::{EventKind, Recorder};
+use super::{Direction, Recorder};
 use crate::history;
 
 /// The pattern/replacement pair as the user typed it, which is also exactly what gets
@@ -153,21 +153,25 @@ pub fn forget(rule: &Rule) {
     }
 }
 
-/// Applies the execution's rules to one chunk, borrowing `original` when nothing
-/// matched so the common case allocates nothing.
+/// Applies the execution's rules to one chunk and writes it down, borrowing `original`
+/// when nothing matched so the common case allocates nothing.
 ///
-/// What gets recorded downstream is the *result*, since the log is meant to show what
-/// the target actually received; the note is what tells you a rewrite happened at all.
+/// Recording happens here rather than in the caller because what belongs in the log
+/// depends on whether a rule fired: normally the chunk, and when one did, both versions
+/// of it with the rules that fired in between. A rule whose effect you can't see is a
+/// rule you can't tell is working.
 pub fn rewritten<'a>(
     rules: Option<&Rules>,
     original: &'a [u8],
+    dir: Direction,
     conn: u64,
     rec: &Recorder,
 ) -> RewriteResult<'a> {
     let Some((bytes, fired)) = rules.and_then(|rules| rules.apply(original)) else {
+        rec.record_data(conn, dir, original);
         return RewriteResult::Same(original);
     };
-    rec.record(conn, EventKind::Note(format!("reescrito por {fired}")));
+    rec.record_rewrite(conn, dir, original, &bytes, &fired);
     RewriteResult::Changed(bytes)
 }
 

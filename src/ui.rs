@@ -18,7 +18,7 @@ use crate::format;
 use crate::history::History;
 use crate::monitor::{Detail, Monitor, TableRow};
 use crate::tools::rewrite::{self, Rule};
-use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, State, lock_log};
+use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, Stage, State, lock_log};
 
 const TAB_BAR_HEIGHT: u16 = 2;
 const COLS: usize = 3;
@@ -732,15 +732,26 @@ fn render_detail(frame: &mut Frame, area: Rect, focus: &DetailFocus) {
     } else {
         (format!(" {} ", focus.detail.title), palette::CYAN)
     };
+    let hint = if focus.detail.handoffs.is_empty() {
+        "↑/↓ rolar · PgUp/PgDn rolar rápido · Esc voltar à lista".to_string()
+    } else {
+        "Ctrl+P criar execução · ↑/↓ rolar · PgUp/PgDn rolar rápido · Esc voltar à lista"
+            .to_string()
+    };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color))
-        .title_bottom(hint_line(
-            "↑/↓ rolar · PgUp/PgDn rolar rápido · Esc voltar à lista",
-        ));
+        .title_bottom(hint_line(&hint));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // The picker replaces the fields while it's open, for the same reason the rules
+    // screen replaces the wizard: two centred boxes read as one with a hole in it.
+    if let Some(picker) = &focus.handoff {
+        render_handoffs(frame, area, picker);
+        return;
+    }
 
     let body = match focus.detail.rates {
         Some((down, up)) => {
@@ -1341,10 +1352,12 @@ fn stamp(at: Duration) -> String {
 /// Renders a payload as text: control characters that carry structure (newline) split
 /// lines, the rest become `·` so a binary blob still shows its printable islands
 /// instead of scrambling the terminal.
-fn payload_text_lines(bytes: &[u8], width: usize) -> Vec<String> {
+/// Each rendered line paired with the payload line it came from, so a caller that knows
+/// something about line 3 can still say so after line 3 wrapped into four.
+fn payload_text_lines(bytes: &[u8], width: usize) -> Vec<(usize, String)> {
     let decoded = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
-    for raw in decoded.split('\n') {
+    for (index, raw) in decoded.split('\n').enumerate() {
         // Drop the CR of a CRLF: the line break already says what it meant, and
         // marking every header end with a `·` buries the text under punctuation. A CR
         // anywhere else is a real oddity and still shows up below.
@@ -1359,7 +1372,7 @@ fn payload_text_lines(bytes: &[u8], width: usize) -> Vec<String> {
                 }
             })
             .collect();
-        out.extend(wrap(&cleaned, width));
+        out.extend(wrap(&cleaned, width).into_iter().map(|line| (index, line)));
     }
     out
 }
@@ -1404,10 +1417,24 @@ fn log_lines(execution: &Execution, hex: bool, width: usize) -> Vec<LogLine> {
     let payload_width = width.saturating_sub(GUTTER_WIDTH + 2).max(MIN_VALUE_WIDTH);
     let mut lines = Vec::new();
 
-    // Newest event first, so the live edge is the top of the screen and new traffic
-    // pushes history downward. Each event's own block stays in its natural order —
-    // reversing *inside* one would scramble the request it represents.
-    for event in log.iter().rev() {
+    // Whatever fell off the front, said at the front — it's older than everything below.
+    if log.dropped() > 0 {
+        lines.push(LogLine {
+            seq: 0,
+            gutter: " ".repeat(GUTTER_WIDTH),
+            text: format!(
+                "… {} eventos mais antigos foram descartados do buffer",
+                log.dropped()
+            ),
+            style: Style::default().fg(palette::DIM),
+        });
+    }
+
+    // Oldest first, so the live edge is the bottom of the screen and new traffic
+    // appends below what's already there — the shape of every log anyone has read.
+    // Nothing above the viewport moves when an event arrives, which is also why the
+    // scroll needs no compensation for arrivals.
+    for event in log.iter() {
         let conn = if event.conn == 0 {
             "  · ".to_string()
         } else {
@@ -1424,7 +1451,12 @@ fn log_lines(execution: &Execution, hex: bool, width: usize) -> Vec<LogLine> {
             EventKind::Closed { reason } => (reason.clone(), Style::default().fg(palette::DIM)),
             EventKind::Note(text) => (text.clone(), Style::default().fg(palette::CYAN)),
             EventKind::Error(text) => (format!("⚠ {text}"), Style::default().fg(palette::RED)),
-            EventKind::Data { dir, len, preview } => {
+            EventKind::Data {
+                dir,
+                len,
+                preview,
+                stage,
+            } => {
                 let color = match dir {
                     Flow::ToTarget => palette::YELLOW,
                     Flow::FromTarget => palette::BLUE,
@@ -1442,23 +1474,48 @@ fn log_lines(execution: &Execution, hex: bool, width: usize) -> Vec<LogLine> {
                     seq: event.seq,
                     gutter: gutter.clone(),
                     text: format!(
-                        "{} {}{suffix}",
+                        "{} {}{suffix}{}",
                         dir.arrow(),
-                        format::human_bytes(*len as f64)
+                        format::human_bytes(*len as f64),
+                        stage.label()
                     ),
-                    style: Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    style: match stage {
+                        Stage::Rewritten { .. } => Style::default()
+                            .fg(palette::GREEN)
+                            .add_modifier(Modifier::BOLD),
+                        Stage::Original => Style::default().fg(palette::DIM),
+                        Stage::Wire => Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    },
                 });
-                let payload = if hex {
+                // The pre-rewrite copy is dimmed: it's there to be compared against and
+                // it never crossed the wire.
+                let payload_style = if *stage == Stage::Original {
+                    Style::default().fg(palette::DIM)
+                } else {
+                    Style::default().fg(color)
+                };
+                let payload: Vec<(usize, String)> = if hex {
+                    // A hexdump has no lines to correspond to, so nothing to mark.
                     payload_hex_lines(preview)
+                        .into_iter()
+                        .map(|line| (usize::MAX, line))
+                        .collect()
                 } else {
                     payload_text_lines(preview, payload_width)
                 };
-                for line in payload {
+                for (source, line) in payload {
+                    let touched = stage.changed(source);
                     lines.push(LogLine {
                         seq: event.seq,
                         gutter: blank.clone(),
-                        text: format!("  {line}"),
-                        style: Style::default().fg(color),
+                        text: format!("{} {line}", if touched { "▌" } else { " " }),
+                        style: if touched {
+                            Style::default()
+                                .fg(palette::GREEN)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            payload_style
+                        },
                     });
                 }
                 continue;
@@ -1472,18 +1529,6 @@ fn log_lines(execution: &Execution, hex: bool, width: usize) -> Vec<LogLine> {
         });
     }
 
-    // Oldest thing there is, so newest-first puts it at the very bottom.
-    if log.dropped() > 0 {
-        lines.push(LogLine {
-            seq: 0,
-            gutter: " ".repeat(GUTTER_WIDTH),
-            text: format!(
-                "… {} eventos mais antigos foram descartados do buffer",
-                log.dropped()
-            ),
-            style: Style::default().fg(palette::DIM),
-        });
-    }
     lines
 }
 
@@ -1574,7 +1619,7 @@ fn render_handoffs(frame: &mut Frame, area: Rect, picker: &HandoffPicker) {
     let height = (lines.len() as u16).saturating_add(4).min(area.height);
     let box_area = centered(area, width, height);
     let block = Block::default()
-        .title(" Achados desta execução ")
+        .title(format!(" {} ", picker.title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN))
         .title_bottom(hint_line("↑/↓ escolher · Enter criar · Esc voltar"));
@@ -1604,9 +1649,9 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
     };
 
     let hint = if monitor.query.is_empty() {
-        "digite p/ buscar · Tab hex · ↑/↓ rolar · End ir ao mais recente · Esc voltar"
+        "digite p/ buscar · Tab hex · Ctrl+L limpar · ↑/↓ e PgUp/PgDn rolar · End seguir · Esc voltar"
     } else {
-        "↑/↓ resultado anterior/próximo · Ctrl+F filtrar · Tab hex · End mais recente · Esc limpar busca"
+        "↑/↓ resultado anterior/próximo · Ctrl+F filtrar · Tab hex · Ctrl+L limpar log · End seguir · Esc limpar busca"
     };
     // The borders are drawn only once the title is known, and the title carries the
     // match count — so the inner area comes from the same block shape up front.
@@ -1658,8 +1703,27 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
     } else {
         format!("Ctrl+P usar achados · {hint}")
     };
+    // Whether the view is riding the live edge decides what every arrow key does next,
+    // so it says which it is rather than leaving it to be inferred from whether the
+    // screen happens to be moving.
+    let follow = if monitor.follow {
+        Line::styled(
+            " ▶ seguindo ",
+            Style::default()
+                .fg(palette::GREEN)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Line::styled(
+            " ⏸ pausado · End volta a seguir ",
+            Style::default()
+                .fg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
     let block = outer
         .title(title)
+        .title_top(follow.right_aligned())
         .border_style(Style::default().fg(if execution.is_running() {
             palette::CYAN
         } else {
@@ -1724,30 +1788,31 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
 /// Three things can move it, in order: following pins it to the newest event; events
 /// that arrived since the last frame are counted so a reader scrolled back into history
 /// stays on the same line instead of being slid downward by new traffic; and a search
-/// that hasn't been navigated yet jumps to its first hit.
+/// Settles where the viewport sits before it's drawn, and reports which match the
+/// arrows are parked on.
+///
+/// Following means being at the live edge, which is now the bottom. Not following means
+/// staying on whatever was being read: the viewport is anchored to an *event*, not to a
+/// line number, so it holds still whether traffic appended below it or the oldest events
+/// fell off the buffer above it. Anchoring by seq also survives a search being switched
+/// on or off, which changes the line count wholesale.
 fn settle_scroll(
     monitor: &ToolMonitorFocus,
     lines: &[LogLine],
     matches: &[u16],
     max_scroll: u16,
 ) -> Option<usize> {
-    let newest = lines.first().map(|line| line.seq).unwrap_or(0);
-    let anchor = monitor.anchor_seq.replace(newest);
-
     if monitor.follow {
-        monitor.scroll.set(0);
-    } else {
-        let arrived = lines.iter().take_while(|line| line.seq > anchor).count() as u16;
-        if arrived > 0 {
-            monitor
-                .scroll
-                .set(monitor.scroll.get().saturating_add(arrived));
-            // The same shift applies to the hit the arrows are on: new matches landing
-            // above it push its index further down the list.
-            if let Some(current) = monitor.match_index.get() {
-                let above = matches.iter().take_while(|&&line| line < arrived).count();
-                monitor.match_index.set(Some(current + above));
-            }
+        monitor.scroll.set(max_scroll);
+    } else if monitor.anchor_seq.get() > 0 {
+        // `>=` rather than `==`: an anchored event that has since been dropped lands the
+        // viewport on the oldest one that survived, which is where it was looking.
+        if let Some(index) = lines
+            .iter()
+            .position(|line| line.seq >= monitor.anchor_seq.get())
+        {
+            let restored = (index as u16).saturating_add(monitor.anchor_offset.get());
+            monitor.scroll.set(restored.min(max_scroll));
         }
     }
 
@@ -1759,7 +1824,23 @@ fn settle_scroll(
         monitor.match_index.set(Some(0));
         monitor.scroll.set(matches[0].saturating_sub(MATCH_CONTEXT));
     }
-
     monitor.scroll.set(monitor.scroll.get().min(max_scroll));
+
+    // Whatever ended up at the top is what the next frame puts back there.
+    let top = monitor.scroll.get() as usize;
+    match lines.get(top) {
+        Some(line) => {
+            let block = lines
+                .iter()
+                .position(|other| other.seq == line.seq)
+                .unwrap_or(top);
+            monitor.anchor_seq.set(line.seq);
+            monitor.anchor_offset.set((top - block) as u16);
+        }
+        None => {
+            monitor.anchor_seq.set(0);
+            monitor.anchor_offset.set(0);
+        }
+    }
     monitor.match_index.get().filter(|&i| i < matches.len())
 }
