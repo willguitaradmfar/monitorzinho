@@ -385,6 +385,13 @@ second verifies properly, and its error message is the verdict.
 SMTP, IMAP, POP3 — so a mail server's certificate reads the same way a web
 server's does.
 
+It can also **watch** rather than read: give it an interval and the execution
+stops being on-demand and checks on its own, saying nothing but a single line per
+check until there is something to say — that the certificate is inside the number
+of days you called close, or that it changed underneath, which is compared by
+SHA-256 fingerprint and answered with a full re-read. A certificate expires on a
+date, not when somebody remembers to look.
+
 #### Rota até o host
 
 Every router between here and a host, with the latency of each hop — the gap

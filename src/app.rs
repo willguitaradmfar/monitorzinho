@@ -1661,7 +1661,7 @@ impl App {
         // Nothing to recreate for an on-demand execution — it holds no threads and no
         // port. 'r' there means "do it again", against the same target.
         if let Some((tool, params)) = self.params_of(existing)
-            && tool.on_demand()
+            && tool.on_demand(&params)
         {
             tool.rerun(existing, &params);
             return;

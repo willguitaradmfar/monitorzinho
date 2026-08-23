@@ -23,12 +23,17 @@ use super::{EventKind, Execution, ParamSpec, Recorder, Tool, x509};
 /// Certificates issued for longer than this stopped being accepted by browsers in 2020.
 /// One that still has it was issued by something that isn't watching.
 const MAX_LIFETIME_DAYS: i64 = 398;
-/// Below this, renewal is no longer "someday".
+/// Below this, renewal is no longer "someday". The default of the parameter that can
+/// raise it — a certificate somebody watches is usually watched from further out.
 const RENEW_SOON_DAYS: i64 = 30;
 /// An RSA key smaller than this hasn't been acceptable for a decade.
 const WEAK_RSA_BITS: usize = 2048;
 
 const STARTTLS: &[&str] = &["não", "smtp", "imap", "pop3"];
+/// How often a watching execution re-reads the certificate. Hours, not minutes: a
+/// certificate changes when somebody renews it, which is a thing that happens a handful
+/// of times a year.
+const WATCH: &[&str] = &["não", "a cada 1h", "a cada 6h", "a cada 24h"];
 
 pub struct CertTool;
 
@@ -77,6 +82,18 @@ impl Tool for CertTool {
                 "5000",
                 "Quanto esperar pela conexão e pelo handshake antes de desistir",
             ),
+            ParamSpec::choice(
+                "repetir",
+                "Vigiar",
+                WATCH,
+                "«não» lê uma vez, quando você abrir. Com um intervalo, fica vigiando e avisa quando o certificado se aproximar do vencimento ou mudar",
+            ),
+            ParamSpec::text(
+                "alerta",
+                "Alertar abaixo de (dias)",
+                "30",
+                "Só na vigia: abaixo disso, cada checagem registra um alerta em vermelho",
+            ),
         ]
     }
 
@@ -94,24 +111,40 @@ impl Tool for CertTool {
             "" | "não" => String::new(),
             mode => format!("  ·  STARTTLS {mode}"),
         };
-        format!("{target}:{port}{starttls}")
+        let watching = match get("repetir") {
+            "" | "não" => String::new(),
+            interval => format!("  ·  vigiando {interval}"),
+        };
+        format!("{target}:{port}{starttls}{watching}")
     }
 
-    fn on_demand(&self) -> bool {
-        true
+    /// Reading a certificate once is a question; watching one is a job. The interval
+    /// is what tells them apart.
+    fn on_demand(&self, params: &HashMap<&'static str, String>) -> bool {
+        watch_interval(params).is_none()
     }
 
     fn start(&self, id: u64, params: &HashMap<&'static str, String>) -> Result<Execution, String> {
         let plan = Plan::from(params)?;
         let (execution, recorder) = Execution::new(id, self.name(), self.summarize(params));
-        recorder.record(
-            0,
-            EventKind::Note(format!(
-                "pronto para ler o certificado de {} ({}). Nada roda até você abrir",
-                plan.target, plan.address
-            )),
-        );
-        Ok(execution.on_demand())
+        let Some(interval) = plan.watch else {
+            recorder.record(
+                0,
+                EventKind::Note(format!(
+                    "pronto para ler o certificado de {} ({}). Nada roda até você abrir",
+                    plan.target, plan.address
+                )),
+            );
+            return Ok(execution.on_demand());
+        };
+        // Watching: it has work to do whether or not anyone is looking at it, which is
+        // the whole point — a certificate expires on a date, not when someone checks.
+        let finished = execution.finish_flag();
+        std::thread::spawn(move || {
+            watch(plan, interval, &recorder);
+            finished.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        Ok(execution)
     }
 
     fn open(&self, execution: &Execution, params: &HashMap<&'static str, String>) {
@@ -132,7 +165,7 @@ impl Tool for CertTool {
         let finished = execution.finish_flag();
         finished.store(false, std::sync::atomic::Ordering::Relaxed);
         std::thread::spawn(move || {
-            inspect(plan, &recorder);
+            inspect(&plan, &recorder, true);
             recorder.ran();
             finished.store(true, std::sync::atomic::Ordering::Relaxed);
         });
@@ -149,6 +182,10 @@ struct Plan {
     address: SocketAddr,
     starttls: String,
     timeout: Duration,
+    /// How often to look again, when this is a watch rather than a reading.
+    watch: Option<Duration>,
+    /// Days left below which every check says so, loudly.
+    alert_days: i64,
 }
 
 impl Plan {
@@ -184,7 +221,66 @@ impl Plan {
             address,
             starttls: get("starttls").to_string(),
             timeout: Duration::from_millis(timeout),
+            watch: watch_interval(params),
+            alert_days: get("alerta").parse().unwrap_or(RENEW_SOON_DAYS),
         })
+    }
+}
+
+/// The watch interval a set of parameters asks for, or `None` for a one-off reading.
+fn watch_interval(params: &HashMap<&'static str, String>) -> Option<Duration> {
+    match params.get("repetir").map(String::as_str).unwrap_or("não") {
+        "a cada 1h" => Some(Duration::from_secs(3600)),
+        "a cada 6h" => Some(Duration::from_secs(6 * 3600)),
+        "a cada 24h" => Some(Duration::from_secs(24 * 3600)),
+        _ => None,
+    }
+}
+
+/// Reads the certificate now and then again on the interval, saying something only when
+/// there is something to say: the first reading in full, then a line per check, and an
+/// alert whenever it is close to expiring or has changed underneath.
+fn watch(plan: Plan, interval: Duration, rec: &Recorder) {
+    note(
+        rec,
+        format!(
+            "vigiando o certificado de {} a cada {} — alerta abaixo de {} dias",
+            plan.target,
+            crate::format::human_duration(interval.as_secs()),
+            plan.alert_days
+        ),
+    );
+    let mut known: Option<String> = None;
+    loop {
+        if rec.stopping() {
+            return;
+        }
+        // The first reading is the full report; after that only what changed, because a
+        // watch that reprints forty lines an hour is a watch nobody reads.
+        let full = known.is_none();
+        if let Some(fingerprint) = inspect(&plan, rec, full) {
+            if let Some(previous) = &known
+                && *previous != fingerprint
+            {
+                rec.record(
+                    0,
+                    EventKind::Error(
+                        "o certificado mudou desde a última checagem — releitura completa"
+                            .to_string(),
+                    ),
+                );
+                inspect(&plan, rec, true);
+            }
+            known = Some(fingerprint);
+        }
+
+        let wake = Instant::now() + interval;
+        while Instant::now() < wake {
+            if rec.stopping() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250).min(wake - Instant::now()));
+        }
     }
 }
 
@@ -207,7 +303,12 @@ fn field(rec: &Recorder, label: &str, value: impl AsRef<str>) {
     note(rec, format!("  {label:<22}{value}"));
 }
 
-fn inspect(plan: Plan, rec: &Recorder) {
+/// Reads the certificate and reports it. Returns the leaf's fingerprint, which is what
+/// a watch compares against to notice a renewal.
+///
+/// `full` decides how much is said: everything, for a reading someone asked for and for
+/// the first check of a watch, or one line for the checks after that.
+fn inspect(plan: &Plan, rec: &Recorder, full: bool) -> Option<String> {
     let started = Instant::now();
     note(
         rec,
@@ -226,14 +327,36 @@ fn inspect(plan: Plan, rec: &Recorder) {
 
     // Accepting anything first: a certificate that fails verification is exactly the one
     // worth reading, and refusing to read it would answer the question with silence.
-    let chain = match fetch(&plan, false) {
+    let chain = match fetch(plan, false) {
         Ok(chain) => chain,
         Err(error) => {
             rec.record(0, EventKind::Error(format!("handshake falhou: {error}")));
             rec.report("sem certificado", error);
-            return;
+            return None;
         }
     };
+
+    if !full {
+        // A watch that reprints forty lines an hour is a watch nobody reads: one line
+        // saying what it found, and the alerts below if there are any.
+        let leaf = chain.certificates.first()?;
+        let days = leaf.days_left().unwrap_or(0);
+        let line = format!(
+            "{} · {} · vence em {days} dias",
+            leaf.subject.clone().unwrap_or_else(|| leaf.subject_dn()),
+            leaf.issuer.clone().unwrap_or_default()
+        );
+        if days <= plan.alert_days {
+            rec.record(0, EventKind::Error(format!("{line} — abaixo do limite")));
+        } else {
+            note(rec, line);
+        }
+        rec.report(
+            format!("vence em {days} dias"),
+            leaf.subject.clone().unwrap_or_else(|| leaf.subject_dn()),
+        );
+        return Some(leaf.fingerprint.clone());
+    }
 
     section(rec, "Conexão");
     field(rec, "Endereço", plan.address.to_string());
@@ -256,7 +379,7 @@ fn inspect(plan: Plan, rec: &Recorder) {
             EventKind::Error("o servidor não enviou certificado nenhum".to_string()),
         );
         rec.report("sem certificado", "servidor não enviou nenhum");
-        return;
+        return None;
     };
 
     section(rec, "Certificado do servidor");
@@ -297,7 +420,7 @@ fn inspect(plan: Plan, rec: &Recorder) {
             )
         },
     );
-    let trusted = match fetch(&plan, true) {
+    let trusted = match fetch(plan, true) {
         Ok(_) => {
             field(
                 rec,
@@ -313,7 +436,7 @@ fn inspect(plan: Plan, rec: &Recorder) {
     };
 
     section(rec, "Avaliação");
-    let problems = problems(leaf, &chain, covers, trusted);
+    let problems = problems(leaf, &chain, covers, trusted, plan.alert_days);
     if problems.is_empty() {
         note(rec, "  nada a apontar");
     }
@@ -338,6 +461,7 @@ fn inspect(plan: Plan, rec: &Recorder) {
         ),
     );
     rec.report(headline, summary);
+    Some(leaf.fingerprint.clone())
 }
 
 /// Everything about one certificate, in the order someone reads it: what it is, when it
@@ -448,14 +572,20 @@ fn validity_line(cert: &Cert) -> String {
 
 /// What's wrong with it, in the order that matters. Everything here is something that
 /// either breaks a client today or will break one on a date that can be named.
-fn problems(cert: &Cert, chain: &Chain, covers: bool, trusted: bool) -> Vec<String> {
+fn problems(
+    cert: &Cert,
+    chain: &Chain,
+    covers: bool,
+    trusted: bool,
+    alert_days: i64,
+) -> Vec<String> {
     let mut found = Vec::new();
     match cert.days_left() {
         Some(days) if days < 0 => found.push(format!(
             "VENCIDO há {} dias — todo cliente que verifica recusa a conexão",
             -days
         )),
-        Some(days) if days <= RENEW_SOON_DAYS => found.push(format!(
+        Some(days) if days <= alert_days => found.push(format!(
             "vence em {days} dias — renove antes que vire incidente"
         )),
         _ => {}

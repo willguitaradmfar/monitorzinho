@@ -160,7 +160,7 @@ pub trait Tool: Send + Sync {
     /// — not when it's created, not when it's restored on launch — and does its work
     /// when the user opens its monitor. A scan of sixty thousand ports has no business
     /// running because the app happened to start.
-    fn on_demand(&self) -> bool {
+    fn on_demand(&self, _params: &HashMap<&'static str, String>) -> bool {
         false
     }
 

@@ -126,7 +126,7 @@ impl Tool for ScanTool {
         format!("{target}  ·  {range}")
     }
 
-    fn on_demand(&self) -> bool {
+    fn on_demand(&self, _params: &HashMap<&'static str, String>) -> bool {
         true
     }
 

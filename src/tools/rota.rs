@@ -80,7 +80,7 @@ impl Tool for RotaTool {
         }
     }
 
-    fn on_demand(&self) -> bool {
+    fn on_demand(&self, _params: &HashMap<&'static str, String>) -> bool {
         true
     }
 
