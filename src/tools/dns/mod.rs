@@ -144,6 +144,8 @@ const RESOLVER_NAMES: &[(&str, &str)] = &[
 const PROPAGATION_TYPES: &[u16] = &[wire::A, wire::AAAA, wire::NS, wire::MX];
 
 const YES_NO: &[&str] = &["sim", "não"];
+/// Just the "sim" of `YES_NO`, for a field that only exists when something is on.
+const YES: &[&str] = &[YES_NO[0]];
 /// How subdomains are found. The distinction the modes exist for: one asks the zone
 /// what it contains, the other guesses names and sees what sticks.
 const SUBDOMAIN_MODES: &[&str] = &["tudo", "sem adivinhação", "lista comum", "não"];
@@ -198,7 +200,8 @@ impl Tool for DnsTool {
                 "Servidores da propagação",
                 PUBLIC_RESOLVERS,
                 "Lista fixa consultada na checagem, separada por vírgula. Aceita IP ou host, com porta opcional",
-            ),
+            )
+            .only_when("propagacao", YES),
             ParamSpec::choice(
                 "whois",
                 "Consultar WHOIS",

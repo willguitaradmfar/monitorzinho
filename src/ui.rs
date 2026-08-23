@@ -1543,7 +1543,7 @@ const WIZARD_TEXT_MARGIN: usize = 8;
 
 fn wizard_param_lines(wizard: &ToolWizard, text_width: usize) -> Vec<Line<'static>> {
     let mut lines = vec![Line::raw("")];
-    for (i, field) in wizard.fields.iter().enumerate() {
+    for (i, field) in wizard.shown() {
         let focused = i == wizard.field;
         let marker = if focused { "▶ " } else { "  " };
         let label_style = if focused {
@@ -1656,7 +1656,7 @@ fn wizard_confirm_lines(app: &App, wizard: &ToolWizard) -> Vec<Line<'static>> {
         ));
         lines.push(Line::raw(""));
     }
-    for field in &wizard.fields {
+    for (_, field) in wizard.shown() {
         // A rules field has no single value to show, so the count goes on the label's
         // line and the rules themselves follow it — this is the last screen before
         // anything starts, so it's worth reading them once.
@@ -1706,11 +1706,29 @@ fn wizard_confirm_lines(app: &App, wizard: &ToolWizard) -> Vec<Line<'static>> {
         ]));
     }
     lines.push(Line::raw(""));
+    // What Enter actually does here differs by tool, and saying "a porta passa a ser
+    // ouvida" over a latency measurement or a scan is the kind of small lie the rest of
+    // this screen exists to avoid. A tool that only works when asked starts nothing at
+    // all; one that listens says so; anything else simply begins.
     lines.push(Line::styled(
-        if wizard.editing.is_some() {
-            "   Enter aplica agora — a execução atual para e recomeça com estes parâmetros."
-        } else {
-            "   Enter inicia agora — a porta passa a ser ouvida imediatamente."
+        match (
+            wizard.editing.is_some(),
+            app.wizard_on_demand(),
+            wizard.listens(),
+        ) {
+            (true, true, _) => {
+                "   Enter aplica agora — a execução volta a esperar, com estes parâmetros."
+            }
+            (true, false, _) => {
+                "   Enter aplica agora — a execução atual para e recomeça com estes parâmetros."
+            }
+            (false, true, _) => {
+                "   Enter cria a execução — nada roda até você abri-la ou apertar r."
+            }
+            (false, false, true) => {
+                "   Enter inicia agora — a porta passa a ser ouvida imediatamente."
+            }
+            (false, false, false) => "   Enter inicia agora — começa a trabalhar imediatamente.",
         },
         Style::default().fg(palette::DIM),
     ));

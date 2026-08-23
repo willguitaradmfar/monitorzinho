@@ -80,8 +80,9 @@ impl Tool for PingTool {
                 "porta",
                 "Porta (modo TCP)",
                 "443",
-                "Só o modo TCP usa. Recusada serve igual: o RST veio do host e cronometra a volta",
-            ),
+                "Recusada serve igual: o RST veio do host e cronometra a volta",
+            )
+            .only_when("modo", USES_PORT),
             ParamSpec::text(
                 "intervalo",
                 "Intervalo (ms)",
@@ -142,6 +143,9 @@ fn format_ms(value: f64) -> String {
 }
 
 const MODES: &[&str] = &["automático", "ICMP", "TCP", "UDP"];
+/// The modes a port belongs to: the TCP one, and the automatic one, which falls back to
+/// TCP wherever the kernel won't hand out an ICMP socket.
+const USES_PORT: &[&str] = &[MODES[0], MODES[2]];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {

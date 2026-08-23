@@ -32,9 +32,16 @@ const BUF: usize = 16 * 1024;
 const IDLE: Duration = Duration::from_secs(30);
 
 const PROTOCOLS: &[&str] = &["TCP", "UDP"];
+/// An HTTP reply — and so a body to put in it — is a TCP affair. A UDP receiver either
+/// echoes the datagram or says nothing.
+const TCP_ONLY: &[&str] = &[PROTOCOLS[0]];
 const REPLIES: &[&str] = &[
     "HTTP 200", "HTTP 204", "HTTP 400", "HTTP 500", "eco", "nada",
 ];
+/// The replies that carry a body to write. 204 is deliberately not among them — "no
+/// content" is the one status that promises there is none — and neither are the two that
+/// aren't HTTP at all.
+const HAS_BODY: &[&str] = &[REPLIES[0], REPLIES[2], REPLIES[3]];
 
 pub struct ListenTool;
 
@@ -76,7 +83,9 @@ impl Tool for ListenTool {
                 "Corpo da resposta",
                 "",
                 "Vai no corpo do HTTP. Vazio manda um corpo mínimo; use para devolver o JSON que o chamador espera",
-            ),
+            )
+            .only_when("proto", TCP_ONLY)
+            .only_when("resposta", HAS_BODY),
         ]
     }
 

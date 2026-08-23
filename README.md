@@ -440,6 +440,21 @@ Three probes a hop, a silent router shown as `* * *` without ending the trace,
 and five silent hops in a row called what it is — a wall — instead of thirty
 lines of stars.
 
+#### The form asks only what applies
+
+A tool's parameters are not all relevant at once. A tunnel in proxy mode has no
+single destination — it takes one from each request — and TLS to the target is a
+TCP affair, and the name sent in a handshake means nothing when there is no
+handshake. A field that does nothing where it stands teaches something false:
+whoever fills it in believes they changed something, and whoever leaves it blank
+wonders what they forgot.
+
+So a parameter can declare what it depends on (`only_when`, chained when it takes
+more than one thing to be true), and the wizard skips the rest — drawing,
+navigating and confirming. Values of hidden fields are kept, so changing a mode
+back brings back what was typed, and `Tool::start` still validates everything,
+since a hand-edited `tools.json` never passes through a form.
+
 #### Repetir requisição
 
 The tunnel shows a request going past; the question that follows is always what

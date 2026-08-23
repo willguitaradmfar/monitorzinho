@@ -496,6 +496,72 @@ pub struct ToolWizard {
     pub editing: Option<u64>,
 }
 
+impl ToolWizard {
+    /// Whether a field means anything given what the other fields currently say.
+    /// A field nobody gated always applies, which is nearly all of them.
+    pub fn applies(&self, index: usize) -> bool {
+        let Some(field) = self.fields.get(index) else {
+            return false;
+        };
+        field.spec.only_when.iter().all(|(key, values)| {
+            self.fields
+                .iter()
+                .any(|other| other.spec.key == *key && values.contains(&other.value.as_str()))
+        })
+    }
+
+    /// The fields to show, in order, with their real indices — the index is what focus
+    /// and the rules editor are held by, so it has to survive the filtering.
+    pub fn shown(&self) -> impl Iterator<Item = (usize, &ParamField)> {
+        (0..self.fields.len())
+            .filter(|index| self.applies(*index))
+            .map(|index| (index, &self.fields[index]))
+    }
+
+    /// The next field in `step`'s direction that applies, or `None` at the end.
+    fn step_field(&self, from: usize, step: i32) -> Option<usize> {
+        let mut index = from as i32;
+        loop {
+            index += step;
+            if index < 0 || index >= self.fields.len() as i32 {
+                return None;
+            }
+            if self.applies(index as usize) {
+                return Some(index as usize);
+            }
+        }
+    }
+
+    /// Where focus goes when the form opens, or after a change hides the field it was
+    /// on: the first one that applies.
+    fn first_field(&self) -> usize {
+        (0..self.fields.len())
+            .find(|index| self.applies(*index))
+            .unwrap_or(0)
+    }
+
+    /// Whether this form is for a tool that takes a port. Read off the parameters
+    /// themselves: a tool that asks where to listen is a tool that listens.
+    pub fn listens(&self) -> bool {
+        self.fields.iter().any(|field| field.spec.key == "listen")
+    }
+
+    /// The parameters as they stand, in the shape `Tool` methods take them.
+    pub fn values(&self) -> HashMap<&'static str, String> {
+        self.fields
+            .iter()
+            .map(|field| (field.spec.key, field.value.clone()))
+            .collect()
+    }
+
+    /// Puts focus somewhere real after a value change hid the field it was on.
+    fn settle_field(&mut self) {
+        if !self.applies(self.field) {
+            self.field = self.first_field();
+        }
+    }
+}
+
 /// Editing one execution's list of rewrite rules.
 ///
 /// It lives inside the wizard rather than beside it: the list belongs to the parameter
@@ -1653,10 +1719,14 @@ impl App {
                 }
             }
             WizardStep::Params => {
-                if !wizard.fields.is_empty() {
-                    let next =
-                        (wizard.field as i32 + delta).clamp(0, wizard.fields.len() as i32 - 1);
-                    wizard.field = next as usize;
+                // One applicable field per step: a field that doesn't apply isn't shown,
+                // so stopping on it would be focus landing on nothing.
+                let step = delta.signum();
+                for _ in 0..delta.abs() {
+                    match wizard.step_field(wizard.field, step) {
+                        Some(next) => wizard.field = next,
+                        None => break,
+                    }
                 }
             }
             WizardStep::Confirm => {}
@@ -1673,6 +1743,9 @@ impl App {
         {
             field.cycle(delta);
             wizard.error = None;
+            // Changing a choice can take other fields away — a tunnel that becomes a
+            // proxy no longer has a destination — so focus is re-settled.
+            wizard.settle_field();
         }
     }
 
@@ -1824,8 +1897,8 @@ impl App {
         // Step off the rules field on the way out. Leaving the cursor on it would mean
         // the next Enter reopens the list the user just closed, with no way forward
         // that doesn't look like the form is stuck.
-        if editor.field + 1 < wizard.fields.len() {
-            wizard.field = editor.field + 1;
+        if let Some(next) = wizard.step_field(editor.field, 1) {
+            wizard.field = next;
         }
         wizard.error = None;
     }
@@ -1851,7 +1924,7 @@ impl App {
                         spec,
                     })
                     .collect();
-                wizard.field = 0;
+                wizard.field = wizard.first_field();
                 wizard.error = None;
                 wizard.step = WizardStep::Params;
             }
@@ -2199,6 +2272,18 @@ impl App {
         if let Some(slot) = self.handoff_slot() {
             *slot = Some(HandoffPicker::new(title, options));
         }
+    }
+
+    /// Whether confirming the open wizard would start work now or only create something
+    /// that waits to be asked. `false` when no wizard is open.
+    pub fn wizard_on_demand(&self) -> bool {
+        let Focus::Wizard(wizard) = &self.focus else {
+            return false;
+        };
+        let Some(tool) = self.tools_available.get(wizard.tool) else {
+            return false;
+        };
+        tool.on_demand(&wizard.values())
     }
 
     /// True while a destructive action is waiting to be confirmed. Checked before every

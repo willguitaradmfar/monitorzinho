@@ -46,9 +46,17 @@ const PROTOCOLS: &[&str] = &["TCP", "UDP"];
 /// Saved verbatim into `tools.json`, so these strings are part of the on-disk format:
 /// change the wording and a saved execution silently falls back to the first option.
 const TLS_MODES: &[&str] = &["não", "sim", "sim, sem validar certificado"];
+/// The `tls` values that mean a handshake actually happens — and so that the name in it
+/// is worth asking about.
+const TLS_ON: &[&str] = &[TLS_MODES[1], TLS_MODES[2]];
 /// What the listening side is: a relay to one fixed place, or a proxy that takes the
 /// destination from each request.
 const MODES: &[&str] = &["destino fixo", "proxy HTTP"];
+/// The mode that has one destination to be filled in. A proxy takes the destination from
+/// each request, so the fields that describe "the destination" don't exist there.
+const FIXED: &[&str] = &[MODES[0]];
+/// TLS to the target is a TCP-only affair.
+const TCP: &[&str] = &["TCP"];
 
 pub struct TunnelTool;
 
@@ -90,23 +98,29 @@ impl Tool for TunnelTool {
                 "Encaminhar para",
                 "127.0.0.1:5432",
                 "Destino real, host:porta. Nomes são resolvidos agora, na criação",
-            ),
+            )
+            .only_when("modo", FIXED),
             ParamSpec::choice(
                 "tls",
                 "TLS no destino",
                 TLS_MODES,
-                "Só para TCP: o cliente continua em texto puro e o túnel fala TLS com o destino, então o log mostra o conteúdo decifrado",
-            ),
-            ParamSpec::rules(
-                "rewrite",
-                "Regex/replace",
-                "Regras aplicadas ao que o cliente manda, antes de sair para o destino. Enter abre a lista",
-            ),
+                "O cliente continua em texto puro e o túnel fala TLS com o destino, então o log mostra o conteúdo decifrado",
+            )
+            .only_when("modo", FIXED)
+            .only_when("proto", TCP),
             ParamSpec::text(
                 "sni",
                 "Nome no certificado",
                 "",
-                "Só com TLS: nome enviado no SNI e conferido no certificado. Vazio usa o host do destino — preencha quando o destino for um IP",
+                "Nome enviado no SNI e conferido no certificado. Vazio usa o host do destino — preencha quando o destino for um IP",
+            )
+            .only_when("modo", FIXED)
+            .only_when("proto", TCP)
+            .only_when("tls", TLS_ON),
+            ParamSpec::rules(
+                "rewrite",
+                "Regex/replace",
+                "Regras aplicadas ao que o cliente manda, antes de sair para o destino. Enter abre a lista",
             ),
         ]
     }

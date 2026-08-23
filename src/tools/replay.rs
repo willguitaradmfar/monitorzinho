@@ -26,6 +26,8 @@ use super::{Direction, EventKind, Execution, ParamSpec, Recorder, Tool, payload,
 
 /// TLS wording, identical to the tunnel's: the same question deserves the same words.
 const TLS_MODES: &[&str] = &["não", "sim", "sim, sem validar certificado"];
+/// The values that mean a handshake happens, and so that the name in it matters.
+const TLS_ON: &[&str] = &[TLS_MODES[1], TLS_MODES[2]];
 
 /// How much of a reply is read before it's called enough. A reply bigger than this is
 /// still a successful repeat — the point is the status and the headers, not archiving
@@ -70,8 +72,9 @@ impl Tool for ReplayTool {
                 "sni",
                 "Nome no TLS (SNI)",
                 "",
-                "Só quando o destino é IP mas o certificado tem nome. Vazio usa o host do destino",
-            ),
+                "Para quando o destino é IP mas o certificado tem nome. Vazio usa o host do destino",
+            )
+            .only_when("tls", TLS_ON),
             ParamSpec::text(
                 "payload",
                 "Requisição",

@@ -83,6 +83,15 @@ pub struct ParamSpec {
     /// is a shortcut past looking something up elsewhere, not a fixed set of answers.
     /// Empty for every field that has nothing to suggest.
     pub suggestions: Vec<Suggestion>,
+    /// What has to be true elsewhere in the form for this field to mean anything: other
+    /// parameters' keys, and the values of each that make this one apply. All of them
+    /// must hold. Empty — the usual case — is a field that always applies.
+    ///
+    /// A tunnel in proxy mode has no single destination: it takes one from each request.
+    /// Asking for a destination there teaches something false — whoever fills it in
+    /// believes they changed where the traffic goes, and whoever leaves it blank wonders
+    /// what they forgot. So the field isn't shown at all.
+    pub only_when: Vec<(&'static str, &'static [&'static str])>,
 }
 
 impl ParamSpec {
@@ -99,6 +108,7 @@ impl ParamSpec {
             default,
             kind: ParamKind::Text,
             suggestions: Vec::new(),
+            only_when: Vec::new(),
         }
     }
 
@@ -117,6 +127,7 @@ impl ParamSpec {
             default: "",
             kind: ParamKind::Rules,
             suggestions: Vec::new(),
+            only_when: Vec::new(),
         }
     }
 
@@ -133,7 +144,15 @@ impl ParamSpec {
             default: options[0],
             kind: ParamKind::Choice(options),
             suggestions: Vec::new(),
+            only_when: Vec::new(),
         }
+    }
+
+    /// Shows this field only while the parameter `key` holds one of `values`. Chain it
+    /// again for a field that needs more than one thing to be true. See `only_when`.
+    pub fn only_when(mut self, key: &'static str, values: &'static [&'static str]) -> Self {
+        self.only_when.push((key, values));
+        self
     }
 }
 
