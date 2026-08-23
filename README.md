@@ -201,6 +201,29 @@ Three things it does beyond relaying:
   there to pick again.
 - **UDP.** Same idea, one flow per source address.
 
+#### Receptor de requisições
+
+A port that receives and writes down, and forwards nothing. The tunnel needs
+somewhere to send what it catches; this is for when there is nowhere — a webhook
+a provider was asked to call, an OAuth redirect, a device that POSTs every
+minute, a script somebody swears is sending the right thing.
+
+`nc -l` accepts the connection too, and then the bytes scroll past. What this
+adds is the same log every other execution here writes — searchable, hex-viewable,
+still there an hour later — plus an answer worth sending: a status and a body, so
+the caller sees a 200 and stops retrying, or sees the 500 you asked for and shows
+you what it does about errors. A JSON body is served as `application/json`,
+because a caller expecting one and getting `text/plain` is an afternoon.
+
+An HTTP request is answered the moment it is complete — at the blank line, or
+once `Content-Length` bytes have arrived — so nothing waits on a timeout. What
+isn't HTTP is answered as soon as the sender goes quiet.
+
+Over UDP only `eco` and `nada` mean anything: there is no request to reply to,
+but sending the datagram back proves the round trip, which is what someone
+testing a NAT or a firewall is after. The row says which of the two it is instead
+of promising a status it cannot send.
+
 #### Scanner de portas
 
 A TCP connect scan of a host, and as much as can be said about each open port.

@@ -68,7 +68,7 @@ impl Tool for ListenTool {
                 "resposta",
                 "Responder com",
                 REPLIES,
-                "O que devolver a quem chamou. «eco» devolve os próprios bytes recebidos; «nada» fecha sem responder",
+                "O que devolver a quem chamou. «eco» devolve os próprios bytes; «nada» fecha calado. Em UDP só «eco» e «nada» valem — não há requisição HTTP a responder",
             ),
             ParamSpec::text(
                 "corpo",
@@ -81,12 +81,18 @@ impl Tool for ListenTool {
 
     fn summarize(&self, params: &HashMap<&'static str, String>) -> String {
         let get = |key| params.get(key).map(String::as_str).unwrap_or("");
-        format!(
-            "{} {} → responde {}",
-            get("proto"),
-            get("listen"),
-            get("resposta")
-        )
+        let proto = get("proto");
+        // What the row promises has to be what the execution does: an HTTP status is
+        // not something a UDP receiver can send, and saying so on the row would be a
+        // small lie repeated every time the list is drawn.
+        let reply = match (proto, Reply::from(get("resposta"), "")) {
+            (_, Reply::Silent) => "não responde".to_string(),
+            ("UDP", Reply::Echo) => "ecoa cada datagrama".to_string(),
+            ("UDP", _) => "não responde (UDP)".to_string(),
+            (_, Reply::Echo) => "ecoa o que chegar".to_string(),
+            (_, Reply::Http { status, .. }) => format!("responde {status}"),
+        };
+        format!("{proto} {} → {reply}", get("listen"))
     }
 
     fn columns(&self, execution: &Execution) -> (String, String) {
@@ -131,7 +137,7 @@ impl Tool for ListenTool {
                     .set_read_timeout(Some(POLL))
                     .map_err(|e| format!("não consegui configurar o socket: {e}"))?;
                 thread::spawn(move || {
-                    receive_udp(socket, address, &recorder);
+                    receive_udp(socket, address, reply, &recorder);
                     finished.store(true, Ordering::Relaxed);
                 });
             }
@@ -368,11 +374,22 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// UDP has nobody to answer and no connection to close: every datagram is its own event,
 /// logged with where it came from.
-fn receive_udp(socket: UdpSocket, address: SocketAddr, rec: &Recorder) {
+fn receive_udp(socket: UdpSocket, address: SocketAddr, reply: Reply, rec: &Recorder) {
+    // Echo is the one answer that means anything over UDP: there is no request to
+    // reply to, but sending the bytes back proves the round trip in both directions,
+    // which is exactly what someone testing a NAT or a firewall is after. An HTTP
+    // status would be a reply to a request that was never made, so it is treated as
+    // silence — and the row says so rather than claiming otherwise.
+    let echo = matches!(reply, Reply::Echo);
     rec.record(
         0,
         EventKind::Note(format!(
-            "recebendo datagramas em {address} — UDP não responde nada"
+            "recebendo datagramas em {address} — {}",
+            if echo {
+                "cada um volta ecoado para quem mandou"
+            } else {
+                "sem resposta"
+            }
         )),
     );
     let mut senders: HashMap<String, u64> = HashMap::new();
@@ -402,6 +419,15 @@ fn receive_udp(socket: UdpSocket, address: SocketAddr, rec: &Recorder) {
                     );
                 }
                 rec.record_data(conn, Direction::ToTarget, &buffer[..read]);
+                if echo {
+                    match socket.send_to(&buffer[..read], peer) {
+                        Ok(sent) => rec.record_data(conn, Direction::FromTarget, &buffer[..sent]),
+                        Err(e) => rec.record(
+                            conn,
+                            EventKind::Error(format!("não consegui ecoar para {peer}: {e}")),
+                        ),
+                    }
+                }
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
             Err(e) => {
