@@ -1133,7 +1133,18 @@ impl App {
     /// — there are five of those, and the failure mode of missing one is a chart that
     /// keeps drawing for something that stopped existing.
     fn sync_tool_charts(&mut self) {
-        let live: Vec<u64> = self.tools.executions.iter().map(|e| e.id).collect();
+        // Switched off counts as gone here, not just removed: its threads have stopped,
+        // so the series has nothing new to publish, and a panel reading it would keep
+        // drawing a flat line at the last thing it measured — a picture of a measurement
+        // that isn't happening. The line comes back with the execution, from the same
+        // key, so switching it on again continues it rather than starting blank.
+        let live: Vec<u64> = self
+            .tools
+            .executions
+            .iter()
+            .filter(|execution| !execution.is_off())
+            .map(|execution| execution.id)
+            .collect();
         let mut removed = Vec::new();
         self.charts.retain(|panel| {
             let keep = panel.execution.is_none_or(|id| live.contains(&id));
@@ -1149,7 +1160,9 @@ impl App {
 
         for index in 0..self.tools.executions.len() {
             let id = self.tools.executions[index].id;
-            if self.charts.iter().any(|p| p.execution == Some(id)) {
+            if self.tools.executions[index].is_off()
+                || self.charts.iter().any(|p| p.execution == Some(id))
+            {
                 continue;
             }
             let Some(monitor) = self.tools.executions[index].chart_monitor() else {

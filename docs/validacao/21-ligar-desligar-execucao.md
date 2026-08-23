@@ -88,7 +88,19 @@ era.
 **desligada**, com os parâmetros novos. Foi desligada de propósito, e a tecla que
 reverte isso é o espaço — não uma confirmação de formulário.
 
-### 7. Ligar recomeça
+### 7. O gráfico sai junto
+
+Uma **Latência contínua** ganha um painel próprio na aba **Visão geral**. Desligue
+a execução com espaço e volte para lá: **o painel sumiu**.
+
+Tinha que sumir. Desligada, a medição parou — mas a série guarda o último valor,
+então um painel lendo dela continuaria desenhando uma linha reta no último número
+medido: o retrato de uma medição que não está acontecendo.
+
+Ligue de novo: o painel volta **com o histórico**, porque a linha é guardada pelo
+alvo (`ping:1.1.1.1`) e não pelo número da execução.
+
+### 8. Ligar recomeça
 
 Espaço numa desligada cria a execução de novo, a partir da mesma configuração:
 porta ouvida outra vez, contadores zerados, log novo. É o mesmo que o `r` faz —

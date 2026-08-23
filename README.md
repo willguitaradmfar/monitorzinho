@@ -211,6 +211,12 @@ refuses to work — `Enter` on a switched-off scan opens the log to read rather 
 starting a scan, and `r` does nothing until it is switched back on. Editing one
 doesn't switch it on either; only `Espaço` does.
 
+Switching one off takes its chart with it, where it had one: the measurement has
+stopped, and a panel still reading that series would draw a flat line at the last
+value — a picture of something that isn't happening. It comes back with the
+execution, continuing the same line, since the history is kept under what is being
+measured rather than under the execution.
+
 A row whose **last** logged event was an error is drawn in red, and goes back to
 normal by itself when something works again — the list is where several
 executions are watched at once, so a failure that only exists inside one of them
