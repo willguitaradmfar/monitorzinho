@@ -8,6 +8,7 @@ pub mod disk;
 pub mod gpu;
 pub mod iface;
 pub mod memory;
+pub mod netns;
 pub mod network;
 pub mod ports;
 pub mod process;
@@ -267,6 +268,17 @@ pub trait TableMonitor: Send {
     /// about its rows doesn't advertise an Enter that would do nothing.
     fn has_detail(&self) -> bool {
         false
+    }
+
+    /// Something the table needs to say about *itself* rather than about a row —
+    /// shown in the corner of the panel, in both the compact and the fullscreen view.
+    ///
+    /// It exists for one honest purpose: a table that can only see part of what it is
+    /// about has to say so. A connections panel that cannot open the root-owned
+    /// containers on the machine is not wrong, but it is incomplete, and a reader who
+    /// isn't told that will read it as the whole picture.
+    fn note(&self) -> Option<String> {
+        None
     }
 
     /// What `Del` would do to `row`, for the confirmation it has to get through and for

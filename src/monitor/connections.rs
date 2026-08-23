@@ -7,7 +7,8 @@ use std::time::Instant;
 use sysinfo::Pid;
 
 use super::iface;
-use super::ports::inode_to_pid;
+use super::netns;
+use super::ports::{self, inode_to_pid};
 use super::process::{command_of, describe_owner, kill_danger};
 use super::resolve::{Lookup, Resolver, Services, user_name};
 use super::{Danger, Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow};
@@ -351,6 +352,10 @@ struct RawConn {
     uid: u32,
     inode: u32,
     info: TcpInfo,
+    /// Which network namespace this socket lives in, when it isn't ours: the container
+    /// it belongs to. `None` means the host's own namespace, which is where everything
+    /// the netlink dump returns comes from.
+    namespace: Option<String>,
 }
 
 impl RawConn {
@@ -526,11 +531,61 @@ fn parse_dump(data: &[u8], protocol: u8, out: &mut Vec<RawConn>) -> bool {
                 uid,
                 inode,
                 info,
+                // The dump answers for the namespace it was asked from, and this one is
+                // asked from ours.
+                namespace: None,
             });
         }
         pos += align4(nlmsg_len);
     }
     false
+}
+
+/// Connections inside every other network namespace on this machine — the containers.
+///
+/// The netlink dump only ever answers for our own namespace, which is why this exists
+/// and why it reads `/proc/<pid>/net/*` instead: that file is the socket table of that
+/// pid's namespace, and needs nothing but permission to read the process. What it does
+/// not carry is `tcp_info`, so these connections have endpoints, state and queues but no
+/// byte counters — and the row says so rather than showing a zero.
+fn namespace_connections() -> (Vec<RawConn>, usize) {
+    let (namespaces, unreadable) = netns::namespaces();
+    let mut found = Vec::new();
+    for namespace in namespaces {
+        for (proto, family, path) in netns::socket_tables(namespace.pid) {
+            for row in ports::parse_table(proto, family, &path) {
+                let tcp = proto == "TCP";
+                let open = if tcp {
+                    TCP_OPEN_STATES & (1 << row.state as u32) != 0
+                } else {
+                    row.state as u32 == TCP_ESTABLISHED
+                };
+                // Same rule as the host's dump: what's listening belongs to the Ports
+                // panel, and the post-close states are noise nobody owns.
+                if !open {
+                    continue;
+                }
+                found.push(RawConn {
+                    protocol: if tcp { IPPROTO_TCP } else { IPPROTO_UDP },
+                    family: if family == "IPv4" { AF_INET } else { AF_INET6 },
+                    state: row.state,
+                    timer: 0,
+                    expires_ms: 0,
+                    local_ip: row.local_ip.clone(),
+                    local_port: row.local_port,
+                    remote_ip: row.remote_ip.clone(),
+                    remote_port: row.remote_port,
+                    rqueue: row.rx_queue as u32,
+                    wqueue: row.tx_queue as u32,
+                    uid: row.uid,
+                    inode: row.inode as u32,
+                    info: TcpInfo::default(),
+                    namespace: Some(namespace.label.clone()),
+                });
+            }
+        }
+    }
+    (found, unreadable)
 }
 
 /// Every `protocol` connection (IPv4 and IPv6) whose state is in `states`. Empty on any
@@ -558,8 +613,11 @@ fn query(protocol: u8, states: u32) -> Vec<RawConn> {
 /// Identifies one connection across successive dumps (its 4-tuple doesn't change for
 /// its lifetime), so tick-to-tick byte deltas — and a fullscreened row — can be matched
 /// back up to the right entry.
-fn conn_key(protocol: u8, local: &str, remote: &str) -> String {
-    format!("{protocol}|{local}|{remote}")
+/// Identity of one socket across ticks. The namespace is part of it: two containers
+/// running the same image talk from the same addresses, and without it they would be
+/// one row that flickers between two connections.
+fn conn_key(protocol: u8, local: &str, remote: &str, namespace: Option<&str>) -> String {
+    format!("{protocol}|{local}|{remote}|{}", namespace.unwrap_or(""))
 }
 
 fn format_rate(down_per_sec: f64, up_per_sec: f64) -> String {
@@ -575,6 +633,10 @@ fn format_rate(down_per_sec: f64, up_per_sec: f64) -> String {
 /// unconnected sockets, which the Ports panel already covers. UDP carries no byte
 /// counter in the kernel, so its connections always report zero traffic/rate.
 pub struct ConnectionsMonitor {
+    /// Namespaces that exist and could not be read — root-owned containers seen from a
+    /// normal user. Counted rather than ignored: an incomplete answer that says how
+    /// incomplete it is remains an answer.
+    unreadable_namespaces: usize,
     /// Last-seen (bytes_acked, bytes_received, when) per connection, keyed by
     /// `conn_key` — diffed against the next sample to turn cumulative counters into a
     /// throughput. Rebuilt every sample so a closed connection's entry just drops out
@@ -591,6 +653,7 @@ pub struct ConnectionsMonitor {
 impl ConnectionsMonitor {
     pub fn new() -> Self {
         Self {
+            unreadable_namespaces: 0,
             history: HashMap::new(),
             resolver: Resolver::new(),
             services: Services::load(),
@@ -604,12 +667,18 @@ impl ConnectionsMonitor {
     fn refresh_snapshot(&mut self) -> HashMap<String, (RawConn, f64, f64)> {
         let mut raw = query(IPPROTO_TCP, TCP_OPEN_STATES);
         raw.extend(query(IPPROTO_UDP, 1u32 << TCP_ESTABLISHED));
+        // Containers. Without these the panel is confidently wrong on any machine
+        // running them: it answers "who is talking to whom" with the host's own
+        // sockets and calls that the whole picture.
+        let (containers, unreadable) = namespace_connections();
+        raw.extend(containers);
+        self.unreadable_namespaces = unreadable;
 
         let now = Instant::now();
         let mut next_history = HashMap::with_capacity(raw.len());
         let mut snapshot = HashMap::with_capacity(raw.len());
         for c in raw {
-            let key = conn_key(c.protocol, &c.local(), &c.remote());
+            let key = conn_key(c.protocol, &c.local(), &c.remote(), c.namespace.as_deref());
             let (down, up) = match self.history.get(&key) {
                 Some(&(prev_acked, prev_received, prev_time)) => {
                     let dt = now.duration_since(prev_time).as_secs_f64().max(0.001);
@@ -662,6 +731,12 @@ impl ConnectionsMonitor {
                 if c.family == AF_INET { "IPv4" } else { "IPv6" }
             ),
         );
+        if let Some(label) = &c.namespace {
+            conn.push(
+                "Container",
+                format!("{label} — namespace de rede próprio, lido por /proc"),
+            );
+        }
         conn.push("Local", self.with_service(c, c.local_port, c.local()));
         // Which card the connection is actually on. On a machine with a VPN and a
         // handful of bridges, the local address alone doesn't say.
@@ -709,7 +784,14 @@ impl ConnectionsMonitor {
         }
 
         let mut traffic = DetailSection::new("Tráfego");
-        if is_tcp {
+        if c.namespace.is_some() {
+            // `/proc/<pid>/net/tcp` carries the queues and nothing else; saying so beats
+            // a section full of zeros that reads like a very quiet connection.
+            traffic.push(
+                "Contadores",
+                "indisponíveis para conexão de container — /proc não traz tcp_info, só as filas abaixo",
+            );
+        } else if is_tcp {
             traffic.push("Taxa atual", format_rate(down, up));
             traffic.push(
                 "Recebido",
@@ -759,7 +841,7 @@ impl ConnectionsMonitor {
         }
 
         let mut sections = vec![conn, owner, traffic];
-        if is_tcp {
+        if is_tcp && c.namespace.is_none() {
             sections.push(path_section(&c.info));
         }
 
@@ -769,7 +851,7 @@ impl ConnectionsMonitor {
             sections,
             // A flat zero line would be worse than no sparkline at all, and UDP never
             // reports bytes.
-            rates: is_tcp.then_some(Rates {
+            rates: (is_tcp && c.namespace.is_none()).then_some(Rates {
                 labels: ("↓ Recebendo", "↑ Enviando"),
                 values: (down, up),
             }),
@@ -836,18 +918,33 @@ fn build_row(
     } else {
         "UDP"
     };
+    // Which container it is, in front of what is running there. The panel's whole
+    // failure mode was not saying this, so it goes where the eye lands first.
+    let process = match &c.namespace {
+        Some(label) => format!("[{label}] {process}"),
+        None => process,
+    };
+    // `/proc` has no `tcp_info`, so a namespace connection has no byte counters to
+    // show. A dash says "not measured here"; a zero would say "nothing moved".
+    let (traffic, rate) = match c.namespace {
+        Some(_) => ("-".to_string(), "-".to_string()),
+        None => (
+            format::human_bytes(c.total_bytes() as f64),
+            format_rate(down, up),
+        ),
+    };
     let mut row = TableRow::leaf(
         vec![
             proto.to_string(),
             process,
             format!("{} → {}", c.local(), c.remote()),
             age,
-            format::human_bytes(c.total_bytes() as f64),
-            format_rate(down, up),
+            traffic,
+            rate,
         ],
         pid,
     );
-    row.key = conn_key(c.protocol, &c.local(), &c.remote());
+    row.key = conn_key(c.protocol, &c.local(), &c.remote(), c.namespace.as_deref());
     row
 }
 
@@ -944,6 +1041,16 @@ impl TableMonitor for ConnectionsMonitor {
             .collect()
     }
 
+    fn note(&self) -> Option<String> {
+        match self.unreadable_namespaces {
+            0 => None,
+            1 => Some("1 container não legível — rode como root para incluí-lo".to_string()),
+            n => Some(format!(
+                "{n} containers não legíveis — rode como root para incluí-los"
+            )),
+        }
+    }
+
     fn refresh_values(&mut self, state: &SystemState, rows: &mut [TableRow]) {
         let snapshot = self.refresh_snapshot();
         let owners = inode_to_pid();
@@ -956,16 +1063,23 @@ impl TableMonitor for ConnectionsMonitor {
             row.pid = owners.get(&(c.inode as u64)).copied().unwrap_or(0);
             let (process, age) = describe_owner(state, row.pid);
             if let Some(cell) = row.cells.get_mut(1) {
-                *cell = process;
+                *cell = match &c.namespace {
+                    Some(label) => format!("[{label}] {process}"),
+                    None => process,
+                };
             }
             if let Some(cell) = row.cells.get_mut(3) {
                 *cell = age;
             }
-            if let Some(cell) = row.cells.get_mut(4) {
-                *cell = format::human_bytes(c.total_bytes() as f64);
-            }
-            if let Some(cell) = row.cells.get_mut(5) {
-                *cell = format_rate(*down, *up);
+            // Left as the dash they were built with for a namespace connection: there
+            // are no counters behind it to refresh.
+            if c.namespace.is_none() {
+                if let Some(cell) = row.cells.get_mut(4) {
+                    *cell = format::human_bytes(c.total_bytes() as f64);
+                }
+                if let Some(cell) = row.cells.get_mut(5) {
+                    *cell = format_rate(*down, *up);
+                }
             }
         }
     }

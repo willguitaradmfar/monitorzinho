@@ -133,6 +133,7 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
                 monitor.headers(),
                 TableChrome {
                     has_detail: monitor.has_detail(),
+                    note: monitor.note(),
                     // Asked of the rows rather than of the monitor: the two top-N
                     // tables are trees only when fullscreened, which is exactly here.
                     is_tree: table_focus.rows.iter().any(|row| row.child_count > 0),
@@ -323,6 +324,7 @@ fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
             monitor.title(),
             monitor.headers(),
             &app.table_rows[i],
+            monitor.note(),
             shortcuts.table.get(&i).copied(),
         );
     }
@@ -584,6 +586,7 @@ fn render_table_panel(
     title: &str,
     headers: &[&str],
     rows: &[TableRow],
+    note: Option<String>,
     shortcut: Option<char>,
 ) {
     let mut block = Block::default()
@@ -592,6 +595,11 @@ fn render_table_panel(
         .border_style(Style::default().fg(palette::CYAN));
     if let Some(badge) = shortcut_badge(shortcut) {
         block = block.title_top(badge);
+    }
+    // What the table can't see, said where the table is: a panel that shows part of
+    // the picture and doesn't say so is read as the whole picture.
+    if let Some(note) = &note {
+        block = block.title_bottom(hint_line(note));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -613,6 +621,8 @@ fn render_table_panel(
 /// worse than no hint at all.
 struct TableChrome {
     has_detail: bool,
+    /// What the table has to say about its own completeness — see `TableMonitor::note`.
+    note: Option<String>,
     /// Whether any row has children. `←`/`→` collapse and expand a tree; on a flat
     /// table they do nothing at all.
     is_tree: bool,
@@ -667,6 +677,9 @@ fn render_fullscreen_table(
             parts.push(format!("Del {action}"));
         }
         parts.push("Esc limpar busca".to_string());
+    }
+    if let Some(note) = &chrome.note {
+        parts.push(note.clone());
     }
     let hint = parts.join(" · ");
     block = block.title_bottom(hint_line(&hint));

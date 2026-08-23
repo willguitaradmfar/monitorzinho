@@ -76,7 +76,17 @@ metric approaches its natural limit (e.g. memory nearing 100%).
 
 - **Ports** — everything listening, TCP and UDP together, newest first.
 - **Connections** — established sockets with per-connection rates and age,
-  refreshed live while fullscreened.
+  refreshed live while fullscreened, **including the ones inside containers**.
+  The netlink dump only answers for the namespace it is asked from, which is the
+  host's, so a machine running five containers that talk to each other all day
+  showed three SSH connections and called that the picture. Other namespaces are
+  read through `/proc/<pid>/net/tcp` — that file is the socket table of that pid's
+  namespace, so a process you may read is a namespace you may read — and each row
+  is labelled with the container it belongs to, named from the runtime's own state
+  file. What `/proc` doesn't carry is `tcp_info`, so those rows show a dash for
+  traffic rather than a zero. Where a namespace can't be opened at all (root-owned
+  containers seen from a normal user), the panel's corner says how many were left
+  out.
 - **Top CPU** / **Top Memory** — the heaviest processes by each metric, shown
   as a tree: parents expand to their children with `←`/`→`.
 - **SSH Sessions** — who is logged in over SSH, from where, on which TTY,

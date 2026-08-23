@@ -99,7 +99,10 @@ fn parse_endpoint(field: &str) -> Option<(String, u16)> {
     Some((ip, port))
 }
 
-fn parse_table(proto: &'static str, family: &'static str, path: &str) -> Vec<SocketRow> {
+/// Parses one socket table by path. The four host tables are the usual callers, and
+/// `/proc/<pid>/net/tcp` — the same format, for another network namespace — is the
+/// reason this takes a path rather than knowing its own.
+pub(super) fn parse_table(proto: &'static str, family: &'static str, path: &str) -> Vec<SocketRow> {
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
     };
