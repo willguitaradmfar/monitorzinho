@@ -17,6 +17,7 @@ pub mod rewrite;
 pub mod scan;
 pub mod tls;
 pub mod tunnel;
+pub mod x509;
 
 /// How one parameter is edited in the add-execution wizard.
 #[derive(Clone)]

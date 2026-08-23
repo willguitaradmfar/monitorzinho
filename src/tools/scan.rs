@@ -511,8 +511,19 @@ fn tls_probe(plan: &Plan, addr: SocketAddr) -> Option<String> {
         .negotiated_cipher_suite()
         .map(|s| format!(", {:?}", s.suite()))
         .unwrap_or_default();
+    // The handshake already fetched the chain — the port had to send it to prove
+    // anything. Reading four fields out of the leaf is what turns "speaks TLS" into
+    // "speaks TLS as api.exemplo.com, signed by Let's Encrypt, for another 62 days".
+    let certificate = session
+        .peer_certificates()
+        .and_then(|chain| chain.first())
+        .and_then(|leaf| super::x509::parse(leaf))
+        .map(|cert| cert.summary())
+        .filter(|summary| !summary.is_empty())
+        .map(|summary| format!("  ·  {summary}"))
+        .unwrap_or_default();
     let _ = stream.shutdown(Shutdown::Both);
-    Some(format!("TLS ({version}{suite})"))
+    Some(format!("TLS ({version}{suite}){certificate}"))
 }
 
 /// A minimal HTTP request, for a port that stayed silent and doesn't do TLS. The status
