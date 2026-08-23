@@ -187,6 +187,16 @@ the row stands: `pronta` for an on-demand execution nobody has asked anything
 of yet, `rodando`, `concluída` once there's a result to read, `parada` for one
 that was stopped or never started.
 
+`Espaço` switches the selected execution off, and on again. Off is not removed
+and not stopped-by-accident: the row stays where it is, with its log and its
+counters, drawn dim and struck through — and it stays off across restarts, so the
+app never comes back up doing the thing somebody turned off. What being off costs
+depends on the tool, which is what its log says at the moment it goes off: a relay
+gives its port back, a probe stops probing, and one that only works when asked
+refuses to work — `Enter` on a switched-off scan opens the log to read rather than
+starting a scan, and `r` does nothing until it is switched back on. Editing one
+doesn't switch it on either; only `Espaço` does.
+
 A row whose **last** logged event was an error is drawn in red, and goes back to
 normal by itself when something works again — the list is where several
 executions are watched at once, so a failure that only exists inside one of them
@@ -601,6 +611,7 @@ at it properly.
 | `Del` | a fullscreened table | what it kills depends on the table — the confirmation says so before anything happens |
 | any letter | a fullscreened table | search, live |
 | `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart (or re-run) / remove an execution |
+| `Espaço` | Ferramentas | switch that execution off — or back on |
 | `Enter` | Ferramentas | open that execution's live log — and run it, for an on-demand tool |
 | `Tab`, `Ctrl+F` | an execution's log | hex view, matches-only filter |
 | `Ctrl+L`, `End` | an execution's log | clear the scrollback, jump back to the live edge |

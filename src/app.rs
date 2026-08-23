@@ -389,6 +389,18 @@ impl ToolsState {
     /// Runs `tool` with `values`, returning the execution either way: one that failed
     /// to start is kept, carrying its error, rather than vanishing.
     fn launch(&mut self, tool: &dyn Tool, values: HashMap<&'static str, String>) -> Execution {
+        self.launch_as(tool, values, true)
+    }
+
+    /// The same, for a row that is meant to exist without running. Nothing is started —
+    /// which is the whole point of switching something off: a tunnel that comes back up
+    /// holding the port it was told to let go of would be the opposite of what was asked.
+    fn launch_as(
+        &mut self,
+        tool: &dyn Tool,
+        values: HashMap<&'static str, String>,
+        enabled: bool,
+    ) -> Execution {
         let id = self.take_id();
         let spec = ExecutionSpec {
             tool: tool.id().to_string(),
@@ -396,7 +408,17 @@ impl ToolsState {
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.clone()))
                 .collect(),
+            enabled,
         };
+        if !enabled {
+            return Execution::switched_off(
+                id,
+                tool.name(),
+                tool.summarize(&values),
+                off_note(tool, &values),
+            )
+            .with_spec(spec);
+        }
         match tool.start(id, &values) {
             Ok(execution) => execution,
             Err(error) => Execution::failed(id, tool.name(), tool.summarize(&values), error),
@@ -414,6 +436,21 @@ impl ToolsState {
             .collect();
         tools::persist::save(&specs);
     }
+}
+
+/// What being switched off means for this particular tool, in its own terms. Not one
+/// sentence for everything: a relay gives its port back, a probe stops probing, and one
+/// that only works when asked stops answering even when asked — and which of the three
+/// it is decides what the user has to know before pressing space again.
+fn off_note(tool: &dyn Tool, values: &HashMap<&'static str, String>) -> String {
+    if tool.on_demand(values) {
+        return "desligada — não roda nem quando aberta. Espaço liga de novo".to_string();
+    }
+    if tool.params().iter().any(|spec| spec.key == "listen") {
+        return "desligada — a porta foi liberada e ninguém é mais atendido aqui. Espaço liga de novo"
+            .to_string();
+    }
+    "desligada — parou de trabalhar. Espaço liga de novo".to_string()
 }
 
 /// Rebuilds a saved execution's parameters against the tool's *current* declaration:
@@ -1059,7 +1096,8 @@ impl App {
                 continue;
             };
             let values = restore_params(tool.as_ref(), &saved);
-            let execution = tools.launch(tool.as_ref(), values);
+            // One that was switched off comes back switched off, holding nothing.
+            let execution = tools.launch_as(tool.as_ref(), values, saved.enabled);
             tools.executions.push(execution);
         }
 
@@ -1986,6 +2024,9 @@ impl App {
         // new one can ask for it, exactly like a restart — and for the same reason it's
         // a stop, wait, start rather than a swap.
         let replacing = editing.and_then(|id| self.tools.index_of(id));
+        // Editing something that was switched off doesn't switch it on: it was put in
+        // that state on purpose, and space is the key that reverses it.
+        let was_off = replacing.is_some_and(|index| self.tools.executions[index].is_off());
         let previous = replacing.and_then(|index| {
             let existing = &self.tools.executions[index];
             let saved = existing.spec().cloned();
@@ -1994,6 +2035,18 @@ impl App {
         });
         if previous.is_some() {
             thread::sleep(RESTART_GRACE);
+        }
+
+        if was_off {
+            // Same row, new parameters, still off — and the log says what it will be
+            // when it comes back.
+            let index = replacing.unwrap_or_default();
+            let replacement = self.tools.launch_as(tool.as_ref(), params, false);
+            self.tools.executions[index] = replacement;
+            self.tools.selected = index;
+            self.tools.persist();
+            self.focus = Focus::None;
+            return;
         }
 
         // Unlike a restored execution, one being added by hand shouldn't be accepted
@@ -2007,6 +2060,7 @@ impl App {
                         .iter()
                         .map(|(key, value)| (key.to_string(), value.clone()))
                         .collect(),
+                    enabled: true,
                 };
                 let execution = execution.with_spec(spec);
                 match replacing {
@@ -2030,7 +2084,7 @@ impl App {
                     && let Some(tool) = self.tools_available.iter().find(|t| t.id() == saved.tool)
                 {
                     let values = restore_params(tool.as_ref(), &saved);
-                    let restored = self.tools.launch(tool.as_ref(), values);
+                    let restored = self.tools.launch_as(tool.as_ref(), values, saved.enabled);
                     self.tools.executions[index] = restored;
                 }
                 let Focus::Wizard(wizard) = &mut self.focus else {
@@ -2111,6 +2165,11 @@ impl App {
         let Some(existing) = self.tools.executions.get(index) else {
             return;
         };
+        // Switched off is a decision, and 'r' is not the key that reverses it — space
+        // is. Restarting into running would undo it without ever saying so.
+        if existing.is_off() {
+            return;
+        }
         // Nothing to recreate for an on-demand execution — it holds no threads and no
         // port. 'r' there means "do it again", against the same target.
         if let Some((tool, params)) = self.params_of(existing)
@@ -2135,6 +2194,49 @@ impl App {
         let values = restore_params(tool.as_ref(), &saved);
         let replacement = self.tools.launch(tool.as_ref(), values);
         self.tools.executions[index] = replacement;
+        self.tools.persist();
+    }
+
+    /// Space on the Ferramentas tab: switches the selected execution off, or back on.
+    ///
+    /// Off is not removed and not stopped-because-something-broke: the row stays with
+    /// its log and its counters, and it stays off across restarts. What it costs while
+    /// off depends on the tool — a relay lets go of its port, a probe stops probing, one
+    /// that works on demand refuses to work — which is what its log says at the moment
+    /// it goes off.
+    pub fn toggle_selected_execution(&mut self) {
+        let index = self.tools.selected;
+        let Some(execution) = self.tools.executions.get(index) else {
+            return;
+        };
+        let Some(saved) = execution.spec().cloned() else {
+            return;
+        };
+        let Some(position) = self
+            .tools_available
+            .iter()
+            .position(|tool| tool.id() == saved.tool)
+        else {
+            return;
+        };
+        let tool = &self.tools_available[position];
+        let values = restore_params(tool.as_ref(), &saved);
+
+        if execution.is_off() {
+            // Back on means started fresh: whatever it was doing before is over, and a
+            // tool takes its port and its threads at start, not on a flag.
+            let replacement = self.tools.launch_as(tool.as_ref(), values, true);
+            self.tools.executions[index] = replacement;
+        } else {
+            let note = off_note(tool.as_ref(), &values);
+            // Kept in place rather than replaced: the log is usually *why* somebody is
+            // switching it off, and it should still be there afterwards.
+            let mut spec = saved;
+            spec.enabled = false;
+            let execution = &mut self.tools.executions[index];
+            execution.switch_off(note);
+            execution.set_spec(spec);
+        }
         self.tools.persist();
     }
 
@@ -2200,8 +2302,12 @@ impl App {
             return;
         };
         // Opening is the trigger for a tool that only works on demand — the scan starts
-        // here, on the keypress, rather than at launch behind the user's back.
-        if let Some((tool, params)) = self.params_of(execution) {
+        // here, on the keypress, rather than at launch behind the user's back. Unless it
+        // is switched off, in which case opening it means reading what it did, not
+        // making it do it again.
+        if !execution.is_off()
+            && let Some((tool, params)) = self.params_of(execution)
+        {
             tool.open(execution, &params);
         }
         let Some(execution) = self.tools.selected() else {

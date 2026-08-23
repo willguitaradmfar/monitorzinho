@@ -18,6 +18,18 @@ pub struct ExecutionSpec {
     /// `Tool::id`, not its display name — the name is free to change, this isn't.
     pub tool: String,
     pub params: BTreeMap<String, String>,
+    /// Whether it should be running. Switched off stays switched off across restarts —
+    /// the row is kept on purpose, and coming back up doing the very thing somebody
+    /// turned off would be the opposite of what they asked for.
+    ///
+    /// Defaulted, so a file written by an older version reads as "on", which is what
+    /// every execution in it was.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 fn path() -> std::path::PathBuf {

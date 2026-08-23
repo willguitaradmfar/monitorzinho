@@ -1054,10 +1054,19 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
     // Every other key on this tab acts on a selected row, so with no rows there is
     // exactly one thing to offer.
+    // Written for the row under the cursor: a switched-off execution doesn't restart
+    // and doesn't run when opened, so offering 'r' there would be offering nothing.
+    let selected_off = app
+        .tools
+        .executions
+        .get(app.tools.selected)
+        .is_some_and(|execution| execution.is_off());
     let hint = if app.tools.executions.is_empty() {
         "a adicionar uma execução"
+    } else if selected_off {
+        "a adicionar · espaço ligar · Enter ver o log · e editar · Del remover · ↑/↓ e PgUp/PgDn navegar"
     } else {
-        "a adicionar · Enter monitorar · e editar · r reiniciar · Del remover · ↑/↓ e PgUp/PgDn navegar"
+        "a adicionar · Enter monitorar · espaço desligar · e editar · r reiniciar · Del remover · ↑/↓ navegar"
     };
     let block = Block::default()
         .title(" Execuções ")
@@ -1101,6 +1110,7 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
                 State::Running => ("rodando", Style::default().fg(palette::GREEN)),
                 State::Done => ("concluída", Style::default().fg(palette::CYAN)),
                 State::Stopped => ("parada", Style::default().fg(palette::RED)),
+                State::Off => ("desligada", Style::default().fg(palette::DIM)),
             };
             // Straight from the tool that owns this execution. A row whose tool is
             // somehow missing still renders — just without the two result columns.
@@ -1115,6 +1125,18 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
                 Cell::from(summary),
                 Cell::from(Span::styled(state, style)),
             ]);
+            // Switched off wins over everything else the row could be saying: struck
+            // through and dimmed, because it is still here — kept on purpose — and
+            // simply isn't doing anything. Whatever error it last logged belongs to
+            // when it was running, and painting that red now would report a problem
+            // where there is only a decision.
+            if execution.is_off() {
+                return row.style(
+                    Style::default()
+                        .fg(palette::DIM)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                );
+            }
             // Failing right now — the last thing it logged was an error — paints the
             // whole row. The list is where several executions are watched at once, and a
             // failure that only exists inside the execution makes the list lie by

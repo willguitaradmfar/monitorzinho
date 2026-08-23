@@ -281,6 +281,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     KeyCode::Delete if on_tools_tab(&app) => app.request_remove_execution(),
                     KeyCode::Char('e') if on_tools_tab(&app) => app.edit_selected_execution(),
                     KeyCode::Char('r') if on_tools_tab(&app) => app.restart_selected_execution(),
+                    // Space, ahead of the global "refresh now" arm below: this tab has
+                    // nothing to refresh — an execution's counters are atomics the UI
+                    // already reads every frame — so the key is free for the one thing
+                    // the list can do to a row without losing it.
+                    KeyCode::Char(' ') if on_tools_tab(&app) => app.toggle_selected_execution(),
                     KeyCode::Up if on_tools_tab(&app) => app.move_tool_selection(-1),
                     KeyCode::Down if on_tools_tab(&app) => app.move_tool_selection(1),
                     KeyCode::PageUp if on_tools_tab(&app) => {

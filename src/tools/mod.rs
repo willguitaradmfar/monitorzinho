@@ -789,6 +789,9 @@ pub struct Execution {
     /// because an on-demand execution that has simply never been asked to do anything
     /// looks exactly the same otherwise.
     failed: bool,
+    /// Switched off by the user. Kept on the list, doing nothing, until switched back
+    /// on — and remembered across restarts, so "off" survives closing the app.
+    off: bool,
     /// How many pieces of on-demand work have completed.
     runs: Arc<AtomicU64>,
     /// The two result columns, written by the tool as it goes.
@@ -854,6 +857,7 @@ impl Execution {
             findings,
             spec: None,
             chart: None,
+            off: false,
         };
         (execution, recorder)
     }
@@ -876,6 +880,35 @@ impl Execution {
             chart.format,
             Arc::clone(&chart.series),
         )))
+    }
+
+    /// A row for something that exists but isn't running: switched off, and restored
+    /// that way. Nothing was started, so there is nothing to stop.
+    pub fn switched_off(id: u64, tool: &'static str, summary: String, note: String) -> Self {
+        let (mut execution, recorder) = Self::new(id, tool, summary);
+        recorder.record(0, EventKind::Note(note));
+        execution.finished.store(true, Ordering::Relaxed);
+        execution.off = true;
+        execution
+    }
+
+    /// Switches a running execution off in place: its threads are told to stop, and the
+    /// row stays exactly where it is — log, counters and all — so what it recorded is
+    /// still there to read afterwards. That's why this isn't the same as removing it and
+    /// adding it back.
+    ///
+    /// `note` is what being off *means* for this particular tool, which is not the same
+    /// sentence twice: a relay gives its port back, a probe stops probing, and one that
+    /// only works when asked stops answering even when asked.
+    pub fn switch_off(&mut self, note: String) {
+        self.stop();
+        self.off = true;
+        self.recorder().record(0, EventKind::Note(note));
+    }
+
+    /// Whether this was switched off on purpose.
+    pub fn is_off(&self) -> bool {
+        self.off
     }
 
     /// Marks this as an execution that idles until asked. Its threads aren't running,
@@ -912,6 +945,9 @@ impl Execution {
 
     /// Where this row stands, in the one vocabulary the list can render.
     pub fn state(&self) -> State {
+        if self.off {
+            return State::Off;
+        }
         if self.failed || self.shutdown.load(Ordering::Relaxed) {
             return State::Stopped;
         }
@@ -985,6 +1021,12 @@ impl Execution {
         self
     }
 
+    /// The same for an execution already on the list — switching one off changes what
+    /// should happen to it next launch without changing anything else about it.
+    pub fn set_spec(&mut self, spec: persist::ExecutionSpec) {
+        self.spec = Some(spec);
+    }
+
     pub fn spec(&self) -> Option<&persist::ExecutionSpec> {
         self.spec.as_ref()
     }
@@ -1015,4 +1057,8 @@ pub enum State {
     /// On-demand, work finished, results are there to read.
     Done,
     Stopped,
+    /// Switched off on purpose, and staying that way across restarts. Different from
+    /// stopped: nothing here died or finished — somebody decided it shouldn't run for
+    /// now, and the row is kept precisely so it can be switched back on.
+    Off,
 }
