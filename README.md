@@ -224,6 +224,25 @@ but sending the datagram back proves the round trip, which is what someone
 testing a NAT or a firewall is after. The row says which of the two it is instead
 of promising a status it cannot send.
 
+#### Seguir arquivo
+
+`tail -f` inside the viewer every other execution already writes to. The reason
+it's a tool rather than a suggestion to open another terminal is that viewer:
+search as you type, jump between hits, hide what doesn't match, read it as hex,
+and thousands of lines still there an hour later. `tail -f | grep` gives you one
+of those and takes the rest away.
+
+It opens with the last 200 lines rather than with an empty screen, found by
+walking backwards in 64 KB blocks counting newlines — a 56 MB log opens
+instantly. A filter can be applied at the source, so a line that doesn't match
+never enters the log at all; the viewer's own search still works on top of that,
+which is a different thing on purpose.
+
+Rotation is handled: the file is recognised by device and inode rather than by
+name, so a `logrotate` that renames it and creates a fresh one is noticed, said
+out loud in the log, and followed from the start of the new file. Following the
+old descriptor in silence is the classic way this goes wrong.
+
 #### Scanner de portas
 
 A TCP connect scan of a host, and as much as can be said about each open port.

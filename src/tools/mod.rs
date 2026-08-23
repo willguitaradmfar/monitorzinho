@@ -17,6 +17,7 @@ pub mod persist;
 pub mod poll;
 pub mod rewrite;
 pub mod scan;
+pub mod tail;
 pub mod tls;
 pub mod tunnel;
 pub mod x509;
@@ -350,6 +351,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(tunnel::TunnelTool),
         Box::new(listen::ListenTool),
+        Box::new(tail::TailTool),
         Box::new(scan::ScanTool),
         Box::new(dns::DnsTool),
         Box::new(cert::CertTool),
