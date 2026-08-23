@@ -443,6 +443,29 @@ changes once the connection is private, and `AUTH` usually only appears there.
 Nothing is ever sent. The relay test stops at `RCPT TO` and resets, which is
 after the server has already decided and before anybody gets an email.
 
+#### Endereço público (STUN), Wake-on-LAN, Portas de saída
+
+Three small questions that had nowhere to be asked.
+
+**STUN** gives the address this machine appears as on the internet, the port NAT
+gave it, and what the NAT does with both. `curl ifconfig.me` gives the address and
+nothing else, and gets it by asking a web server to say — which works right up
+until the thing being debugged is UDP not coming back. Two servers from different
+operators are asked on purpose: same port for different destinations means a cone
+NAT you can punch through, a different port per destination means a symmetric one
+where direct peer-to-peer will not work however hard you try.
+
+**Wake-on-LAN** sends the one packet a switched-off machine's card still listens
+for: six `FF` bytes and its MAC sixteen times over, three times over because
+nothing acknowledges a magic packet. The network scanner publishes the MAC of
+everything it sees, so waking a machine is offered straight from a sweep — which
+is how you have the MAC of a machine that is now off.
+
+**Portas de saída** asks the question backwards: not what the destination
+accepts, but what can leave from here. A refused connection counts as success —
+the refusal had to get out — while a blocked port simply goes quiet, which is why
+it waits three seconds and not three hundred milliseconds.
+
 #### Scanner de rede
 
 What's alive on the local network, with a MAC, a vendor and a name for each.
