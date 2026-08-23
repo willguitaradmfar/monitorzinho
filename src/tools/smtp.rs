@@ -18,6 +18,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::tls;
 use super::{EventKind, Execution, ParamSpec, Recorder, Tool};
 
 const TLS_MODES: &[&str] = &["automático", "STARTTLS", "TLS direto", "sem TLS"];
@@ -334,7 +335,7 @@ fn upgrade(
     plan: &Plan,
     rec: &Recorder,
     how: &str,
-) -> Result<(Session<TlsStream>, ()), String> {
+) -> Result<(Session<tls::OwnedStream>, ()), String> {
     let client = super::tls::Client::new(
         &format!("{}:{}", plan.host, plan.address.port()),
         &plan.host,
@@ -361,7 +362,7 @@ fn upgrade(
         ),
     );
     Ok((
-        Session::new(TlsStream::new(session, socket), plan.timeout),
+        Session::new(tls::OwnedStream::new(session, socket), plan.timeout),
         (),
     ))
 }
@@ -539,36 +540,6 @@ fn report_capabilities(rec: &Recorder, capabilities: &[String]) {
     }
     for capability in capabilities {
         note(rec, format!("      {capability}"));
-    }
-}
-
-/// A TLS connection that owns both halves, so it can be handed to a `Session` the same
-/// way a plain socket is. `rustls::Stream` borrows its session, which makes it unable to
-/// live inside anything that outlives the call — this owns instead of borrowing.
-struct TlsStream {
-    session: rustls::ClientConnection,
-    socket: TcpStream,
-}
-
-impl TlsStream {
-    fn new(session: rustls::ClientConnection, socket: TcpStream) -> Self {
-        Self { session, socket }
-    }
-}
-
-impl Read for TlsStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        rustls::Stream::new(&mut self.session, &mut self.socket).read(buf)
-    }
-}
-
-impl Write for TlsStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        rustls::Stream::new(&mut self.session, &mut self.socket).write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        rustls::Stream::new(&mut self.session, &mut self.socket).flush()
     }
 }
 

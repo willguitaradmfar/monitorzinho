@@ -17,9 +17,11 @@ pub mod icmp;
 pub mod listen;
 pub mod mdns;
 pub mod net;
+pub mod payload;
 pub mod persist;
 pub mod ping;
 pub mod poll;
+pub mod replay;
 pub mod rewrite;
 pub mod rota;
 pub mod scan;
@@ -338,6 +340,15 @@ pub fn offers_for(kind: &str, value: &str) -> Vec<Handoff> {
             });
             offers
         }
+        // A captured request: the value *is* the request, escaped onto one line, and its
+        // first line is what identifies it — which for HTTP is the request line itself.
+        // The destination is deliberately absent here: whoever captured it knows where it
+        // was going, and a finding doesn't. See `TunnelTool::handoffs`.
+        "requisicao" => vec![Handoff {
+            label: format!("repetir {}", payload::first_line(value, 60)),
+            tool: "replay",
+            params: vec![("payload", value.to_string())],
+        }],
         "rede" => vec![Handoff {
             label: format!("varrer a rede {value}"),
             tool: "net",
@@ -386,6 +397,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(net::NetTool),
         Box::new(rota::RotaTool),
         Box::new(ping::PingTool),
+        Box::new(replay::ReplayTool),
         Box::new(stun::StunTool),
         Box::new(egress::EgressTool),
         Box::new(wol::WolTool),
@@ -921,6 +933,13 @@ impl Execution {
         execution.finished.store(true, Ordering::Relaxed);
         execution.failed = true;
         execution
+    }
+
+    /// Never got off the ground: a missing parameter, a bad address, a busy port. Told
+    /// apart from "stopped" because the answer is different — this one wants the form
+    /// reopened, not a restart.
+    pub fn failed_to_start(&self) -> bool {
+        self.failed
     }
 
     /// Records what would recreate this execution across restarts.

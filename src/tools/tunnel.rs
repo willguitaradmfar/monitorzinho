@@ -25,9 +25,10 @@ use std::thread;
 use std::time::Duration;
 
 use super::poll;
+use super::replay::Capture;
 use super::rewrite::{Rules, rewritten};
 use super::tls;
-use super::{Direction, EventKind, Execution, ParamSpec, Recorder, Tool};
+use super::{Direction, EventKind, Execution, Handoff, ParamSpec, Recorder, Tool, offers_from};
 
 /// Relay buffer. Big enough that a bulk transfer isn't chopped into hundreds of log
 /// events, small enough that an interactive protocol still logs message by message.
@@ -154,6 +155,41 @@ impl Tool for TunnelTool {
         )
     }
 
+    /// The usual offers, plus the destination for anything that came out of this
+    /// tunnel's traffic.
+    ///
+    /// This is the override the trait describes: a captured request is a finding like
+    /// any other, but *where to send it again* isn't in the request — it's in this
+    /// tunnel's configuration, which only this tunnel knows. A proxy is the exception
+    /// and stays blank: its destination is whatever each request asked for, not one
+    /// place, so the field is left for the user rather than filled in wrong.
+    fn handoffs(&self, execution: &Execution) -> Vec<Handoff> {
+        let mut offers = offers_from(execution);
+        let Some(spec) = execution.spec() else {
+            return offers;
+        };
+        if spec
+            .params
+            .get("modo")
+            .is_some_and(|mode| is_proxy_mode(mode))
+        {
+            return offers;
+        }
+        let Some(target) = spec.params.get("target").filter(|t| !t.trim().is_empty()) else {
+            return offers;
+        };
+        for offer in offers.iter_mut().filter(|offer| offer.tool == "replay") {
+            offer.params.push(("destino", target.clone()));
+            if let Some(tls) = spec.params.get("tls") {
+                offer.params.push(("tls", tls.clone()));
+            }
+            if let Some(sni) = spec.params.get("sni").filter(|s| !s.trim().is_empty()) {
+                offer.params.push(("sni", sni.clone()));
+            }
+        }
+        offers
+    }
+
     fn start(&self, id: u64, params: &HashMap<&'static str, String>) -> Result<Execution, String> {
         let proto = params.get("proto").map(String::as_str).unwrap_or("TCP");
         let listen = params.get("listen").map(String::as_str).unwrap_or_default();
@@ -252,7 +288,11 @@ enum TlsMode {
 
 /// Whether this execution is a proxy rather than a relay to a fixed target.
 fn is_proxy(params: &HashMap<&'static str, String>) -> bool {
-    params.get("modo").map(String::as_str) == Some(MODES[1])
+    params.get("modo").is_some_and(|mode| is_proxy_mode(mode))
+}
+
+fn is_proxy_mode(mode: &str) -> bool {
+    mode == MODES[1]
 }
 
 fn tls_mode(params: &HashMap<&'static str, String>) -> TlsMode {
@@ -457,7 +497,15 @@ fn proxy_connect(client: TcpStream, target: &str, conn: u64, rec: &Recorder) {
         return;
     }
     let _ = upstream.set_nodelay(true);
-    pump_both(client, upstream, &Rules::default(), conn, rec, true);
+    pump_both(
+        client,
+        upstream,
+        &Rules::default(),
+        conn,
+        rec,
+        true,
+        Capture::new(),
+    );
 }
 
 /// A plain proxied request: readable, so it is read.
@@ -517,7 +565,11 @@ fn proxy_plain(
         let _ = client.shutdown(Shutdown::Both);
         return;
     }
-    pump_both(client, upstream, rules, conn, rec, false);
+    // The head already left, above, so the capture is primed with it: the body — and
+    // any further request on the same kept-alive connection — arrives through the pump.
+    let mut capture = Capture::new();
+    capture.feed(&forwarded, rec);
+    pump_both(client, upstream, rules, conn, rec, false, capture);
 }
 
 /// `GET http://host:port/path HTTP/1.1` → the three parts a connection needs.
@@ -613,7 +665,7 @@ fn relay_tcp(
     let _ = client.set_nodelay(true);
     let _ = upstream.set_nodelay(true);
 
-    pump_both(client, upstream, rules, conn, rec, false);
+    pump_both(client, upstream, rules, conn, rec, false, Capture::new());
 }
 
 /// Runs both directions of a plain relay until either side is done. Shared by the fixed
@@ -626,6 +678,7 @@ fn pump_both(
     conn: u64,
     rec: &Recorder,
     opaque: bool,
+    mut capture: Capture,
 ) {
     // Each direction needs its own handle on both sockets: one to read from, one to
     // write to, and `shutdown` on either end unblocks whichever side is still reading.
@@ -643,23 +696,28 @@ fn pump_both(
             pump(
                 upstream_r,
                 client,
-                Direction::FromTarget,
-                None,
-                conn,
-                &rec,
-                opaque,
+                Leg {
+                    dir: Direction::FromTarget,
+                    rules: None,
+                    conn,
+                    rec: &rec,
+                    opaque,
+                    capture: None,
+                },
             );
         })
     };
-    // Only this direction gets the rules: they exist to fix up what the client sends.
     pump(
         client_r,
         upstream,
-        Direction::ToTarget,
-        Some(rules),
-        conn,
-        rec,
-        opaque,
+        Leg {
+            dir: Direction::ToTarget,
+            rules: Some(rules),
+            conn,
+            rec,
+            opaque,
+            capture: Some(&mut capture),
+        },
     );
     let _ = back.join();
 
@@ -674,15 +732,30 @@ fn pump_both(
 /// Copies one direction of a TCP connection, recording every chunk. Ends on EOF, on
 /// error, or when the execution is stopped; either way it shuts both sockets down so
 /// the opposite pump ends too instead of blocking forever on a half-dead connection.
-fn pump(
-    mut from: TcpStream,
-    mut to: TcpStream,
+/// One direction of one connection: what it carries, and everyone it has to tell.
+struct Leg<'a> {
     dir: Direction,
-    rules: Option<&Rules>,
+    /// Only the client→target direction gets rules; they exist to fix up what the
+    /// client sends.
+    rules: Option<&'a Rules>,
     conn: u64,
-    rec: &Recorder,
+    rec: &'a Recorder,
+    /// Somebody else's TLS going past: nothing to rewrite, nothing worth keeping.
     opaque: bool,
-) {
+    /// Only the client→target direction captures: what is worth repeating is what was
+    /// asked, not what was answered.
+    capture: Option<&'a mut Capture>,
+}
+
+fn pump(mut from: TcpStream, mut to: TcpStream, leg: Leg) {
+    let Leg {
+        dir,
+        rules,
+        conn,
+        rec,
+        opaque,
+        mut capture,
+    } = leg;
     let _ = from.set_read_timeout(Some(POLL));
     let mut buf = vec![0u8; RELAY_BUF];
     while !rec.stopping() {
@@ -698,6 +771,12 @@ fn pump(
                     to.write_all(&buf[..n])
                 } else {
                     let payload = rewritten(rules, &buf[..n], dir, conn, rec);
+                    // Fed what actually left, rules already applied: repeating the
+                    // request the target received is the only repeat that means
+                    // anything.
+                    if let Some(capture) = capture.as_deref_mut() {
+                        capture.feed(&payload, rec);
+                    }
                     to.write_all(&payload)
                 };
                 if let Err(e) = written {

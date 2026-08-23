@@ -2342,6 +2342,19 @@ impl App {
         // to the new execution is the point of the gesture.
         self.focus = Focus::None;
         self.switch_tab(Tab::Tools);
+        // An offer that can't run as it stands opens its form instead of sitting there
+        // as a dead row: everything the offer carried is already in the fields, and what
+        // is missing is exactly what only the user can say — repeating a request a
+        // receiver caught, for instance, needs somewhere to send it, and no finding can
+        // know where. Only for a single offer: a bulk creation has no one form to open.
+        if chosen.len() == 1
+            && self
+                .tools
+                .selected()
+                .is_some_and(|execution| execution.failed_to_start())
+        {
+            self.edit_selected_execution();
+        }
     }
 
     /// ↑/↓ in the monitor. With a search active these step between hits instead of

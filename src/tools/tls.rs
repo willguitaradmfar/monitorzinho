@@ -385,3 +385,33 @@ fn handshake_summary(tls: &ClientConnection) -> String {
         None => format!("TLS estabelecido: {version}"),
     }
 }
+
+/// A TLS connection that owns both halves, so it can be handed to a `Session` the same
+/// way a plain socket is. `rustls::Stream` borrows its session, which makes it unable to
+/// live inside anything that outlives the call — this owns instead of borrowing.
+pub struct OwnedStream {
+    session: rustls::ClientConnection,
+    socket: TcpStream,
+}
+
+impl OwnedStream {
+    pub fn new(session: rustls::ClientConnection, socket: TcpStream) -> Self {
+        Self { session, socket }
+    }
+}
+
+impl Read for OwnedStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        rustls::Stream::new(&mut self.session, &mut self.socket).read(buf)
+    }
+}
+
+impl Write for OwnedStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        rustls::Stream::new(&mut self.session, &mut self.socket).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        rustls::Stream::new(&mut self.session, &mut self.socket).flush()
+    }
+}

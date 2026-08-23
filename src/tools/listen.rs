@@ -20,6 +20,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
+use super::replay::Capture;
 use super::{Direction, EventKind, Execution, ParamSpec, Recorder, Tool, poll};
 
 /// How long an accept or receive waits before going around to check the stop flag.
@@ -284,6 +285,10 @@ fn accept(listener: TcpListener, address: SocketAddr, reply: Arc<Reply>, rec: &R
 fn serve(mut stream: TcpStream, conn: u64, reply: &Reply, rec: &Recorder) -> String {
     let _ = stream.set_read_timeout(Some(POLL));
     let mut received: Vec<u8> = Vec::new();
+    // What arrives at a receiver is worth sending somewhere else: the webhook that came
+    // in here is the one you want to point at your real service. The destination is the
+    // one thing this cannot know, so that field is the only one left blank.
+    let mut capture = Capture::new();
     let mut idle = Duration::ZERO;
 
     loop {
@@ -296,6 +301,7 @@ fn serve(mut stream: TcpStream, conn: u64, reply: &Reply, rec: &Recorder) -> Str
             Ok(read) => {
                 idle = Duration::ZERO;
                 rec.record_data(conn, Direction::ToTarget, &buffer[..read]);
+                capture.feed(&buffer[..read], rec);
                 received.extend_from_slice(&buffer[..read]);
                 // An HTTP request ends at the blank line unless it carries a body, and
                 // a caller that keeps the connection open waiting for an answer would

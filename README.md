@@ -440,6 +440,28 @@ Three probes a hop, a silent router shown as `* * *` without ending the trace,
 and five silent hops in a row called what it is — a wall — instead of thirty
 lines of stars.
 
+#### Repetir requisição
+
+The tunnel shows a request going past; the question that follows is always what
+happens if it runs again. Rebuilding it in `curl` means copying header by header,
+and the header that matters is usually the one nobody thought to copy — so the
+request travels whole. What a relay saw is pre-filled here, escaped onto one line
+(`\r`, `\n`, `\xNN`), and sending it again is one key. Repeating it unchanged
+answers "was it me or them"; repeating it changed — a different path, one header
+short — answers which part.
+
+Requests are framed rather than grabbed: a `read` is not a request, so the head is
+reassembled across chunks and the body ends where `Content-Length` says it does.
+A chunked body isn't offered at all, since repeating a head whose body never ends
+would leave the far side waiting. The destination comes from the tunnel that
+captured it, because it is in that tunnel's configuration and not in the request;
+a receiver has no destination to give, so that offer opens the form with
+everything else filled in and the cursor on the one field only the user can
+answer.
+
+Nothing is sent until asked — on demand, like the port scanner. A request that
+moves money is repeated when somebody means it, not because the app started.
+
 #### Latência contínua
 
 The same round trip `ping` measures, kept running and drawn as a line on the
