@@ -256,6 +256,26 @@ name, so a `logrotate` that renames it and creates a fresh one is noticed, said
 out loud in the log, and followed from the start of the new file. Following the
 old descriptor in silence is the classic way this goes wrong.
 
+#### Sonda HTTP
+
+Calls a URL on a schedule and says where the time went. "Is it up" is the easy
+half; the half that decides what to do next is *which part* was slow — a name
+that took 900 ms to resolve, a handshake that took two seconds, or a server that
+accepted the connection instantly and then sat on the request. The total hides
+all three, so the four phases are measured separately: DNS, connect, TLS,
+first byte.
+
+It keeps running rather than answering once, because an endpoint that answered
+once is not an endpoint that is up. A status class can be required (`2xx`, or an
+exact `204`), redirects are followed and shown hop by hop, and every failure is a
+red line that moves the success rate on the row.
+
+Two details it gets right on purpose, both found by comparing against `curl -w`
+on the same target: `TCP_NODELAY`, without which a small request waits on the
+other side's delayed ACK and the probe reports 40 ms of its own making as the
+server's latency; and one TLS client per host kept for the life of the execution,
+since building it parses the whole system trust store and did so on every request.
+
 #### Scanner de portas
 
 A TCP connect scan of a host, and as much as can be said about each open port.

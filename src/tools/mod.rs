@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub mod cert;
 pub mod dns;
+pub mod http;
 pub mod icmp;
 pub mod listen;
 pub mod net;
@@ -354,6 +355,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(tunnel::TunnelTool),
         Box::new(listen::ListenTool),
         Box::new(tail::TailTool),
+        Box::new(http::HttpTool),
         Box::new(scan::ScanTool),
         Box::new(dns::DnsTool),
         Box::new(cert::CertTool),
