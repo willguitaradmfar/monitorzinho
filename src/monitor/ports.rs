@@ -272,20 +272,30 @@ fn reach(sockets: &[&SocketRow]) -> &'static str {
     }
 }
 
-/// A tunnel that records everything this port receives. It can't listen on the port
-/// itself — that one is taken, by definition — so it takes the first free port above
-/// it, and the client gets pointed one number to the right.
-pub(super) fn record_traffic(proto: &str, port: u16, sockets: &[SocketRow]) -> Vec<Handoff> {
-    let taken: HashSet<u16> = sockets
+/// Every port currently bound, whatever it's bound to — the set a new listener has to
+/// stay out of.
+pub(super) fn listening_port_set(sockets: &[SocketRow]) -> HashSet<u16> {
+    sockets
         .iter()
         .filter(|row| row.is_listening())
         .map(|row| row.local_port)
-        .collect();
+        .collect()
+}
+
+/// A tunnel that records everything this port receives. It can't listen on the port
+/// itself — that one is taken, by definition — so it takes the first free port above
+/// it, and the client gets pointed one number to the right.
+///
+/// `taken` is both what to avoid and where the choice is recorded: several of these are
+/// built side by side for one process, and two offers proposing the same local port
+/// would mean the second one failing to bind the moment both are accepted.
+pub(super) fn record_traffic(proto: &str, port: u16, taken: &mut HashSet<u16>) -> Vec<Handoff> {
     let Some(listen) = (port.saturating_add(1)..=port.saturating_add(64))
         .find(|candidate| !taken.contains(candidate))
     else {
         return Vec::new();
     };
+    taken.insert(listen);
     vec![Handoff {
         label: format!("túnel {proto} em {listen} gravando o que iria para {port}"),
         tool: "tunnel",
@@ -377,7 +387,7 @@ impl PortsMonitor {
             gone_note: "não está mais em escuta",
             sections,
             rates: None,
-            handoffs: record_traffic(proto, port, &sockets),
+            handoffs: record_traffic(proto, port, &mut listening_port_set(&sockets)),
             handoff_title: "Gravar o tráfego desta porta",
         })
     }

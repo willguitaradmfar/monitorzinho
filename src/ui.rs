@@ -1689,18 +1689,6 @@ fn log_lines(execution: &Execution, hex: bool, width: usize) -> Vec<LogLine> {
     lines
 }
 
-/// Case-insensitive substring search over ASCII, returning a byte offset. Comparing
-/// raw bytes keeps the returned indices valid for slicing: an ASCII byte can never
-/// match a UTF-8 continuation byte, so a match can only ever start and end on a
-/// character boundary.
-fn find_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
-    let (hay, need) = (haystack.as_bytes(), needle.as_bytes());
-    if need.is_empty() || hay.len() < need.len() || from > hay.len() - need.len() {
-        return None;
-    }
-    (from..=hay.len() - need.len()).find(|&i| hay[i..i + need.len()].eq_ignore_ascii_case(need))
-}
-
 /// Splits `text` into spans with every occurrence of `query` picked out, so a search
 /// hit is visible in place rather than only by the line having survived a filter.
 fn highlight(text: &str, query: &str, base: Style) -> Vec<Span<'static>> {
@@ -1712,7 +1700,7 @@ fn highlight(text: &str, query: &str, base: Style) -> Vec<Span<'static>> {
         .add_modifier(Modifier::BOLD | Modifier::REVERSED);
     let mut spans = Vec::new();
     let mut pos = 0;
-    while let Some(found) = find_ci(text, query, pos) {
+    while let Some(found) = format::find_ci(text, query, pos) {
         if found > pos {
             spans.push(Span::styled(text[pos..found].to_string(), base));
         }
@@ -1741,25 +1729,37 @@ fn render_handoffs(frame: &mut Frame, area: Rect, picker: &HandoffPicker) {
         .selected
         .saturating_sub(visible.saturating_sub(1))
         .min(picker.rows().saturating_sub(visible));
+    let searching = !picker.query.is_empty();
 
     let mut lines = vec![Line::raw("")];
     for row in first..first + visible {
         let selected = row == picker.selected;
-        let style = if selected {
-            Style::default()
+        let hit = picker.matches(row);
+        // Everything stays on screen while a search runs; what changes is where the eye
+        // is sent. The rows that don't match go quiet rather than away.
+        let style = match (selected, searching, hit) {
+            (true, _, _) => Style::default()
                 .fg(palette::YELLOW)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
+                .add_modifier(Modifier::BOLD),
+            (false, true, false) => Style::default().fg(palette::DIM),
+            _ => Style::default(),
         };
         let label = match picker.at(row) {
             Some(offer) => offer.label.clone(),
+            // The bulk row says exactly what it would create right now, since a search
+            // changes that from "all of them" to "the ones you can see marked".
+            None if searching => match picker.match_count() {
+                0 => format!("nada a criar: «{}» não casa com nada", picker.query),
+                n => format!("as {n} que casam com «{}»", picker.query),
+            },
             None => format!("todos os {} de uma vez", picker.options.len()),
         };
-        lines.push(Line::styled(
-            format!(" {}{label}", if selected { "▶ " } else { "  " }),
+        let mut spans = vec![Span::styled(
+            format!(" {}", if selected { "▶ " } else { "  " }),
             style,
-        ));
+        )];
+        spans.extend(highlight(&label, &picker.query, style));
+        lines.push(Line::from(spans));
     }
     if picker.rows() > visible {
         lines.push(Line::styled(
@@ -1768,20 +1768,37 @@ fn render_handoffs(frame: &mut Frame, area: Rect, picker: &HandoffPicker) {
         ));
     }
     lines.push(Line::raw(""));
+    // With a search running, whether it found anything is the first thing to know —
+    // especially when the answer is nothing, since no row disappeared to say so.
     lines.push(Line::styled(
-        "   A execução é criada já preenchida, e você cai na lista com ela selecionada.",
+        match (searching, picker.match_count()) {
+            (true, 0) => format!("   Nada casa com «{}».", picker.query),
+            (true, n) => format!(
+                "   {n} de {} casam com «{}» — ↑/↓ vão de um a outro.",
+                picker.options.len(),
+                picker.query
+            ),
+            _ => "   A execução é criada já preenchida, e você cai na lista com ela selecionada."
+                .to_string(),
+        },
         Style::default().fg(palette::DIM),
     ));
 
     let height = (lines.len() as u16).saturating_add(4).min(area.height);
     let box_area = centered(area, width, height);
     let block = Block::default()
-        .title(format!(" {} ", picker.title))
+        .title(if searching {
+            format!(" {} — busca: {} ", picker.title, picker.query)
+        } else {
+            format!(" {} ", picker.title)
+        })
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN))
-        .title_bottom(hint_line(
-            "↑/↓ e PgUp/PgDn escolher · Enter criar · Esc voltar",
-        ));
+        .title_bottom(hint_line(if searching {
+            "↑/↓ resultado anterior/próximo · PgUp/PgDn rolar · Enter criar · Esc limpar busca"
+        } else {
+            "digite p/ buscar · ↑/↓ e PgUp/PgDn escolher · Enter criar · Esc voltar"
+        }));
     let inner = block.inner(box_area);
     frame.render_widget(Clear, box_area);
     frame.render_widget(block, box_area);
@@ -1829,7 +1846,7 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
 
     let mut lines = log_lines(execution, monitor.hex, inner.width as usize);
     if monitor.only_matches && !monitor.query.is_empty() {
-        lines.retain(|line| find_ci(&line.text, &monitor.query, 0).is_some());
+        lines.retain(|line| format::find_ci(&line.text, &monitor.query, 0).is_some());
     }
     let matches: Vec<u16> = if monitor.query.is_empty() {
         Vec::new()
@@ -1837,7 +1854,7 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
         lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| find_ci(&line.text, &monitor.query, 0).is_some())
+            .filter(|(_, line)| format::find_ci(&line.text, &monitor.query, 0).is_some())
             .map(|(i, _)| i as u16)
             .collect()
     };

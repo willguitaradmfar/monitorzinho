@@ -6,6 +6,7 @@ use std::time::Duration;
 use crossterm::event::KeyCode;
 use sysinfo::{Pid, Signal};
 
+use crate::format;
 use crate::history::{self, CAPACITY, History};
 use crate::monitor::{self, Danger, Detail, Monitor, SystemState, TableMonitor, TableRow};
 use crate::tools::persist::ExecutionSpec;
@@ -516,6 +517,16 @@ pub struct HandoffPicker {
     /// are enough offers for that to save anything.
     pub selected: usize,
     pub bulk: bool,
+    /// Live search, typed straight in. A sweep of a /24 comes back with a hundred
+    /// addresses and the one being looked for is somewhere in the middle.
+    ///
+    /// Unlike the tables', this search never hides a row. This is a list of things
+    /// about to be *acted* on, with a "all of them at once" row sitting at the top of
+    /// it: quietly narrowing what "all" means, or hiding rows a keypress away from
+    /// creating an execution, is how someone ends up with forty executions they never
+    /// saw. It moves the cursor to the match and marks it instead — and where a
+    /// narrowed "all" is genuinely wanted, the bulk row says so in as many words.
+    pub query: String,
 }
 
 /// Offers below this many aren't worth a bulk row: picking one of two is already one
@@ -529,7 +540,71 @@ impl HandoffPicker {
             bulk: options.len() >= BULK_THRESHOLD,
             options,
             selected: 0,
+            query: String::new(),
         }
+    }
+
+    /// Whether this row's offer matches the current search. The bulk row never does —
+    /// it isn't one of the findings, and letting it match would put the cursor on
+    /// "create all of them" as the answer to a search for one.
+    pub fn matches(&self, row: usize) -> bool {
+        !self.query.is_empty()
+            && self
+                .at(row)
+                .is_some_and(|offer| format::contains_ci(&offer.label, &self.query))
+    }
+
+    pub fn match_count(&self) -> usize {
+        (0..self.rows()).filter(|&row| self.matches(row)).count()
+    }
+
+    /// The offers a narrowed bulk row would create — those matching the search, or all
+    /// of them when nothing is being searched for.
+    fn matching(&self) -> Vec<&Handoff> {
+        if self.query.is_empty() {
+            return self.options.iter().collect();
+        }
+        (0..self.rows())
+            .filter(|&row| self.matches(row))
+            .filter_map(|row| self.at(row))
+            .collect()
+    }
+
+    /// Moves the cursor to the first match at or after `start`, wrapping once. A row
+    /// that still matches keeps the cursor where it is, so typing more of a word never
+    /// walks away from what's already found.
+    fn focus_match_from(&mut self, start: usize) {
+        let rows = self.rows();
+        if self.query.is_empty() || rows == 0 {
+            return;
+        }
+        if let Some(row) = (0..rows)
+            .map(|step| (start + step) % rows)
+            .find(|&row| self.matches(row))
+        {
+            self.selected = row;
+        }
+    }
+
+    /// Next/previous match, wrapping — what ↑/↓ mean while a search is running, the
+    /// same as in the tables and the log.
+    fn jump_match(&mut self, delta: i32) {
+        let hits: Vec<usize> = (0..self.rows()).filter(|&row| self.matches(row)).collect();
+        if hits.is_empty() {
+            return;
+        }
+        let current = hits
+            .iter()
+            .position(|&row| row >= self.selected)
+            .unwrap_or(0) as i32;
+        let next = if delta > 0 && hits.get(current as usize) == Some(&self.selected) {
+            current + delta
+        } else if delta > 0 {
+            current
+        } else {
+            current + delta
+        };
+        self.selected = hits[next.rem_euclid(hits.len() as i32) as usize];
     }
 
     /// How many rows are shown, including the bulk row.
@@ -1769,12 +1844,31 @@ impl App {
             return;
         };
         match code {
+            // While searching, the arrows step between hits — the list is still all
+            // there, and PgUp/PgDn stay the way through it row by row.
+            KeyCode::Up if !picker.query.is_empty() => picker.jump_match(-1),
+            KeyCode::Down if !picker.query.is_empty() => picker.jump_match(1),
             KeyCode::Up => picker.move_selection(-1),
             KeyCode::Down => picker.move_selection(1),
             KeyCode::PageUp => picker.move_selection(-PAGE_ROWS),
             KeyCode::PageDown => picker.move_selection(PAGE_ROWS),
             KeyCode::Enter => self.create_from_handoff(),
+            KeyCode::Backspace => {
+                picker.query.pop();
+                let from = picker.selected;
+                picker.focus_match_from(from);
+            }
+            // Esc drops the search before it drops the picker, same as everywhere else
+            // — one key, one level at a time.
+            KeyCode::Esc if !picker.query.is_empty() => picker.query.clear(),
             KeyCode::Esc => *slot = None,
+            // Typing searches straight away; there's no mode to enter first, and the
+            // picker has no other use for letters.
+            KeyCode::Char(c) => {
+                picker.query.push(c);
+                let from = picker.selected;
+                picker.focus_match_from(from);
+            }
             _ => {}
         }
     }
@@ -1789,8 +1883,9 @@ impl App {
         let Some(picker) = slot else {
             return;
         };
-        // The bulk row creates one execution per finding; any other row creates the one
-        // it names. Both go through the same path.
+        // The bulk row creates one execution per finding — every finding, or, with a
+        // search running, the ones it matches, which is what its label promises at that
+        // moment. Any other row creates the one it names. Both go through the same path.
         let chosen: Vec<Handoff> = match picker.at(picker.selected) {
             Some(handoff) => vec![Handoff {
                 label: handoff.label.clone(),
@@ -1798,8 +1893,8 @@ impl App {
                 params: handoff.params.clone(),
             }],
             None => picker
-                .options
-                .iter()
+                .matching()
+                .into_iter()
                 .map(|handoff| Handoff {
                     label: handoff.label.clone(),
                     tool: handoff.tool,

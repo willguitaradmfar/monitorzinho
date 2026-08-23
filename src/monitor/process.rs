@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::Instant;
 
 use sysinfo::{Pid, Process};
 
-use super::ports::{record_traffic, socket_inodes, socket_table};
+use super::ports::{listening_port_set, record_traffic, socket_inodes, socket_table};
 use super::resolve::user_name;
 use super::{Danger, Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow};
 use crate::format;
@@ -526,8 +526,14 @@ fn sockets_section(pid: u32) -> Option<(DetailSection, Vec<Handoff>)> {
     }
 
     let mut section = DetailSection::new("Rede");
-    let listening: Vec<&&super::ports::SocketRow> =
-        mine.iter().filter(|row| row.is_listening()).collect();
+    // Deduped by protocol and port: a service bound on both families is two sockets to
+    // the kernel and one port to a reader — and, further down, one offer rather than
+    // the same tunnel proposed twice.
+    let mut seen = HashSet::new();
+    let listening: Vec<&&super::ports::SocketRow> = mine
+        .iter()
+        .filter(|row| row.is_listening() && seen.insert((row.proto, row.local_port)))
+        .collect();
     if !listening.is_empty() {
         section.push(
             "Escutando",
@@ -560,10 +566,12 @@ fn sockets_section(pid: u32) -> Option<(DetailSection, Vec<Handoff>)> {
     }
 
     // A port this process is listening on is a tunnel's whole configuration, the same
-    // way one of its own rows is on the Ports panel.
+    // way one of its own rows is on the Ports panel. Built through one shared set of
+    // taken ports so no two of them ask to listen on the same number.
+    let mut taken = listening_port_set(&table);
     let handoffs = listening
         .iter()
-        .flat_map(|row| record_traffic(row.proto, row.local_port, &table))
+        .flat_map(|row| record_traffic(row.proto, row.local_port, &mut taken))
         .collect();
     Some((section, handoffs))
 }

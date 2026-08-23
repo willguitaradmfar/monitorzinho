@@ -36,3 +36,22 @@ pub fn human_duration(seconds: u64) -> String {
         format!("{secs}s")
     }
 }
+
+/// Case-insensitive substring search over ASCII, returning a byte offset. Comparing
+/// raw bytes keeps the returned index valid for slicing: an ASCII byte can never match
+/// a UTF-8 continuation byte, so a match can only ever start and end on a character
+/// boundary. What gets searched here is addresses, commands and protocol text rather
+/// than prose, so folding by byte is both correct enough and free — a Unicode-aware
+/// fold would allocate on every line of a log that redraws several times a second.
+pub fn find_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let (hay, need) = (haystack.as_bytes(), needle.as_bytes());
+    if need.is_empty() || hay.len() < need.len() || from > hay.len() - need.len() {
+        return None;
+    }
+    (from..=hay.len() - need.len()).find(|&i| hay[i..i + need.len()].eq_ignore_ascii_case(need))
+}
+
+/// Whether `needle` appears anywhere in `haystack`, ignoring case.
+pub fn contains_ci(haystack: &str, needle: &str) -> bool {
+    find_ci(haystack, needle, 0).is_some()
+}

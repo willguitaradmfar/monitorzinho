@@ -132,6 +132,16 @@ the same conversation now goes through something that writes it down. A
 listening port offers a tunnel that records what it receives, on the first free
 port above it; an interface offers a sweep of the network it's on.
 
+The picker searches, too: type and it finds, which matters most on the offers
+that come from a tool's log — a sweep of a /24 comes back with a hundred
+addresses and the one you want is somewhere in the middle. It never hides a row.
+This is a list of things about to be *acted* on, with an "all of them at once"
+row sitting at the top of it, so quietly narrowing what "all" means is how you
+end up with forty executions you never saw. The cursor moves to the match and
+marks it in place, `↑`/`↓` step between hits, `Esc` drops the search before it
+drops the picker — and where a narrowed "all" is genuinely what you want, the
+bulk row says so in as many words: "the 4 matching «5432»".
+
 ### Ferramentas — the tools
 
 Things monitorzinho runs, rather than watches. An execution keeps working while
@@ -322,6 +332,7 @@ at it properly.
 | `Ctrl+L`, `End` | an execution's log | clear the scrollback, jump back to the live edge |
 | `Ctrl+P` | a detail view | turn what's on screen into an execution — a tunnel to either end of a connection, a recording of a port, a sweep of an interface's network |
 | `Ctrl+P` | an execution's log | turn what it found into new executions — one, or all of them |
+| any letter | the `Ctrl+P` picker | search the offers; the cursor moves to the match, nothing is hidden |
 | `Esc` | anywhere | back one level (clears a search first) |
 | `Enter` / `Esc` | a confirmation | go through with it / leave it alone — no other key answers |
 | `q` | a fullscreened chart or detail | close it and go back (in a table, `q` is search input like any other letter) |
