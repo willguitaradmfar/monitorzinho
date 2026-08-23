@@ -16,7 +16,7 @@ use crate::app::{
 };
 use crate::format;
 use crate::history::History;
-use crate::monitor::{Detail, Monitor, TableRow};
+use crate::monitor::{Danger, Detail, Monitor, TableRow};
 use crate::tools::rewrite::{self, Rule};
 use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, Stage, State, lock_log};
 
@@ -98,7 +98,15 @@ fn hint_line(text: &str) -> Line<'static> {
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    render_screen(frame, area, app);
+    // Drawn last and over everything: a question about something irreversible has no
+    // business sharing the screen with the thing it's about to do.
+    if let Some(pending) = &app.pending {
+        render_confirm(frame, area, &pending.danger);
+    }
+}
 
+fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
     match &app.focus {
         Focus::Chart(idx) => {
             render_panel(
@@ -117,12 +125,19 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         Focus::Table(table_focus) => {
             let monitor = app.table_monitors[table_focus.table_index].as_ref();
+            let danger = app.selected_danger();
             render_fullscreen_table(
                 frame,
                 area,
                 monitor.title(),
                 monitor.headers(),
-                monitor.has_detail(),
+                TableChrome {
+                    has_detail: monitor.has_detail(),
+                    // Asked of the rows rather than of the monitor: the two top-N
+                    // tables are trees only when fullscreened, which is exactly here.
+                    is_tree: table_focus.rows.iter().any(|row| row.child_count > 0),
+                    danger: danger.as_ref().map(|danger| danger.action),
+                },
                 table_focus,
             );
             return;
@@ -153,6 +168,49 @@ pub fn render(frame: &mut Frame, app: &App) {
         Tab::Processes => render_processes_tab(frame, sections[1], app),
         Tab::Tools => render_tools_tab(frame, sections[1], app),
     }
+}
+
+/// The stop-and-read box for anything that can't be undone: what is about to happen,
+/// spelled out, and two keys — one that goes through with it, one that doesn't.
+///
+/// Red rather than the usual cyan, and it never picks a default: Enter is the only key
+/// that acts, Esc is the only key that cancels, and everything else is ignored so a
+/// keystroke aimed at the screen underneath can't answer a question it never saw.
+fn render_confirm(frame: &mut Frame, area: Rect, danger: &Danger) {
+    let width = CONFIRM_WIDTH.min(area.width);
+    let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
+
+    let mut lines = vec![Line::raw("")];
+    for line in &danger.lines {
+        for (i, chunk) in wrap(line, text_width).into_iter().enumerate() {
+            lines.push(Line::styled(
+                format!("{}{chunk}", if i == 0 { "   • " } else { "     " }),
+                Style::default().fg(palette::DIM),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "   Enter faz agora. Esc deixa como está.",
+        Style::default().fg(palette::YELLOW),
+    ));
+
+    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let box_area = centered(area, width, height);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {} ", danger.title),
+            Style::default()
+                .fg(palette::RED)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::RED))
+        .title_bottom(hint_line("Enter confirmar · Esc cancelar"));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Slim header showing the two tabs (the active one highlighted), plus the app
@@ -190,11 +248,15 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
+        // The panel keys are only on the tabs that have panels — the Ferramentas tab
+        // has its own footer, and offering "1-9 ampliar" over a list that can't be
+        // fullscreened is the sort of hint that sends someone hunting for a bug.
+        let keys = match app.tab {
+            Tab::Tools => "Tab/Shift+Tab alternar aba · Ctrl+C 2x sair",
+            _ => "1-9/letras ampliar painel · espaço atualizar · Tab/Shift+Tab alternar aba · Ctrl+C 2x sair",
+        };
         Paragraph::new(Line::styled(
-            format!(
-                " v{} · Tab/Shift+Tab alternar aba · Ctrl+C 2x sair ",
-                env!("CARGO_PKG_VERSION")
-            ),
+            format!(" v{} · {keys} ", env!("CARGO_PKG_VERSION")),
             Style::default().fg(palette::DIM),
         ))
     }
@@ -215,7 +277,7 @@ fn render_overview_tab(frame: &mut Frame, area: Rect, app: &App) {
 /// connected next to what they're connected to) — matches
 /// `monitor::all_table_monitors()`'s order.
 fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
-    if app.table_monitors.len() < 6 {
+    if app.table_monitors.len() < 7 {
         return;
     }
 
@@ -233,9 +295,15 @@ fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(rows[0]);
+    // Three across the bottom: sessions, interfaces and the machine itself are all
+    // short lists, and the alternative is a fourth full-width row of mostly blank.
     let bottom_row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .constraints([
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ])
         .split(rows[3]);
 
     let panels = [
@@ -245,6 +313,7 @@ fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
         rows[2],
         bottom_row[0],
         bottom_row[1],
+        bottom_row[2],
     ];
     for (i, &panel_area) in panels.iter().enumerate() {
         let monitor = app.table_monitors[i].as_ref();
@@ -449,6 +518,14 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
             Constraint::Length(22),
         ],
         ["Field", "Value"] => vec![Constraint::Length(10), Constraint::Fill(1)],
+        ["Iface", "State", "Address", "Rate"] => vec![
+            // Wide enough for a docker bridge's generated name, which is the longest
+            // interface name anyone actually meets.
+            Constraint::Length(16),
+            Constraint::Length(10),
+            Constraint::Fill(1),
+            Constraint::Length(21),
+        ],
         ["User", "Host", "TTY", "Time", "Folder", "Command"] => vec![
             Constraint::Length(10),
             Constraint::Length(16),
@@ -531,14 +608,27 @@ fn render_table_panel(
     frame.render_widget(table, inner);
 }
 
+/// What the footer of a fullscreened table is allowed to offer — every part of it
+/// depends on the table underneath, and a hint for a key that does nothing there is
+/// worse than no hint at all.
+struct TableChrome {
+    has_detail: bool,
+    /// Whether any row has children. `←`/`→` collapse and expand a tree; on a flat
+    /// table they do nothing at all.
+    is_tree: bool,
+    /// What `Del` does here, in a word, or `None` where it does nothing — a table of
+    /// interfaces has no process to kill.
+    danger: Option<&'static str>,
+}
+
 /// Fullscreen view of a frozen table: same columns as the overview panel, plus a
-/// selectable/highlighted row and a footer hint for navigate/kill/back.
+/// selectable/highlighted row and a footer built from what this particular table can do.
 fn render_fullscreen_table(
     frame: &mut Frame,
     area: Rect,
     title: &str,
     headers: &[&str],
-    has_detail: bool,
+    chrome: TableChrome,
     table_focus: &TableFocus,
 ) {
     let title = if table_focus.query.is_empty() {
@@ -550,17 +640,35 @@ fn render_fullscreen_table(
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN));
-    let hint = if table_focus.query.is_empty() {
-        "↑/↓ navegar · ←/→ colapsar/expandir · Del matar (SIGKILL, com filhos) · digite p/ buscar · Esc voltar"
+
+    let mut parts: Vec<String> = Vec::new();
+    if chrome.has_detail {
+        parts.push("Enter detalhar".to_string());
+    }
+    if table_focus.query.is_empty() {
+        parts.push("↑/↓ navegar".to_string());
+        parts.push("PgUp/PgDn saltar".to_string());
+        if chrome.is_tree {
+            parts.push("←/→ colapsar/expandir".to_string());
+        }
+        if let Some(action) = chrome.danger {
+            parts.push(format!("Del {action}"));
+        }
+        parts.push("digite p/ buscar".to_string());
+        parts.push("Esc voltar".to_string());
     } else {
-        "↑/↓ ir ao próximo/anterior resultado · ←/→ colapsar/expandir · Del matar (SIGKILL, com filhos) · Esc limpar busca"
-    };
-    // Advertised only where Enter actually leads somewhere — see `TableMonitor::has_detail`.
-    let hint = if has_detail {
-        format!("Enter detalhar · {hint}")
-    } else {
-        hint.to_string()
-    };
+        // With a search running the arrows jump between hits, so they're described as
+        // what they do now rather than as what they do the rest of the time.
+        parts.push("↑/↓ e PgUp/PgDn ir ao resultado anterior/próximo".to_string());
+        if chrome.is_tree {
+            parts.push("←/→ colapsar/expandir".to_string());
+        }
+        if let Some(action) = chrome.danger {
+            parts.push(format!("Del {action}"));
+        }
+        parts.push("Esc limpar busca".to_string());
+    }
+    let hint = parts.join(" · ");
     block = block.title_bottom(hint_line(&hint));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -726,7 +834,7 @@ fn render_detail(frame: &mut Frame, area: Rect, focus: &DetailFocus) {
     // known state of a connection that just closed is usually the interesting one.
     let (title, color) = if focus.gone {
         (
-            format!(" {} — encerrada ", focus.detail.title),
+            format!(" {} — {} ", focus.detail.title, focus.detail.gone_note),
             palette::DIM,
         )
     } else {
@@ -753,8 +861,8 @@ fn render_detail(frame: &mut Frame, area: Rect, focus: &DetailFocus) {
         return;
     }
 
-    let body = match focus.detail.rates {
-        Some((down, up)) => {
+    let body = match &focus.detail.rates {
+        Some(rates) => {
             let split = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(RATE_PANEL_HEIGHT), Constraint::Min(0)])
@@ -766,12 +874,19 @@ fn render_detail(frame: &mut Frame, area: Rect, focus: &DetailFocus) {
             render_rate(
                 frame,
                 cols[0],
-                "↓ Recebendo",
-                down,
+                rates.labels.0,
+                rates.values.0,
                 &focus.down,
                 palette::GREEN,
             );
-            render_rate(frame, cols[1], "↑ Enviando", up, &focus.up, palette::BLUE);
+            render_rate(
+                frame,
+                cols[1],
+                rates.labels.1,
+                rates.values.1,
+                &focus.up,
+                palette::BLUE,
+            );
             split[1]
         }
         None => inner,
@@ -816,13 +931,18 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// The Ferramentas tab: every execution the user has started, live. Nothing is sampled
 /// here — the counters are atomics the tools' own threads keep updating.
 fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
+    // Every other key on this tab acts on a selected row, so with no rows there is
+    // exactly one thing to offer.
+    let hint = if app.tools.executions.is_empty() {
+        "a adicionar uma execução"
+    } else {
+        "a adicionar · Enter monitorar · e editar · r reiniciar · Del remover · ↑/↓ e PgUp/PgDn navegar"
+    };
     let block = Block::default()
         .title(" Execuções ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN))
-        .title_bottom(hint_line(
-            "a adicionar · Enter monitorar · e editar · r reiniciar · Del remover · ↑/↓ navegar",
-        ));
+        .title_bottom(hint_line(hint));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -910,22 +1030,44 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
     let (subtitle, hint) = match wizard.step {
         WizardStep::SelectTool => (
             "escolher ferramenta".to_string(),
-            "↑/↓ escolher · Enter continuar · Esc cancelar",
+            "↑/↓ escolher · Enter continuar · Esc cancelar".to_string(),
         ),
         WizardStep::Params => (
             tool.map(|t| t.name().to_string()).unwrap_or_default(),
-            if editing {
-                "↑/↓ campo · ←/→ alternar opção · digite para editar · Enter continuar · Esc descartar"
-            } else {
-                "↑/↓ campo · ←/→ alternar opção · digite para editar · Enter continuar · Esc voltar"
+            // Built around the field that's focused: ←/→ do nothing on a text field,
+            // typing does nothing on a choice, and on a rules field Enter opens a list
+            // instead of moving the wizard along.
+            {
+                let mut parts = vec!["↑/↓ campo"];
+                match wizard
+                    .fields
+                    .get(wizard.field)
+                    .map(|field| &field.spec.kind)
+                {
+                    Some(ParamKind::Choice(_)) => {
+                        parts.push("←/→ alternar opção");
+                        parts.push("Enter continuar");
+                    }
+                    Some(ParamKind::Rules) => parts.push("Enter abre a lista de regras"),
+                    _ => {
+                        parts.push("digite para editar");
+                        parts.push("Enter continuar");
+                    }
+                }
+                parts.push(if editing {
+                    "Esc descartar"
+                } else {
+                    "Esc voltar"
+                });
+                parts.join(" · ")
             },
         ),
         WizardStep::Confirm => (
             "confirmar".to_string(),
             if editing {
-                "Enter aplica as mudanças · Esc voltar"
+                "Enter aplica as mudanças · Esc voltar".to_string()
             } else {
-                "Enter inicia a execução · Esc voltar"
+                "Enter inicia a execução · Esc voltar".to_string()
             },
         ),
     };
@@ -952,7 +1094,7 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
         .title(format!(" {heading} — {subtitle} "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::PURPLE))
-        .title_bottom(hint_line(hint));
+        .title_bottom(hint_line(&hint));
     let inner = block.inner(box_area);
     frame.render_widget(Clear, box_area);
     frame.render_widget(block, box_area);
@@ -962,9 +1104,16 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
 /// The rewrite rules of one execution, plus the shared history to pull from.
 fn render_rules(frame: &mut Frame, area: Rect, editor: &RulesEditor) {
     let (subtitle, hint) = match &editor.mode {
+        // With no rules written yet there is nothing to move between, edit or remove —
+        // the only keys that do anything are the two that put something in the list.
+        RulesMode::List if editor.rules.is_empty() => (
+            "regex/replace",
+            "a nova regra · h histórico · Esc concluir".to_string(),
+        ),
         RulesMode::List => (
             "regex/replace",
-            "a nova · e editar · h histórico · Del remover · Esc concluir",
+            "↑/↓ e PgUp/PgDn escolher · a nova · e ou Enter editar · h histórico · Del remover · Esc concluir"
+                .to_string(),
         ),
         RulesMode::Edit { editing, .. } => (
             if editing.is_some() {
@@ -972,11 +1121,16 @@ fn render_rules(frame: &mut Frame, area: Rect, editor: &RulesEditor) {
             } else {
                 "nova regra"
             },
-            "Tab/↑/↓ trocar de linha · Enter salvar · Esc cancelar",
+            "Tab/↑/↓ trocar de linha · Enter salvar · Esc cancelar".to_string(),
+        ),
+        RulesMode::History { entries, .. } if entries.is_empty() => (
+            "histórico de regras",
+            "Esc voltar".to_string(),
         ),
         RulesMode::History { .. } => (
             "histórico de regras",
-            "↑/↓ escolher · Enter usar nesta execução · Del apagar do histórico · Esc voltar",
+            "↑/↓ e PgUp/PgDn escolher · Enter usar nesta execução · Del apagar do histórico · Esc voltar"
+                .to_string(),
         ),
     };
 
@@ -1010,7 +1164,7 @@ fn render_rules(frame: &mut Frame, area: Rect, editor: &RulesEditor) {
         .title(format!(" {subtitle} "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN))
-        .title_bottom(hint_line(hint));
+        .title_bottom(hint_line(&hint));
     let inner = block.inner(box_area);
     frame.render_widget(Clear, box_area);
     frame.render_widget(block, box_area);
@@ -1171,6 +1325,9 @@ fn wizard_tool_lines(app: &App, wizard: &ToolWizard, text_width: usize) -> Vec<L
 /// Label column for the parameter form, wide enough for the longest label any tool
 /// currently declares.
 const PARAM_LABEL_WIDTH: usize = 20;
+/// Narrower than the wizard: a confirmation is a short question, and a wide box for
+/// three lines reads as a form to fill in rather than a thing to answer.
+const CONFIRM_WIDTH: u16 = 76;
 const WIZARD_WIDTH: u16 = 92;
 /// Borders plus the indent the wizard's prose sits at — subtracted from the box width
 /// to get the column that help text and descriptions wrap to.
@@ -1622,7 +1779,9 @@ fn render_handoffs(frame: &mut Frame, area: Rect, picker: &HandoffPicker) {
         .title(format!(" {} ", picker.title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN))
-        .title_bottom(hint_line("↑/↓ escolher · Enter criar · Esc voltar"));
+        .title_bottom(hint_line(
+            "↑/↓ e PgUp/PgDn escolher · Enter criar · Esc voltar",
+        ));
     let inner = block.inner(box_area);
     frame.render_widget(Clear, box_area);
     frame.render_widget(block, box_area);
@@ -1648,11 +1807,21 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
         return;
     };
 
-    let hint = if monitor.query.is_empty() {
+    let mut hint = if monitor.query.is_empty() {
         "digite p/ buscar · Tab hex · Ctrl+L limpar · ↑/↓ e PgUp/PgDn rolar · End seguir · Esc voltar"
+            .to_string()
     } else {
         "↑/↓ resultado anterior/próximo · Ctrl+F filtrar · Tab hex · Ctrl+L limpar log · End seguir · Esc limpar busca"
+            .to_string()
     };
+    // Offered only once this execution has found something to hand over: on a tunnel,
+    // or on a scan that hasn't run yet, Ctrl+P opens nothing.
+    if app
+        .tool_for(execution)
+        .is_some_and(|tool| !tool.handoffs(execution).is_empty())
+    {
+        hint = format!("Ctrl+P criar execução · {hint}");
+    }
     // The borders are drawn only once the title is known, and the title carries the
     // match count — so the inner area comes from the same block shape up front.
     let outer = Block::default().borders(Borders::ALL);

@@ -6,10 +6,11 @@ use std::time::Instant;
 
 use sysinfo::Pid;
 
+use super::iface;
 use super::ports::inode_to_pid;
-use super::process::{command_of, describe_owner};
+use super::process::{command_of, describe_owner, kill_danger};
 use super::resolve::{Lookup, Resolver, Services, user_name};
-use super::{Detail, DetailSection, SystemState, TableMonitor, TableRow};
+use super::{Danger, Detail, DetailSection, Rates, SystemState, TableMonitor, TableRow};
 use crate::format;
 use crate::tools::Handoff;
 
@@ -649,6 +650,11 @@ impl ConnectionsMonitor {
             ),
         );
         conn.push("Local", self.with_service(c, c.local_port, c.local()));
+        // Which card the connection is actually on. On a machine with a VPN and a
+        // handful of bridges, the local address alone doesn't say.
+        if let Some(interface) = iface::interface_of(&state.networks, &c.local_ip) {
+            conn.push("Interface", interface);
+        }
         conn.push("Remoto", self.with_service(c, c.remote_port, c.remote()));
         conn.push("Host remoto", host);
         if let Some(timer) = timer_name(c.timer) {
@@ -746,11 +752,16 @@ impl ConnectionsMonitor {
 
         Detail {
             title: format!("{proto} {} → {}", c.local(), c.remote()),
+            gone_note: "encerrada",
             sections,
             // A flat zero line would be worse than no sparkline at all, and UDP never
             // reports bytes.
-            rates: is_tcp.then_some((down, up)),
+            rates: is_tcp.then_some(Rates {
+                labels: ("↓ Recebendo", "↑ Enviando"),
+                values: (down, up),
+            }),
             handoffs: tunnels(c, proto),
+            handoff_title: "Túnel a partir desta conexão",
         }
     }
 
@@ -948,6 +959,24 @@ impl TableMonitor for ConnectionsMonitor {
 
     fn has_detail(&self) -> bool {
         true
+    }
+
+    /// The row is one socket, but the key kills the process holding it — which usually
+    /// holds others too. Said plainly here, because "Del" over a list of connections
+    /// reads as "close this connection".
+    fn danger(&self, state: &SystemState, row: &TableRow) -> Option<Danger> {
+        kill_danger(
+            state,
+            row,
+            "matar o dono",
+            "Matar o processo dono desta conexão",
+            vec![
+                format!("Esta conexão ({}) cai junto.", row.key),
+                "O processo costuma ter outras conexões abertas — todas caem com ele, \
+                 não só a que está selecionada."
+                    .to_string(),
+            ],
+        )
     }
 
     fn detail(&mut self, state: &SystemState, row: &TableRow) -> Option<Detail> {

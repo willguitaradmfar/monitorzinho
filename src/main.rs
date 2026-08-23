@@ -102,6 +102,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 app.quit_armed = false;
 
                 match key.code {
+                    // A destructive action waiting to be confirmed sits above every
+                    // screen, including the rules one — nothing underneath may act on
+                    // the key that answers it.
+                    code if app.confirm_open() => app.confirm_key(code),
                     // The rules screen sits on top of the wizard and takes every key,
                     // including Esc and 'q': in its Edit mode they're just characters.
                     code if app.rules_editor_open() => app.rules_key(code),
@@ -141,6 +145,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     KeyCode::Enter if matches!(app.focus, Focus::Wizard(_)) => app.wizard_advance(),
                     KeyCode::Up if matches!(app.focus, Focus::Wizard(_)) => app.wizard_move(-1),
                     KeyCode::Down if matches!(app.focus, Focus::Wizard(_)) => app.wizard_move(1),
+                    // A form is shorter than a page, so these land on its first and last
+                    // field — which is exactly what a fast move through a form means.
+                    KeyCode::PageUp if matches!(app.focus, Focus::Wizard(_)) => {
+                        app.wizard_move(-app::PAGE_ROWS);
+                    }
+                    KeyCode::PageDown if matches!(app.focus, Focus::Wizard(_)) => {
+                        app.wizard_move(app::PAGE_ROWS);
+                    }
                     KeyCode::Left if matches!(app.focus, Focus::Wizard(_)) => app.wizard_cycle(-1),
                     KeyCode::Right if matches!(app.focus, Focus::Wizard(_)) => app.wizard_cycle(1),
                     KeyCode::Backspace if matches!(app.focus, Focus::Wizard(_)) => {
@@ -200,11 +212,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     // panels, so its letters are free for its own bindings.
                     KeyCode::Char('a') if on_tools_tab(&app) => app.open_wizard(),
                     KeyCode::Enter if on_tools_tab(&app) => app.open_tool_monitor(),
-                    KeyCode::Delete if on_tools_tab(&app) => app.remove_selected_execution(),
+                    KeyCode::Delete if on_tools_tab(&app) => app.request_remove_execution(),
                     KeyCode::Char('e') if on_tools_tab(&app) => app.edit_selected_execution(),
                     KeyCode::Char('r') if on_tools_tab(&app) => app.restart_selected_execution(),
                     KeyCode::Up if on_tools_tab(&app) => app.move_tool_selection(-1),
                     KeyCode::Down if on_tools_tab(&app) => app.move_tool_selection(1),
+                    KeyCode::PageUp if on_tools_tab(&app) => {
+                        app.move_tool_selection(-app::PAGE_ROWS);
+                    }
+                    KeyCode::PageDown if on_tools_tab(&app) => {
+                        app.move_tool_selection(app::PAGE_ROWS);
+                    }
                     KeyCode::Tab if matches!(app.focus, Focus::None) => app.next_tab(),
                     KeyCode::BackTab if matches!(app.focus, Focus::None) => app.prev_tab(),
                     // Like top's spacebar: force an immediate refresh without waiting for
@@ -229,11 +247,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     }
                     KeyCode::Up if matches!(app.focus, Focus::Table(_)) => app.move_selection(-1),
                     KeyCode::Down if matches!(app.focus, Focus::Table(_)) => app.move_selection(1),
+                    KeyCode::PageUp if matches!(app.focus, Focus::Table(_)) => {
+                        app.page_selection(-app::PAGE_ROWS);
+                    }
+                    KeyCode::PageDown if matches!(app.focus, Focus::Table(_)) => {
+                        app.page_selection(app::PAGE_ROWS);
+                    }
                     KeyCode::Right if matches!(app.focus, Focus::Table(_)) => app.expand_selected(),
                     KeyCode::Left if matches!(app.focus, Focus::Table(_)) => {
                         app.collapse_selected()
                     }
-                    KeyCode::Delete if matches!(app.focus, Focus::Table(_)) => app.kill_selected(),
+                    KeyCode::Delete if matches!(app.focus, Focus::Table(_)) => {
+                        app.request_kill_selected();
+                    }
                     KeyCode::Backspace if matches!(app.focus, Focus::Table(_)) => {
                         app.search_backspace();
                     }

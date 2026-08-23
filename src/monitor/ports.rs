@@ -1,27 +1,105 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use sysinfo::Pid;
 
-use super::process::describe_owner;
-use super::{SystemState, TableMonitor, TableRow};
+use super::iface;
+use super::process::{describe_owner, kill_danger, owner_section};
+use super::resolve::{Services, user_name};
+use super::{Danger, Detail, DetailSection, SystemState, TableMonitor, TableRow};
+use crate::tools::Handoff;
 
 /// TCP_LISTEN, per include/net/tcp_states.h — shared by /proc/net/tcp{,6}.
-const TCP_LISTEN: &str = "0A";
+const TCP_LISTEN: u8 = 0x0A;
 /// TCP_CLOSE, reused by the kernel as the "unconnected" state for a bound UDP socket
 /// (UDP has no real LISTEN state) — /proc/net/udp{,6}.
-const UDP_UNCONN: &str = "07";
+const UDP_UNCONN: u8 = 0x07;
+pub(super) const TCP_ESTABLISHED: u8 = 0x01;
 
 const HEADERS: [&str; 4] = ["Proto", "Port", "Process", "Age"];
 
-struct PortEntry {
-    port: u16,
-    inode: u64,
+/// The four kernel socket tables, each tagged with what a row in it means. Read
+/// together everywhere here: a service bound on both families is one port to a reader,
+/// however many sockets it is to the kernel.
+const TABLES: [(&str, &str, &str); 4] = [
+    ("TCP", "IPv4", "/proc/net/tcp"),
+    ("TCP", "IPv6", "/proc/net/tcp6"),
+    ("UDP", "IPv4", "/proc/net/udp"),
+    ("UDP", "IPv6", "/proc/net/udp6"),
+];
+
+/// One row of a `/proc/net/{tcp,udp}[6]` table.
+///
+/// These tables are the cheap, always-readable view of the socket world — no netlink,
+/// no privileges — which is why three panels read them for three different questions:
+/// which ports are listening, which sockets a process holds, and where a login came
+/// from. Parsed once into this shape rather than three times into three.
+pub(super) struct SocketRow {
+    pub proto: &'static str,
+    pub family: &'static str,
+    pub local_ip: String,
+    pub local_port: u16,
+    pub remote_ip: String,
+    pub remote_port: u16,
+    /// Raw `tcp_states.h` value. UDP reuses the same numbers loosely — see `UDP_UNCONN`.
+    pub state: u8,
+    pub uid: u32,
+    pub inode: u64,
+    /// For a listening TCP socket the kernel puts the accept backlog here (how many
+    /// established connections are waiting for the process to call `accept`), not a
+    /// byte count. For everything else it's bytes queued.
+    pub rx_queue: u64,
+    pub tx_queue: u64,
 }
 
-/// Ports (with their socket inode) found in a `/proc/net/{tcp,udp}[6]` table whose
-/// state field matches `want_state`.
-fn parse_ports(path: &str, want_state: &str) -> Vec<PortEntry> {
+impl SocketRow {
+    pub fn is_listening(&self) -> bool {
+        (self.proto == "TCP" && self.state == TCP_LISTEN)
+            || (self.proto == "UDP" && self.state == UDP_UNCONN)
+    }
+
+    /// `192.168.0.10:443`, bracketing IPv6 so the port stays legible.
+    pub fn local(&self) -> String {
+        endpoint(&self.local_ip, self.local_port)
+    }
+
+    pub fn remote(&self) -> String {
+        endpoint(&self.remote_ip, self.remote_port)
+    }
+}
+
+pub(super) fn endpoint(ip: &str, port: u16) -> String {
+    if ip.contains(':') {
+        format!("[{ip}]:{port}")
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+/// Parses one address field, `<hex address>:<hex port>`. The kernel prints each 32-bit
+/// word host-endian, so an IPv4 address comes back with its octets reversed and an IPv6
+/// address with each of its four words reversed — recovering both means reading the
+/// words back little-endian rather than the more obvious big-endian.
+fn parse_endpoint(field: &str) -> Option<(String, u16)> {
+    let (addr, port) = field.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let ip = match addr.len() {
+        8 => Ipv4Addr::from(u32::from_str_radix(addr, 16).ok()?.to_le_bytes()).to_string(),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for (i, word) in addr.as_bytes().chunks(8).enumerate() {
+                let word = u32::from_str_radix(std::str::from_utf8(word).ok()?, 16).ok()?;
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            Ipv6Addr::from(bytes).to_string()
+        }
+        _ => return None,
+    };
+    Some((ip, port))
+}
+
+fn parse_table(proto: &'static str, family: &'static str, path: &str) -> Vec<SocketRow> {
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -30,29 +108,42 @@ fn parse_ports(path: &str, want_state: &str) -> Vec<PortEntry> {
         .skip(1)
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let local = fields.get(1)?;
-            let state = fields.get(3)?;
-            let inode = fields.get(9)?;
-            if !state.eq_ignore_ascii_case(want_state) {
-                return None;
-            }
-            let port_hex = local.rsplit(':').next()?;
-            Some(PortEntry {
-                port: u16::from_str_radix(port_hex, 16).ok()?,
-                inode: inode.parse().ok()?,
+            let (local_ip, local_port) = parse_endpoint(fields.get(1)?)?;
+            let (remote_ip, remote_port) = parse_endpoint(fields.get(2)?)?;
+            let (tx_queue, rx_queue) = fields.get(4)?.split_once(':')?;
+            Some(SocketRow {
+                proto,
+                family,
+                local_ip,
+                local_port,
+                remote_ip,
+                remote_port,
+                state: u8::from_str_radix(fields.get(3)?, 16).ok()?,
+                uid: fields.get(7)?.parse().ok()?,
+                inode: fields.get(9)?.parse().ok()?,
+                rx_queue: u64::from_str_radix(rx_queue, 16).unwrap_or(0),
+                tx_queue: u64::from_str_radix(tx_queue, 16).unwrap_or(0),
             })
         })
         .collect()
 }
 
-/// Distinct local ports across the IPv4 and IPv6 tables, deduped by port (same
-/// service bound on both families shows up once), sorted ascending.
-fn collect_ports(paths: &[&str], want_state: &str) -> BTreeMap<u16, u64> {
+/// Every socket the kernel will show us, across both protocols and both families.
+pub(super) fn socket_table() -> Vec<SocketRow> {
+    TABLES
+        .iter()
+        .flat_map(|(proto, family, path)| parse_table(proto, family, path))
+        .collect()
+}
+
+/// Distinct listening ports per protocol, deduped by port (same service bound on both
+/// families shows up once) with the inode of whichever socket was seen first.
+fn listening_ports(sockets: &[SocketRow]) -> BTreeMap<(&'static str, u16), u64> {
     let mut ports = BTreeMap::new();
-    for path in paths {
-        for entry in parse_ports(path, want_state) {
-            ports.entry(entry.port).or_insert(entry.inode);
-        }
+    for row in sockets.iter().filter(|row| row.is_listening()) {
+        ports
+            .entry((row.proto, row.local_port))
+            .or_insert(row.inode);
     }
     ports
 }
@@ -70,26 +161,35 @@ pub(super) fn inode_to_pid() -> HashMap<u64, u32> {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            let Ok(link) = fs::read_link(fd.path()) else {
-                continue;
-            };
-            let Some(inode_str) = link
-                .to_str()
-                .and_then(|s| s.strip_prefix("socket:["))
-                .and_then(|s| s.strip_suffix(']'))
-            else {
-                continue;
-            };
-            if let Ok(inode) = inode_str.parse() {
-                map.entry(inode).or_insert(pid);
-            }
+        for inode in socket_inodes(pid) {
+            map.entry(inode).or_insert(pid);
         }
     }
     map
+}
+
+/// Socket inodes held open by one process — the same `/proc/<pid>/fd` walk as above,
+/// for the case where the pid is known and the sockets are the question.
+pub(super) fn socket_inodes(pid: u32) -> HashSet<u64> {
+    let mut inodes = HashSet::new();
+    let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return inodes;
+    };
+    for fd in fds.flatten() {
+        let Ok(link) = fs::read_link(fd.path()) else {
+            continue;
+        };
+        let Some(inode) = link
+            .to_str()
+            .and_then(|s| s.strip_prefix("socket:["))
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|s| s.parse().ok())
+        else {
+            continue;
+        };
+        inodes.insert(inode);
+    }
+    inodes
 }
 
 /// TCP and UDP listening ports in one list, newest first (owning process' run time
@@ -97,16 +197,10 @@ pub(super) fn inode_to_pid() -> HashMap<u64, u32> {
 /// no age to rank it by). Ties keep TCP before UDP.
 fn sample_ports(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
     let owners = inode_to_pid();
-    let mut rows: Vec<(&'static str, u16, u32)> = Vec::new();
-    for (proto, paths, want_state) in [
-        ("TCP", ["/proc/net/tcp", "/proc/net/tcp6"], TCP_LISTEN),
-        ("UDP", ["/proc/net/udp", "/proc/net/udp6"], UDP_UNCONN),
-    ] {
-        for (port, inode) in collect_ports(&paths, want_state) {
-            let pid = owners.get(&inode).copied().unwrap_or(0);
-            rows.push((proto, port, pid));
-        }
-    }
+    let mut rows: Vec<(&'static str, u16, u32)> = listening_ports(&socket_table())
+        .into_iter()
+        .map(|((proto, port), inode)| (proto, port, owners.get(&inode).copied().unwrap_or(0)))
+        .collect();
     rows.sort_by_key(|&(_, port, pid)| {
         let age = state
             .sys
@@ -120,12 +214,213 @@ fn sample_ports(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
         .take(limit.unwrap_or(usize::MAX))
         .map(|(proto, port, pid)| {
             let (process, age) = describe_owner(state, pid);
-            TableRow::leaf(vec![proto.to_string(), port.to_string(), process, age], pid)
+            let mut row =
+                TableRow::leaf(vec![proto.to_string(), port.to_string(), process, age], pid);
+            // Protocol and port, not the pid: the owner is what a port's row is *about*,
+            // but it's also the part that can be missing, change, or be shared.
+            row.key = port_key(proto, port);
+            row
         })
         .collect()
 }
 
-pub struct PortsMonitor;
+fn port_key(proto: &str, port: u16) -> String {
+    format!("{proto} {port}")
+}
+
+/// Which cards the port can be reached on. A wildcard bind is on all of them, which is
+/// the answer people are usually checking for; a bound address names exactly one.
+fn bound_interfaces(state: &SystemState, sockets: &[&SocketRow]) -> String {
+    if sockets
+        .iter()
+        .any(|row| row.local_ip == "0.0.0.0" || row.local_ip == "::")
+    {
+        let all = iface::interfaces(&state.networks);
+        let names: Vec<&str> = all
+            .iter()
+            .filter(|interface| interface.is_up() && !interface.addresses.is_empty())
+            .map(|interface| interface.name.as_str())
+            .collect();
+        return format!("todas — {}", names.join(", "));
+    }
+    let named: Vec<String> = sockets
+        .iter()
+        .filter_map(|row| {
+            let interface = iface::interface_of(&state.networks, &row.local_ip)?;
+            Some(format!("{interface} ({})", row.local_ip))
+        })
+        .collect();
+    named.join("  ·  ")
+}
+
+/// Who the port is reachable by, read from the addresses it's bound to. The distinction
+/// people actually want from this panel: a development server nobody outside can touch
+/// versus one the whole network can.
+fn reach(sockets: &[&SocketRow]) -> &'static str {
+    if sockets
+        .iter()
+        .any(|row| row.local_ip == "0.0.0.0" || row.local_ip == "::")
+    {
+        "qualquer endereço desta máquina — alcançável pela rede"
+    } else if sockets
+        .iter()
+        .all(|row| row.local_ip.starts_with("127.") || row.local_ip == "::1")
+    {
+        "só o loopback — nada de fora desta máquina chega aqui"
+    } else {
+        "endereços específicos, listados acima"
+    }
+}
+
+/// A tunnel that records everything this port receives. It can't listen on the port
+/// itself — that one is taken, by definition — so it takes the first free port above
+/// it, and the client gets pointed one number to the right.
+pub(super) fn record_traffic(proto: &str, port: u16, sockets: &[SocketRow]) -> Vec<Handoff> {
+    let taken: HashSet<u16> = sockets
+        .iter()
+        .filter(|row| row.is_listening())
+        .map(|row| row.local_port)
+        .collect();
+    let Some(listen) = (port.saturating_add(1)..=port.saturating_add(64))
+        .find(|candidate| !taken.contains(candidate))
+    else {
+        return Vec::new();
+    };
+    vec![Handoff {
+        label: format!("túnel {proto} em {listen} gravando o que iria para {port}"),
+        tool: "tunnel",
+        params: vec![
+            ("proto", proto.to_string()),
+            ("listen", format!("127.0.0.1:{listen}")),
+            ("target", format!("127.0.0.1:{port}")),
+        ],
+    }]
+}
+
+pub struct PortsMonitor {
+    services: Services,
+}
+
+impl PortsMonitor {
+    pub fn new() -> Self {
+        Self {
+            services: Services::load(),
+        }
+    }
+
+    fn build_detail(&self, state: &SystemState, proto: &str, port: u16) -> Option<Detail> {
+        let sockets = socket_table();
+        let bound: Vec<&SocketRow> = sockets
+            .iter()
+            .filter(|row| row.proto == proto && row.local_port == port && row.is_listening())
+            .collect();
+        // Nothing listening on it any more: the service stopped between two ticks.
+        let first = *bound.first()?;
+        let is_tcp = proto == "TCP";
+
+        let mut socket = DetailSection::new("Porta");
+        socket.push("Protocolo", proto);
+        socket.push(
+            "Porta",
+            match self.services.name(is_tcp, port) {
+                Some(service) => format!("{port} ({service})"),
+                None => port.to_string(),
+            },
+        );
+        socket.push(
+            "Escutando em",
+            bound
+                .iter()
+                .map(|row| format!("{} [{}]", row.local(), row.family))
+                .collect::<Vec<_>>()
+                .join("  ·  "),
+        );
+        socket.push("Alcance", reach(&bound));
+        socket.push("Interfaces", bound_interfaces(state, &bound));
+        socket.push(
+            "Dono do socket",
+            match user_name(first.uid) {
+                Some(name) => format!("{name} (uid {})", first.uid),
+                None => format!("uid {}", first.uid),
+            },
+        );
+        if is_tcp {
+            let waiting: u64 = bound.iter().map(|row| row.rx_queue).sum();
+            socket.push(
+                "Fila de accept",
+                format!("{waiting} conexão(ões) esperando o processo aceitar"),
+            );
+        }
+        socket.push(
+            "Inode",
+            bound
+                .iter()
+                .map(|row| row.inode.to_string())
+                .collect::<Vec<_>>()
+                .join(" · "),
+        );
+
+        let pid = inode_to_pid().get(&first.inode).copied().unwrap_or(0);
+        let owner = owner_section(
+            state,
+            pid,
+            "não identificado — socket de outro usuário, ou processo já encerrado",
+        );
+
+        let mut sections = vec![socket, owner];
+        if is_tcp {
+            sections.push(clients(&sockets, port));
+        }
+
+        Some(Detail {
+            title: format!("{proto} porta {port}"),
+            gone_note: "não está mais em escuta",
+            sections,
+            rates: None,
+            handoffs: record_traffic(proto, port, &sockets),
+            handoff_title: "Gravar o tráfego desta porta",
+        })
+    }
+}
+
+/// Who is connected to this port right now, grouped by peer address — a listening port
+/// with forty connections from one host and one from another is a different situation
+/// from forty separate clients, and the row above can't tell them apart.
+fn clients(sockets: &[SocketRow], port: u16) -> DetailSection {
+    let mut section = DetailSection::new("Conexões");
+    let established: Vec<&SocketRow> = sockets
+        .iter()
+        .filter(|row| row.proto == "TCP" && row.local_port == port && row.state == TCP_ESTABLISHED)
+        .collect();
+    section.push("Estabelecidas", established.len().to_string());
+
+    let mut peers: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in &established {
+        *peers.entry(row.remote_ip.as_str()).or_default() += 1;
+    }
+    let mut ranked: Vec<(&str, usize)> = peers.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    for (ip, count) in ranked.iter().take(MAX_CLIENTS) {
+        section.push(ip, format!("{count} conexão(ões)"));
+    }
+    if ranked.len() > MAX_CLIENTS {
+        section.push(
+            "E mais",
+            format!("{} outro(s) endereço(s)", ranked.len() - MAX_CLIENTS),
+        );
+    }
+    section
+}
+
+/// Peers listed individually before the tail is summarised. Enough to recognise who's
+/// talking to a service, short of turning the section into the Connections panel.
+const MAX_CLIENTS: usize = 10;
+
+impl Default for PortsMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TableMonitor for PortsMonitor {
     fn title(&self) -> &'static str {
@@ -150,5 +445,29 @@ impl TableMonitor for PortsMonitor {
                 *cell = age;
             }
         }
+    }
+
+    fn detail(&mut self, state: &SystemState, row: &TableRow) -> Option<Detail> {
+        let (proto, port) = row.key.split_once(' ')?;
+        self.build_detail(state, proto, port.parse().ok()?)
+    }
+
+    /// Del here kills the *process*, not the port — a distinction worth making before
+    /// the fact rather than after, since the row is about the port.
+    fn danger(&self, state: &SystemState, row: &TableRow) -> Option<Danger> {
+        let port = row.key.clone();
+        kill_danger(
+            state,
+            row,
+            "matar quem escuta",
+            "Matar o processo que escuta esta porta",
+            vec![format!(
+                "A porta {port} deixa de responder na hora, e qualquer cliente ligado a ela cai junto."
+            )],
+        )
+    }
+
+    fn has_detail(&self) -> bool {
+        true
     }
 }

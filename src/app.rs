@@ -7,10 +7,10 @@ use crossterm::event::KeyCode;
 use sysinfo::{Pid, Signal};
 
 use crate::history::{self, CAPACITY, History};
-use crate::monitor::{self, Detail, Monitor, SystemState, TableMonitor, TableRow};
+use crate::monitor::{self, Danger, Detail, Monitor, SystemState, TableMonitor, TableRow};
 use crate::tools::persist::ExecutionSpec;
 use crate::tools::rewrite::{self, Rule};
-use crate::tools::{self, Execution, Handoff, ParamKind, ParamSpec, Tool};
+use crate::tools::{self, Execution, Handoff, ParamKind, ParamSpec, State, Tool};
 
 /// The top-level views. Each is sampled only while it's the active tab — see
 /// `App::tick` — so switching away from one stops spending resources on it.
@@ -537,6 +537,13 @@ impl HandoffPicker {
         self.options.len() + usize::from(self.bulk)
     }
 
+    /// Moves the highlight, clamped to the ends. Shared by ↑/↓ and PgUp/PgDn — the
+    /// only difference between them is how far they ask to go.
+    fn move_selection(&mut self, delta: i32) {
+        let last = self.rows().saturating_sub(1) as i32;
+        self.selected = (self.selected as i32 + delta).clamp(0, last) as usize;
+    }
+
     /// The finding a row stands for, or `None` for the bulk row.
     pub fn at(&self, row: usize) -> Option<&Handoff> {
         match (self.bulk, row) {
@@ -550,6 +557,14 @@ impl HandoffPicker {
 /// How many lines of context are kept above a match when jumping to it, so a hit never
 /// lands flush against the top border with nothing before it.
 pub const MATCH_CONTEXT: u16 = 2;
+
+/// Rows a PgUp/PgDn moves a selection by, in every list that has one. A fixed step
+/// rather than the panel's own height: only the renderer knows that, and a page that
+/// means the same distance everywhere is easier to build a feel for than one that
+/// changes with the size of what it's moving through. Unlike a single ↑/↓, a page
+/// stops at the ends instead of wrapping — a fast gesture that silently teleports from
+/// the bottom of a list to the top is a fast gesture that loses your place.
+pub const PAGE_ROWS: i32 = 10;
 
 /// The live log of one execution, opened with Enter from the Ferramentas tab.
 ///
@@ -653,8 +668,30 @@ pub struct App {
     /// second Ctrl+C pressed straight after the first, so a stray one never kills a
     /// session that's carrying live executions.
     pub quit_armed: bool,
+    /// A destructive key waiting to be confirmed. Sits above every screen and takes
+    /// every key while it's open, so nothing underneath can act on the keypress that
+    /// dismisses it.
+    pub pending: Option<Pending>,
     state: SystemState,
     ticks_since_save: u32,
+}
+
+/// A destructive action, described and held until it's confirmed.
+pub struct Pending {
+    pub danger: Danger,
+    pub action: PendingAction,
+}
+
+/// What to carry out once the confirmation is accepted. Each variant re-reads what it
+/// needs at that moment rather than carrying a snapshot: a table can reshape, and a
+/// stored index would then point at the wrong row.
+pub enum PendingAction {
+    /// SIGKILL the selected row's process and its subtree, in the fullscreened table.
+    KillRow,
+    /// Stop and forget the selected execution on the Ferramentas tab.
+    RemoveExecution,
+    /// Drop one rule from the shared rewrite history, which lives on disk.
+    ForgetRule(Rule),
 }
 
 impl App {
@@ -702,6 +739,7 @@ impl App {
             focus: Focus::None,
             tab: Tab::Overview,
             quit_armed: false,
+            pending: None,
             state: SystemState::new(),
             ticks_since_save: 0,
         }
@@ -792,9 +830,9 @@ impl App {
                         // changed would cost more than just building them again.
                         Focus::Detail(df) => match monitor.detail(&self.state, &df.row) {
                             Some(detail) => {
-                                if let Some((down, up)) = detail.rates {
-                                    df.down.push(down);
-                                    df.up.push(up);
+                                if let Some(rates) = &detail.rates {
+                                    df.down.push(rates.values.0);
+                                    df.up.push(rates.values.1);
                                 }
                                 df.detail = detail;
                                 df.gone = false;
@@ -916,9 +954,9 @@ impl App {
 
         let mut down = History::new(CAPACITY);
         let mut up = History::new(CAPACITY);
-        if let Some((d, u)) = detail.rates {
-            down.push(d);
-            up.push(u);
+        if let Some(rates) = &detail.rates {
+            down.push(rates.values.0);
+            up.push(rates.values.1);
         }
         // Only now that we know there's a detail to show does the table get taken —
         // bailing out above must leave the focus untouched.
@@ -974,10 +1012,52 @@ impl App {
         }
     }
 
-    /// Sends SIGKILL to the currently selected process *and* every descendant in its
-    /// subtree, then drops all of them from the frozen snapshot. No-op outside
-    /// `Focus::Table`.
-    pub fn kill_selected(&mut self) {
+    /// Moves the selection a whole page (PgUp/PgDn), stopping at the ends rather than
+    /// wrapping the way a single step does — see `PAGE_ROWS`. While searching it steps
+    /// between matches instead, same as ↑/↓, since that's what the keys mean there.
+    pub fn page_selection(&mut self, delta: i32) {
+        let Focus::Table(tf) = &mut self.focus else {
+            return;
+        };
+        if !tf.query.is_empty() {
+            tf.focus_relative_match(delta.signum());
+            return;
+        }
+        let indices = tf.visible_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let last = indices.len() as i32 - 1;
+        tf.selected = (tf.selected as i32 + delta).clamp(0, last) as usize;
+    }
+
+    /// What `Del` would do to the selected row, or `None` where it would do nothing —
+    /// which is also what the footer asks before offering the key at all.
+    pub fn selected_danger(&self) -> Option<Danger> {
+        let Focus::Table(tf) = &self.focus else {
+            return None;
+        };
+        let &row_idx = tf.visible_indices().get(tf.selected)?;
+        let row = tf.rows.get(row_idx)?;
+        self.table_monitors[tf.table_index].danger(&self.state, row)
+    }
+
+    /// `Del` on a fullscreened table. Nothing dies here: it puts up what would happen
+    /// and waits. A table with nothing to kill (interfaces, machine facts) returns no
+    /// danger, and the key is then simply ignored.
+    pub fn request_kill_selected(&mut self) {
+        if let Some(danger) = self.selected_danger() {
+            self.pending = Some(Pending {
+                danger,
+                action: PendingAction::KillRow,
+            });
+        }
+    }
+
+    /// Sends SIGKILL to the confirmed row's process *and* every descendant in its
+    /// subtree, then drops all of them from the frozen snapshot. Reached only through
+    /// `Pending`, never straight from a keypress.
+    fn kill_selected(&mut self) {
         let Focus::Table(tf) = &mut self.focus else {
             return;
         };
@@ -1198,6 +1278,8 @@ impl App {
             match code {
                 KeyCode::Up => editor.move_selection(-1),
                 KeyCode::Down => editor.move_selection(1),
+                KeyCode::PageUp => editor.move_selection(-PAGE_ROWS),
+                KeyCode::PageDown => editor.move_selection(PAGE_ROWS),
                 KeyCode::Enter => {
                     if let Some(rule) = entries.get(*selected).cloned() {
                         // Re-filed as it's picked, so the history keeps ordering itself
@@ -1209,9 +1291,25 @@ impl App {
                     }
                 }
                 KeyCode::Delete => {
+                    // The history is shared by every execution and lives in a file:
+                    // this is the one Del in the rules screen that leaves the current
+                    // execution and touches something permanent.
                     if let Some(rule) = entries.get(*selected).cloned() {
-                        rewrite::forget(&rule);
-                        editor.open_history();
+                        let described = format!("«{}»  →  «{}»", rule.find, rule.replace);
+                        self.pending = Some(Pending {
+                            danger: Danger {
+                                action: "apagar do histórico",
+                                title: "Apagar esta regra do histórico?".to_string(),
+                                lines: vec![
+                                    described,
+                                    "Some do histórico compartilhado, em disco, para todas as \
+                                     execuções — as regras já aplicadas nesta continuam onde \
+                                     estão."
+                                        .to_string(),
+                                ],
+                            },
+                            action: PendingAction::ForgetRule(rule),
+                        });
                     }
                 }
                 KeyCode::Esc => editor.mode = RulesMode::List,
@@ -1223,6 +1321,8 @@ impl App {
         match code {
             KeyCode::Up => editor.move_selection(-1),
             KeyCode::Down => editor.move_selection(1),
+            KeyCode::PageUp => editor.move_selection(-PAGE_ROWS),
+            KeyCode::PageDown => editor.move_selection(PAGE_ROWS),
             KeyCode::Char('a') => editor.edit_new(),
             KeyCode::Char('e') | KeyCode::Enter => editor.edit_selected(),
             KeyCode::Char('h') => editor.open_history(),
@@ -1497,7 +1597,35 @@ impl App {
     /// Stops and forgets the selected execution (Del). The threads wind down on their
     /// own within a poll interval; nothing here waits for them, so the UI never stalls
     /// behind a socket.
-    pub fn remove_selected_execution(&mut self) {
+    /// `Del` on the Ferramentas tab. Stopping a tunnel drops whatever is connected
+    /// through it and throws away its log, and the row doesn't come back on the next
+    /// launch — so this asks first, naming what it is.
+    pub fn request_remove_execution(&mut self) {
+        let Some(execution) = self.tools.executions.get(self.tools.selected) else {
+            return;
+        };
+        let mut lines = vec![format!("{} — {}", execution.tool, execution.summary)];
+        if matches!(execution.state(), State::Running) {
+            lines.push(
+                "Está rodando agora: para de escutar na hora, e o que estiver ligado a ela cai."
+                    .to_string(),
+            );
+        }
+        lines.push(
+            "O log gravado até aqui é descartado, e a execução não volta no próximo início."
+                .to_string(),
+        );
+        self.pending = Some(Pending {
+            danger: Danger {
+                action: "remover execução",
+                title: "Remover esta execução?".to_string(),
+                lines,
+            },
+            action: PendingAction::RemoveExecution,
+        });
+    }
+
+    fn remove_selected_execution(&mut self) {
         if self.tools.selected >= self.tools.executions.len() {
             return;
         }
@@ -1553,8 +1681,10 @@ impl App {
     /// Offers what the open view found as new executions (Ctrl+P). Silent when there's
     /// nothing another tool could be pointed at.
     pub fn open_handoffs(&mut self) {
+        // Each detail names its own picker: what a connection offers (a tunnel to
+        // either end) and what a listening port offers are different gestures.
         let title = match &self.focus {
-            Focus::Detail(_) => "Túnel a partir desta conexão",
+            Focus::Detail(detail) => detail.detail.handoff_title,
             _ => "Achados desta execução",
         };
         let options = match &self.focus {
@@ -1566,8 +1696,8 @@ impl App {
                         .map(|tool| tool.handoffs(execution))
                 })
                 .unwrap_or_default(),
-            // A connection detail already names both ends and the protocol, which is a
-            // tunnel's whole configuration.
+            // A detail already holds everything the offered execution needs — a
+            // connection names both ends and the protocol, a port names its service.
             Focus::Detail(detail) => detail
                 .detail
                 .handoffs
@@ -1585,6 +1715,39 @@ impl App {
         }
         if let Some(slot) = self.handoff_slot() {
             *slot = Some(HandoffPicker::new(title, options));
+        }
+    }
+
+    /// True while a destructive action is waiting to be confirmed. Checked before every
+    /// other handler, including the rules screen's — the box sits over all of them.
+    pub fn confirm_open(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Enter goes through with it, Esc calls it off, and every other key is ignored
+    /// rather than taken as an answer — a confirmation that any keypress can satisfy is
+    /// not a confirmation.
+    pub fn confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => {
+                let Some(pending) = self.pending.take() else {
+                    return;
+                };
+                match pending.action {
+                    PendingAction::KillRow => self.kill_selected(),
+                    PendingAction::RemoveExecution => self.remove_selected_execution(),
+                    PendingAction::ForgetRule(rule) => {
+                        rewrite::forget(&rule);
+                        if let Focus::Wizard(wizard) = &mut self.focus
+                            && let Some(editor) = &mut wizard.editor
+                        {
+                            editor.open_history();
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => self.pending = None,
+            _ => {}
         }
     }
 
@@ -1606,10 +1769,10 @@ impl App {
             return;
         };
         match code {
-            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
-            KeyCode::Down => {
-                picker.selected = (picker.selected + 1).min(picker.rows().saturating_sub(1));
-            }
+            KeyCode::Up => picker.move_selection(-1),
+            KeyCode::Down => picker.move_selection(1),
+            KeyCode::PageUp => picker.move_selection(-PAGE_ROWS),
+            KeyCode::PageDown => picker.move_selection(PAGE_ROWS),
             KeyCode::Enter => self.create_from_handoff(),
             KeyCode::Esc => *slot = None,
             _ => {}

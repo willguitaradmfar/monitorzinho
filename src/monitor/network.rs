@@ -1,5 +1,30 @@
+use sysinfo::NetworkData;
+
 use super::{Monitor, SystemState};
 use crate::format;
+
+/// Which interface carried most of this sample, and how much of it.
+///
+/// The chart sums every interface, which answers "how much is moving" and says nothing
+/// about "over what" — and on a machine with Wi-Fi, a VPN and three bridges, the second
+/// question is usually the one being asked. Names the interface next to the figure, the
+/// same place a percentage-of-capacity monitor puts its absolute quantity.
+fn busiest(state: &SystemState, bytes: fn(&NetworkData) -> u64) -> Option<String> {
+    let total: u64 = state.networks.list().values().map(bytes).sum();
+    if total == 0 {
+        return None;
+    }
+    let (name, moved) = state
+        .networks
+        .list()
+        .iter()
+        .map(|(name, data)| (name, bytes(data)))
+        .max_by_key(|(_, moved)| *moved)?;
+    Some(format!(
+        "{name} {:.0}%",
+        moved as f64 / total as f64 * 100.0
+    ))
+}
 
 pub struct NetRxMonitor;
 
@@ -23,6 +48,10 @@ impl Monitor for NetRxMonitor {
 
     fn group(&self) -> &'static str {
         "Network"
+    }
+
+    fn extra(&self, state: &SystemState) -> Option<String> {
+        busiest(state, NetworkData::received)
     }
 }
 
@@ -53,5 +82,9 @@ impl Monitor for NetTxMonitor {
 
     fn group(&self) -> &'static str {
         "Network"
+    }
+
+    fn extra(&self, state: &SystemState) -> Option<String> {
+        busiest(state, NetworkData::transmitted)
     }
 }

@@ -119,11 +119,7 @@ impl Tool for NetTool {
             0,
             EventKind::Note(format!(
                 "pronto para varrer {} — {} endereço(s). Nada roda até você abrir",
-                plan.networks
-                    .iter()
-                    .map(|net| net.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                plan.labels.join(", "),
                 plan.hosts().len()
             )),
         );
@@ -222,6 +218,10 @@ fn mask_of(prefix: u8) -> u32 {
 
 struct Plan {
     networks: Vec<Network>,
+    /// How each network is named in the log — the CIDR plus the interface it's reached
+    /// through, where we found it ourselves. Two bridges with adjacent ranges are told
+    /// apart by the card, not by the number.
+    labels: Vec<String>,
     ports: Vec<u16>,
     workers: usize,
     timeout: Duration,
@@ -232,7 +232,7 @@ impl Plan {
     fn from(params: &HashMap<&'static str, String>) -> Result<Self, String> {
         let get = |key| params.get(key).map(String::as_str).unwrap_or("").trim();
 
-        let networks = match get("rede") {
+        let (networks, labels) = match get("rede") {
             "" => {
                 let found = local_networks();
                 if found.is_empty() {
@@ -241,8 +241,17 @@ impl Plan {
                     );
                 }
                 found
+                    .into_iter()
+                    .map(|(network, interface)| {
+                        let label = format!("{network} ({interface})");
+                        (network, label)
+                    })
+                    .unzip()
             }
-            text => vec![parse_cidr(text)?],
+            text => {
+                let network = parse_cidr(text)?;
+                (vec![network], vec![network.to_string()])
+            }
         };
 
         let ports = parse_ports(get("portas"))?;
@@ -266,6 +275,7 @@ impl Plan {
 
         let plan = Self {
             networks,
+            labels,
             ports,
             workers,
             timeout: Duration::from_millis(timeout),
@@ -333,7 +343,7 @@ fn parse_ports(spec: &str) -> Result<Vec<u16>, String> {
 /// `/proc/net/route` rather than a guess at "192.168.x": a laptop on a VPN with three
 /// container bridges is attached to five networks, and the interesting host is as
 /// likely to be on one of those as on the wifi.
-fn local_networks() -> Vec<Network> {
+fn local_networks() -> Vec<(Network, String)> {
     let Ok(content) = fs::read_to_string("/proc/net/route") else {
         return Vec::new();
     };
@@ -361,8 +371,8 @@ fn local_networks() -> Vec<Network> {
             continue;
         }
         let network = Network::new(destination, prefix);
-        if !networks.contains(&network) {
-            networks.push(network);
+        if !networks.iter().any(|(known, _)| *known == network) {
+            networks.push((network, fields[0].to_string()));
         }
     }
     networks
@@ -457,12 +467,7 @@ fn sweep(plan: Plan, rec: &Recorder) {
     let started = Instant::now();
     let hosts = plan.hosts();
     let total = hosts.len();
-    let networks = plan
-        .networks
-        .iter()
-        .map(|net| net.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let networks = plan.labels.join(", ");
 
     rec.record(
         0,

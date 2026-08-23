@@ -6,6 +6,7 @@ pub mod connections;
 pub mod cpu;
 pub mod disk;
 pub mod gpu;
+pub mod iface;
 pub mod memory;
 pub mod network;
 pub mod ports;
@@ -40,9 +41,14 @@ impl SystemState {
         self.networks.refresh(true);
     }
 
-    /// Refreshes the process list (Processes tab: ports/top CPU/top memory). This is
-    /// the most expensive part of a tick, so it only runs while that tab is focused.
+    /// Refreshes the process list (Processes tab: ports/top CPU/top memory), plus the
+    /// interface list that tab's network panels read. This is the most expensive part
+    /// of a tick, so it only runs while that tab is focused.
     pub fn refresh_processes(&mut self) {
+        // Interfaces and their addresses: cheap next to the process walk below, and
+        // every network panel on this tab is wrong without them — an address that
+        // changed when a VPN came up would otherwise stay as it was at launch.
+        self.networks.refresh(true);
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
@@ -181,20 +187,53 @@ impl DetailSection {
     }
 }
 
+/// The pair of live figures a detail sparklines above its fields. Both are byte rates
+/// — what they're rates *of* is the subject's business, hence the labels: a socket
+/// moves bytes across the wire, a process moves them to and from the disk.
+pub struct Rates {
+    pub labels: (&'static str, &'static str),
+    pub values: (f64, f64),
+}
+
 /// Everything the fullscreen detail view (Enter on a row) shows about one selected
 /// row. Rebuilt from scratch every tick while the view is open, so its values stay
 /// live without the view having to track what changed.
 pub struct Detail {
     /// Headline identifying the subject, e.g. `TCP 192.168.0.10:54312 → 142.250.0.1:443`.
     pub title: String,
+    /// What the title gains once the subject stops existing — "encerrada" for a
+    /// connection, "encerrado" for a process, "desconectada" for a session. A single
+    /// word rather than a sentence, because it's appended to a title that already
+    /// says what the subject is.
+    pub gone_note: &'static str,
     pub sections: Vec<DetailSection>,
-    /// Current download/upload throughput in bytes/s, when the subject has one — the
-    /// app feeds these into a pair of `History`s so the view can sparkline them.
-    pub rates: Option<(f64, f64)>,
+    /// Current throughput in bytes/s, when the subject has any — the app feeds these
+    /// into a pair of `History`s so the view can sparkline them.
+    pub rates: Option<Rates>,
     /// Executions this subject suggests creating. A connection to a database is the
     /// exact configuration of a tunnel to that database, and retyping the address into
     /// a form while looking straight at it is work the app can do.
     pub handoffs: Vec<Handoff>,
+    /// Heading of the hand-off picker, since what the offers *are* differs by subject:
+    /// a connection's two ends and a listening port's traffic are not the same thing.
+    pub handoff_title: &'static str,
+}
+
+/// What a destructive key would do, said out loud before it does it.
+///
+/// `Del` on a process table sends SIGKILL to a whole subtree, and on a session table it
+/// throws a person off the machine. Both are one keypress away from a row someone is
+/// merely reading, and neither can be undone — so the key stops here first, and this is
+/// what it stops to say.
+pub struct Danger {
+    /// Verb for the footer hint, e.g. `matar processo`, `desconectar sessão`. What the
+    /// key does differs by table, and a footer that says "matar" over a table of
+    /// interfaces is worse than one that says nothing.
+    pub action: &'static str,
+    /// Heading of the confirmation box, naming the exact subject.
+    pub title: String,
+    /// What will happen, one consequence per line — the whole reason for stopping.
+    pub lines: Vec<String>,
 }
 
 /// One "monitorzinho" that shows a ranked snapshot list instead of a time series
@@ -229,15 +268,25 @@ pub trait TableMonitor: Send {
     fn has_detail(&self) -> bool {
         false
     }
+
+    /// What `Del` would do to `row`, for the confirmation it has to get through and for
+    /// the footer that offers it. `None` — the default — means the key does nothing
+    /// here, and then nothing advertises it: a table of interfaces or of facts about the
+    /// machine has no process to kill, and a footer promising one is a lie the reader
+    /// only finds out about by pressing it.
+    fn danger(&self, _state: &SystemState, _row: &TableRow) -> Option<Danger> {
+        None
+    }
 }
 
 pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {
     vec![
-        Box::new(ports::PortsMonitor),
+        Box::new(ports::PortsMonitor::new()),
         Box::new(connections::ConnectionsMonitor::new()),
-        Box::new(process::TopCpuMonitor),
-        Box::new(process::TopMemMonitor),
+        Box::new(process::TopCpuMonitor::default()),
+        Box::new(process::TopMemMonitor::default()),
         Box::new(ssh::SshSessionsMonitor),
+        Box::new(iface::InterfacesMonitor::new()),
         Box::new(summary::SummaryMonitor::new()),
     ]
 }

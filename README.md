@@ -78,10 +78,17 @@ metric approaches its natural limit (e.g. memory nearing 100%).
   as a tree: parents expand to their children with `←`/`→`.
 - **SSH Sessions** — who is logged in over SSH, from where, on which TTY,
   since when, and what they're running.
+- **Interfaces** — every network interface the kernel knows about, up or down:
+  what kind it is (Wi-Fi, Ethernet, bridge, VPN, tunnel, loopback), whether it
+  has a link, its addresses, and what's moving through it right now. Read from
+  `/sys/class/net`, the same place `ip` reads, so a machine with a wired port,
+  Wi-Fi, a WireGuard tunnel and three container bridges shows all seven rather
+  than the one that happens to carry the default route.
 - **System Info** — what this machine *is*: distribution and version, kernel,
   architecture, make and model, form factor, board, BIOS and its date, uptime,
   and whether it's running on top of a hypervisor or inside a container. Plus
-  host, user, gateway, DNS and a one-line summary of CPU, memory, disk and GPU.
+  host, user, its address *and the card that address is on*, the interface
+  list, gateway, DNS and a one-line summary of CPU, memory, disk and GPU.
   Hardware identity comes from the firmware's own DMI tables and the
   distribution from `/etc/os-release`, so it's what the machine says about
   itself rather than anything inferred.
@@ -92,17 +99,38 @@ compact grid shows. In a fullscreened table, typing searches immediately —
 there's no search mode to enter first — and `Del` kills the selected process
 (SIGKILL, with its children).
 
-Pressing `Enter` on a connection opens a **detail view**: both endpoints with
-reverse-DNS names and service names, the owning process, throughput, and — for
-TCP — what the kernel knows about the path itself (RTT and its variance,
-congestion window, retransmits, MSS, and so on, read straight from `tcp_info`).
+Pressing `Enter` on any row opens a **detail view** — everything that table's
+monitor knows about that one subject, rebuilt every tick so it stays live:
 
-From there, `Ctrl+P` turns the connection into a **tunnel**. A connection
+- **a connection** — both endpoints with reverse-DNS and service names, the
+  interface it's on, the owning process, throughput, and, for TCP, what the
+  kernel knows about the path itself (RTT and its variance, congestion window,
+  retransmits, MSS, and so on, read straight from `tcp_info`).
+- **a port** — every address it's bound to and which cards those are, whether
+  it's reachable from the network or only from this machine, the accept queue,
+  the owning process, and who is connected to it right now, grouped by peer.
+- **a process** — identity, state, parent, threads, open descriptors, OOM
+  score, command and working directory, CPU and the full memory breakdown,
+  its children, the sockets it holds, and live disk read/write sparklines.
+- **an SSH session** — where the login came from (read off sshd's own socket
+  where that's readable, and matched against the socket table where it isn't),
+  its shell, and every process the session is running.
+- **an interface** — kind, link state, MAC, MTU, negotiated speed, driver,
+  Wi-Fi signal, every address, the routes through it, and packet/error/drop
+  counters with live throughput.
+- **a System Info row** — the rest of whatever the row summarises: the CPU line
+  becomes topology, clocks, cache and feature flags; Memory becomes the full
+  `/proc/meminfo` breakdown; DNS becomes every server, search domain and the
+  stub's upstreams; Disk becomes every mount.
+
+From there, `Ctrl+P` turns what's on screen into an execution. A connection
 already names both ends and the protocol, which is the tunnel tool's entire
 configuration, so it offers to relay to either end — listening on the same port
 locally, so a client's config usually needs only its host changed to
 `127.0.0.1`. Close the original connection, point the client at the tunnel, and
-the same conversation now goes through something that writes it down.
+the same conversation now goes through something that writes it down. A
+listening port offers a tunnel that records what it receives, on the first free
+port above it; an interface offers a sweep of the network it's on.
 
 ### Ferramentas — the tools
 
@@ -267,8 +295,8 @@ normal user actually has, cheapest first:
   every port is as discovered as one running a web server.
 
 Networks come from the kernel's routing table, so a laptop on a VPN with
-container bridges sweeps all of them rather than a guess at `192.168.x`; a CIDR
-can be typed instead. MAC vendors are read from whatever OUI database the
+container bridges sweeps all of them rather than a guess at `192.168.x`, each
+named with the interface it's reached through; a CIDR can be typed instead. MAC vendors are read from whatever OUI database the
 system ships (`ieee-data`, `nmap`, `wireshark`) — a vendor table baked into the
 binary would be wrong the month after it shipped.
 
@@ -283,21 +311,37 @@ at it properly.
 | `Tab` / `Shift+Tab` | anywhere | next/previous tab |
 | space | a tab | refresh now, without waiting for the tick |
 | `1`–`9`, letters | Visão Geral, Processos | fullscreen that panel |
-| `Enter` | a fullscreened table | open the row's detail view, where there is one |
+| `Enter` | a fullscreened table | open the row's detail view |
+| `PgUp` / `PgDn` | any list or log | move ten rows / scroll fast, stopping at the ends |
 | `←` / `→` | process tree | collapse/expand |
-| `Del` | a fullscreened table | kill the selected process (SIGKILL, with children) |
+| `Del` | a fullscreened table | what it kills depends on the table — the confirmation says so before anything happens |
 | any letter | a fullscreened table | search, live |
 | `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart (or re-run) / remove an execution |
 | `Enter` | Ferramentas | open that execution's live log — and run it, for an on-demand tool |
 | `Tab`, `Ctrl+F` | an execution's log | hex view, matches-only filter |
 | `Ctrl+L`, `End` | an execution's log | clear the scrollback, jump back to the live edge |
-| `Ctrl+P` | a connection's detail | turn the connection into a tunnel to either end |
+| `Ctrl+P` | a detail view | turn what's on screen into an execution — a tunnel to either end of a connection, a recording of a port, a sweep of an interface's network |
 | `Ctrl+P` | an execution's log | turn what it found into new executions — one, or all of them |
 | `Esc` | anywhere | back one level (clears a search first) |
-| `q` | a tab | quit |
+| `Enter` / `Esc` | a confirmation | go through with it / leave it alone — no other key answers |
+| `q` | a fullscreened chart or detail | close it and go back (in a table, `q` is search input like any other letter) |
 | `Ctrl+C` twice | anywhere | quit — one press only arms it, so a stray `Ctrl+C` can't kill a session carrying live executions |
 
-Quitting saves history cleanly before exit.
+Quitting saves history cleanly before exit. Nothing but `Ctrl+C` twice closes the
+app — a monitor left running for hours shouldn't die to a mistyped letter.
+
+The footer of every screen lists only the keys that do something *there*: no
+`←`/`→` over a table that isn't a tree, no `Del` over a table with nothing to
+kill, no `Ctrl+P` on an execution that hasn't found anything yet. A hint for a
+key that does nothing is worse than no hint — it sends you looking for a bug.
+
+Anything irreversible stops and says what it is about to do first: which process
+(and how many of its children) `Del` would SIGKILL, that killing the owner of a
+port takes the port down with it, that disconnecting a session throws a person
+off the machine mid-command, that removing an execution drops what's connected
+through it and throws its log away, that forgetting a rewrite rule deletes it
+from the shared history on disk. `Enter` goes ahead, `Esc` doesn't, and every
+other key is ignored rather than taken as an answer.
 
 ## Architecture
 
@@ -307,7 +351,8 @@ Three small traits drive everything:
   Implement it in `src/monitor/<name>.rs` and add it to `all_monitors()` in
   `src/monitor/mod.rs`.
 - `TableMonitor` — a ranked snapshot list, for data that doesn't fit a time
-  series. Optionally answers `detail()` to get an `Enter` view.
+  series. Answer `detail()` and the row gets an `Enter` view; return `handoffs`
+  from it and `Ctrl+P` turns what's on screen into a tool execution.
 - `Tool` — something that runs: it declares the parameters the wizard should
   ask for, then starts threads and reports back through a shared event log and
   two columns of its execution's row. Say `on_demand()` and it starts nothing
@@ -316,7 +361,8 @@ Three small traits drive everything:
   `all_tools()`.
 
 There are no bindings crates for the Linux-specific parts: the socket tables
-come from a hand-rolled netlink `SOCK_DIAG` client, names from `getnameinfo`
+come from a hand-rolled netlink `SOCK_DIAG` client and from `/proc/net/{tcp,udp}`
+parsed by hand, interfaces from `/sys/class/net`, names from `getnameinfo`
 through NSS (on background threads, so a slow resolver can't stall the UI),
 the relays wait on `poll(2)` directly, and DNS queries are built and parsed
 byte by byte.

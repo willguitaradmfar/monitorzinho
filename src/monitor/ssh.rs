@@ -4,8 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sysinfo::{Pid, Process};
 
-use super::process::command_of;
-use super::{SystemState, TableMonitor, TableRow};
+use super::iface;
+use super::ports::{SocketRow, TCP_ESTABLISHED, socket_inodes, socket_table};
+use super::process::{command_of, kill_danger};
+use super::resolve::user_name;
+use super::{Danger, Detail, DetailSection, SystemState, TableMonitor, TableRow};
 use crate::format;
 
 const HEADERS: [&str; 6] = ["User", "Host", "TTY", "Time", "Folder", "Command"];
@@ -243,6 +246,213 @@ fn sample_sessions(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
         .collect()
 }
 
+// --- detail view ---------------------------------------------------------------------
+
+/// The `sshd` process the session hangs below — the one that actually holds the network
+/// socket. `is_ssh_session` walks the same ancestry to answer yes/no; this returns the
+/// pid, because the socket is where the session's real origin is written down.
+fn sshd_ancestor(state: &SystemState, pid: u32) -> Option<u32> {
+    let mut current = Some(Pid::from_u32(pid));
+    for _ in 0..MAX_ANCESTOR_DEPTH {
+        let p = current.and_then(|pid| state.sys.process(pid))?;
+        if p.name().to_string_lossy() == "sshd" {
+            return Some(p.pid().as_u32());
+        }
+        current = p.parent();
+    }
+    None
+}
+
+/// Where the login actually came from, in as much detail as the kernel will give us.
+///
+/// The socket belongs to sshd, whose `/proc/<pid>/fd` is closed to everyone but root —
+/// so the inode route only works when monitorzinho is running as root. Failing that,
+/// the socket *tables* are world-readable even when the descriptors aren't: an
+/// established connection from the address utmp recorded is the same connection, found
+/// from the other end.
+fn connection_section(state: &SystemState, session_pid: u32, host: &str) -> DetailSection {
+    let mut section = DetailSection::new("Conexão");
+    let Some(sshd) = sshd_ancestor(state, session_pid) else {
+        section.push("sshd", "não encontrado na ancestralidade desta sessão");
+        return section;
+    };
+    section.push("Processo sshd", sshd.to_string());
+
+    let table = socket_table();
+    let inodes = socket_inodes(sshd);
+    if let Some(row) = table
+        .iter()
+        .find(|row| inodes.contains(&row.inode) && row.remote_port != 0)
+    {
+        push_socket(&mut section, "", row, state);
+        return section;
+    }
+
+    let candidates: Vec<&SocketRow> = table
+        .iter()
+        .filter(|row| row.proto == "TCP" && row.state == TCP_ESTABLISHED && row.remote_ip == host)
+        .collect();
+    match candidates.as_slice() {
+        // One connection from that address: it can only be this session's.
+        [row] => push_socket(&mut section, "", row, state),
+        // Several sessions from the same address are indistinguishable from here — utmp
+        // doesn't record the port — so they're offered as what they are rather than one
+        // of them being picked and presented as fact.
+        [..] if !candidates.is_empty() => {
+            section.push(
+                "Conexões de " .to_owned().as_str(),
+                format!("{host} — {} abertas, indistinguíveis daqui", candidates.len()),
+            );
+            for row in candidates.iter().take(MAX_CANDIDATES) {
+                push_socket(&mut section, "candidata: ", row, state);
+            }
+        }
+        _ => section.push(
+            "Socket",
+            "não localizado — os descritores do sshd são do root e o utmp não registrou um endereço",
+        ),
+    }
+    section
+}
+
+/// Candidate connections shown when the address alone can't pick one out.
+const MAX_CANDIDATES: usize = 4;
+
+/// The endpoint pair and what's queued on it, as read from the socket table.
+fn push_socket(section: &mut DetailSection, prefix: &str, row: &SocketRow, state: &SystemState) {
+    section.push(&format!("{prefix}De"), row.remote());
+    section.push(
+        &format!("{prefix}Para"),
+        format!("{} [{}]", row.local(), row.family),
+    );
+    if let Some(interface) = iface::interface_of(&state.networks, &row.local_ip) {
+        section.push(&format!("{prefix}Interface"), interface);
+    }
+    section.push(
+        &format!("{prefix}Filas"),
+        format!(
+            "{} a receber · {} a enviar",
+            format::human_bytes(row.rx_queue as f64),
+            format::human_bytes(row.tx_queue as f64)
+        ),
+    );
+    section.push(
+        &format!("{prefix}Dono do socket"),
+        match user_name(row.uid) {
+            Some(name) => format!("{name} (uid {})", row.uid),
+            None => format!("uid {}", row.uid),
+        },
+    );
+}
+
+/// The session's login shell. A login shell is exec'd with a dash in front of its name
+/// — the convention that tells it to read the login profile — which is what tells it
+/// apart from every other command the session has since started.
+fn login_shell<'a>(state: &'a SystemState, subtree: &[u32]) -> Option<&'a Process> {
+    subtree
+        .iter()
+        .filter_map(|&pid| state.sys.process(Pid::from_u32(pid)))
+        .find(|p| command_of(p).starts_with('-'))
+}
+
+/// What the session is running, listed rather than reduced to the one "most active"
+/// process the table column shows. A login sitting at a prompt has one entry here; one
+/// running a build inside tmux has the whole tree.
+fn processes_section(state: &SystemState, subtree: &[u32]) -> DetailSection {
+    let mut section = DetailSection::new("Processos da sessão");
+    let mut listed: Vec<&Process> = subtree
+        .iter()
+        .filter_map(|&pid| state.sys.process(Pid::from_u32(pid)))
+        .filter(|p| p.thread_kind().is_none())
+        .collect();
+    // Busiest first, same ordering `most_active` picks the headline command by.
+    listed.sort_by(|a, b| {
+        b.cpu_usage()
+            .total_cmp(&a.cpu_usage())
+            .then(b.start_time().cmp(&a.start_time()))
+    });
+    section.push("Total", listed.len().to_string());
+    for p in listed.iter().take(MAX_SESSION_PROCESSES) {
+        section.push(
+            &p.pid().as_u32().to_string(),
+            format!("{:.1}%  {}", p.cpu_usage(), command_of(p)),
+        );
+    }
+    if listed.len() > MAX_SESSION_PROCESSES {
+        section.push(
+            "E mais",
+            format!("{} processo(s)", listed.len() - MAX_SESSION_PROCESSES),
+        );
+    }
+    section
+}
+
+/// Processes listed before the tail is summarised. A session inside a multiplexer can
+/// hold dozens; the first screenful is what identifies it.
+const MAX_SESSION_PROCESSES: usize = 15;
+
+fn build_detail(state: &SystemState, entry: &UtmpEntry, now: u64) -> Detail {
+    let subtree = subtree_pids(state, entry.pid);
+    let owner = state.sys.process(Pid::from_u32(entry.pid));
+    let active = most_active(state, &subtree);
+
+    let mut session = DetailSection::new("Sessão");
+    session.push("Usuário", entry.user.clone());
+    session.push(
+        "Origem (utmp)",
+        if entry.host.is_empty() {
+            "não registrada".to_string()
+        } else {
+            entry.host.clone()
+        },
+    );
+    session.push("Terminal", entry.line.clone());
+    session.push(
+        "Conectado há",
+        format::human_duration(now.saturating_sub(entry.login_time)),
+    );
+    session.push("PID da sessão", entry.pid.to_string());
+    // utmp registers the privilege-separated sshd, not the shell — see `subtree_pids`.
+    session.push(
+        "Processo registrado",
+        owner.map(command_of).unwrap_or_else(|| "?".to_string()),
+    );
+    if let Some(shell) = login_shell(state, &subtree) {
+        session.push(
+            "Shell",
+            format!("{} · {}", shell.pid().as_u32(), command_of(shell)),
+        );
+    }
+    session.push(
+        "Diretório",
+        active
+            .or(owner)
+            .and_then(Process::cwd)
+            .map(|cwd| cwd.display().to_string())
+            .unwrap_or_else(|| "?".to_string()),
+    );
+    session.push(
+        "Comando ativo",
+        match active {
+            Some(p) => command_of(p),
+            None => "nada além do shell — sessão parada no prompt".to_string(),
+        },
+    );
+
+    Detail {
+        title: format!("{}@{} · {}", entry.user, entry.line, entry.host),
+        gone_note: "desconectada",
+        sections: vec![
+            session,
+            connection_section(state, entry.pid, &entry.host),
+            processes_section(state, &subtree),
+        ],
+        rates: None,
+        handoffs: Vec::new(),
+        handoff_title: "",
+    }
+}
+
 pub struct SshSessionsMonitor;
 
 impl TableMonitor for SshSessionsMonitor {
@@ -270,5 +480,35 @@ impl TableMonitor for SshSessionsMonitor {
             };
             *row = build_row(state, entry, now);
         }
+    }
+
+    /// Del here doesn't kill a process someone was looking at — it throws a person off
+    /// the machine. The confirmation says whose session it is and what they lose.
+    fn danger(&self, state: &SystemState, row: &TableRow) -> Option<Danger> {
+        let user = row.cells.first().cloned().unwrap_or_default();
+        let tty = row.cells.get(2).cloned().unwrap_or_default();
+        let from = row.cells.get(1).cloned().unwrap_or_default();
+        kill_danger(
+            state,
+            row,
+            "desconectar sessão",
+            &format!("Desconectar a sessão de {user} em {tty}"),
+            vec![
+                format!("A conexão vinda de {from} cai na hora, sem aviso do outro lado."),
+                "Morre o shell, tudo que a sessão estiver rodando e o sshd que segura a \
+                 conexão — trabalho não salvo se perde."
+                    .to_string(),
+            ],
+        )
+    }
+
+    fn detail(&mut self, state: &SystemState, row: &TableRow) -> Option<Detail> {
+        let now = now_secs();
+        let entry = read_utmp().into_iter().find(|e| e.pid == row.pid)?;
+        Some(build_detail(state, &entry, now))
+    }
+
+    fn has_detail(&self) -> bool {
+        true
     }
 }

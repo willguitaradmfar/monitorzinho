@@ -1,11 +1,14 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
 use std::net::Ipv4Addr;
 
 use nvml_wrapper::Nvml;
+use sysinfo::{Disks, Networks};
 
 use super::disk::primary_disk;
-use super::{SystemState, TableMonitor, TableRow};
+use super::iface;
+use super::{Detail, DetailSection, SystemState, TableMonitor, TableRow};
 use crate::format;
 
 const HEADERS: [&str; 2] = ["Field", "Value"];
@@ -65,7 +68,7 @@ fn dns_servers() -> String {
 /// `192.168.1.1`. The kernel prints the raw 32-bit address (stored host-endian) as a
 /// hex number, so recovering the dotted-quad octet order means reading it back out
 /// little-endian rather than the more obvious big-endian.
-fn parse_hex_ipv4(hex: &str) -> Option<Ipv4Addr> {
+pub(super) fn hex_ipv4(hex: &str) -> Option<Ipv4Addr> {
     let bytes = u32::from_str_radix(hex, 16).ok()?.to_le_bytes();
     Some(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
 }
@@ -80,7 +83,7 @@ fn default_gateway() -> Option<Ipv4Addr> {
         let destination = *fields.get(1)?;
         let gateway = *fields.get(2)?;
         if destination == "00000000" && gateway != "00000000" {
-            parse_hex_ipv4(gateway)
+            hex_ipv4(gateway)
         } else {
             None
         }
@@ -313,8 +316,27 @@ fn gpu_summary(nvml: &Nvml) -> Option<String> {
     Some(format!("{} · {}", name, format::human_bytes(total as f64)))
 }
 
+/// The address traffic leaves by, and the interface it leaves through. Two facts that
+/// are useless apart: on a machine with a VPN, a wired port and three bridges, an IP
+/// with no card beside it is an answer to half the question.
+fn outbound_address(state: &SystemState) -> String {
+    let Some(ip) = outbound_ip() else {
+        // No route out at all — worth saying plainly, since "?" reads as a failure to
+        // look rather than as an answer.
+        return "sem rota de saída".to_string();
+    };
+    match iface::interface_of(&state.networks, &ip.to_string()) {
+        Some(interface) => format!("{ip}  ·  {interface}"),
+        None => ip.to_string(),
+    }
+}
+
 fn row(field: &str, value: String) -> TableRow {
-    TableRow::leaf(vec![field.to_string(), value], 0)
+    let mut row = TableRow::leaf(vec![field.to_string(), value], 0);
+    // The field name, not a pid: these rows are facts about the machine, and the fact
+    // is what the detail view goes back and asks about on the next tick.
+    row.key = field.to_string();
+    row
 }
 
 /// A general "who/what is this machine" summary, laid out beside SSH Sessions since
@@ -326,12 +348,19 @@ pub struct SummaryMonitor {
     /// sharing `GpuMonitor`'s, since table monitors and chart monitors are constructed
     /// and owned separately.
     nvml: Option<Nvml>,
+    /// Its own disk list, refreshed when a detail asks for it. `SystemState` only
+    /// refreshes disks on the Overview tab, so by the time someone is reading this
+    /// panel they'd be minutes old — and a mount that appeared since launch wouldn't be
+    /// there at all. Interfaces need no such handling: the Processes tab refreshes them
+    /// every tick for the Interfaces panel next door.
+    disks: Disks,
 }
 
 impl SummaryMonitor {
     pub fn new() -> Self {
         Self {
             nvml: Nvml::init().ok(),
+            disks: Disks::new_with_refreshed_list(),
         }
     }
 
@@ -349,12 +378,8 @@ impl SummaryMonitor {
         rows.extend([
             row("Uptime", format::human_duration(sysinfo::System::uptime())),
             row("User", current_user()),
-            row(
-                "IP",
-                outbound_ip()
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|| "?".to_string()),
-            ),
+            row("IP", outbound_address(state)),
+            row("Interfaces", iface::addressed_summary(&state.networks)),
             row(
                 "Gateway",
                 default_gateway()
@@ -406,5 +431,638 @@ impl TableMonitor for SummaryMonitor {
                 row.cells[1] = f.cells[1].clone();
             }
         }
+    }
+
+    fn detail(&mut self, state: &SystemState, row: &TableRow) -> Option<Detail> {
+        // Mounts are read here rather than on the tick: this is the only view that
+        // shows them, and it's open a fraction of the time the tab is.
+        self.disks.refresh(true);
+        self.detail_for(state, &row.key.clone())
+    }
+
+    fn has_detail(&self) -> bool {
+        true
+    }
+}
+
+// --- detail views --------------------------------------------------------------------
+//
+// Every row of this panel is a summary of something bigger, and Enter is where the rest
+// of it lives: the CPU line becomes the topology and the clocks, the Memory line becomes
+// the breakdown, the DNS line becomes every server and search domain. All of it read
+// straight from /proc and /sys at the moment it's asked for, rather than from the shared
+// `SystemState` — that one only refreshes what the *charts* need, and only while the
+// Overview tab is focused, so its memory and CPU figures are stale by the time anyone is
+// reading this panel.
+
+/// A one-line file, trimmed. Most of /sys is exactly this.
+fn read_line(path: &str) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// `/proc/meminfo`, in bytes. The kernel prints kB.
+fn meminfo() -> HashMap<String, u64> {
+    let Ok(content) = fs::read_to_string("/proc/meminfo") else {
+        return HashMap::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            let kb: u64 = value.split_whitespace().next()?.parse().ok()?;
+            Some((key.to_string(), kb * 1024))
+        })
+        .collect()
+}
+
+/// One `/proc/cpuinfo` block per logical CPU, as key/value pairs.
+fn cpuinfo() -> Vec<HashMap<String, String>> {
+    let Ok(content) = fs::read_to_string("/proc/cpuinfo") else {
+        return Vec::new();
+    };
+    let mut blocks = Vec::new();
+    let mut current = HashMap::new();
+    for line in content.lines() {
+        match line.split_once(':') {
+            Some((key, value)) => {
+                current.insert(key.trim().to_string(), value.trim().to_string());
+            }
+            // Blank line: end of one processor's block.
+            None => {
+                if !current.is_empty() {
+                    blocks.push(std::mem::take(&mut current));
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+}
+
+/// The `/etc/passwd` line for `name`, split into its seven fields.
+fn passwd_entry(name: &str) -> Option<Vec<String>> {
+    let content = fs::read_to_string("/etc/passwd").ok()?;
+    content.lines().find_map(|line| {
+        let fields: Vec<String> = line.split(':').map(str::to_string).collect();
+        (fields.first().map(String::as_str) == Some(name)).then_some(fields)
+    })
+}
+
+/// Secondary groups `name` belongs to, from `/etc/group`. The primary group isn't
+/// listed there against the member — it lives in the passwd entry's gid.
+fn groups_of(name: &str) -> Vec<String> {
+    let Ok(content) = fs::read_to_string("/etc/group") else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let group = fields.first()?;
+            let members = fields.get(3)?;
+            members
+                .split(',')
+                .any(|member| member == name)
+                .then(|| group.to_string())
+        })
+        .collect()
+}
+
+/// Every default route, not just the first: a laptop on a VPN has two, and which one
+/// wins is the metric — the number that explains where traffic is actually going.
+fn default_routes() -> Vec<(String, Ipv4Addr, u32)> {
+    let Ok(content) = fs::read_to_string("/proc/net/route") else {
+        return Vec::new();
+    };
+    let mut routes: Vec<(String, Ipv4Addr, u32)> = content
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if *fields.get(1)? != "00000000" {
+                return None;
+            }
+            let gateway = hex_ipv4(fields.get(2)?)?;
+            Some((
+                fields.first()?.to_string(),
+                gateway,
+                fields.get(6)?.parse().unwrap_or(0),
+            ))
+        })
+        .collect();
+    routes.sort_by_key(|(_, _, metric)| *metric);
+    routes
+}
+
+/// The MAC an address has answered ARP with, from the neighbour table. Present for
+/// anything this machine has spoken to recently, which the gateway always has.
+fn arp_mac(ip: &str) -> Option<String> {
+    let content = fs::read_to_string("/proc/net/arp").ok()?;
+    content.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let mac = fields.get(3)?;
+        (*fields.first()? == ip).then(|| mac.to_string())
+    })
+}
+
+/// `/etc/resolv.conf` keyword lines — `nameserver`, `search`, `options`, in order.
+fn resolv_conf(keyword: &str, path: &str) -> Vec<String> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter_map(|line| Some(line.strip_prefix(keyword)?.trim().to_string()))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn machine_section() -> DetailSection {
+    let mut section = DetailSection::new("Firmware (DMI)");
+    for (label, field) in [
+        ("Fabricante", "sys_vendor"),
+        ("Produto", "product_name"),
+        ("Versão do produto", "product_version"),
+        ("Família", "product_family"),
+        ("Fabricante da placa", "board_vendor"),
+        ("Placa", "board_name"),
+        ("Versão da placa", "board_version"),
+        ("BIOS", "bios_vendor"),
+        ("Versão da BIOS", "bios_version"),
+    ] {
+        if let Some(value) = dmi(field) {
+            section.push(label, value);
+        }
+    }
+    if let Some(date) = dmi("bios_date") {
+        section.push("Data da BIOS", iso_date(&date));
+    }
+    if let Some(chassis) = chassis() {
+        section.push("Gabinete", chassis);
+    }
+    if section.fields.is_empty() {
+        section.push(
+            "DMI",
+            "nenhum — normal dentro de um contêiner, onde não há firmware a consultar",
+        );
+    }
+    section
+}
+
+fn os_detail() -> Vec<DetailSection> {
+    let mut distro = DetailSection::new("Distribuição");
+    for (label, key) in [
+        ("Nome", "NAME"),
+        ("Versão", "VERSION"),
+        ("ID", "ID"),
+        ("Baseada em", "ID_LIKE"),
+        ("Como se apresenta", "PRETTY_NAME"),
+    ] {
+        if let Some(value) = os_release(key) {
+            distro.push(label, value);
+        }
+    }
+
+    let mut kernel = DetailSection::new("Kernel");
+    if let Some(version) = sysinfo::System::kernel_version() {
+        kernel.push("Versão", version);
+    }
+    kernel.push("Completa", sysinfo::System::kernel_long_version());
+    kernel.push("Arquitetura", sysinfo::System::cpu_arch());
+    if let Some(init) = read_line("/proc/1/comm") {
+        kernel.push("Init (pid 1)", init);
+    }
+    if let Some(cmdline) = read_line("/proc/cmdline") {
+        kernel.push("Linha de boot", cmdline);
+    }
+    vec![distro, kernel]
+}
+
+fn uptime_section() -> DetailSection {
+    let mut section = DetailSection::new("Tempo e carga");
+    section.push(
+        "Ligado há",
+        format::human_duration(sysinfo::System::uptime()),
+    );
+    let load = sysinfo::System::load_average();
+    section.push(
+        "Carga média",
+        format!(
+            "{:.2} · {:.2} · {:.2}   (1, 5 e 15 min)",
+            load.one, load.five, load.fifteen
+        ),
+    );
+    // Field 4 of /proc/loadavg, `running/total`: how many of the machine's tasks are
+    // actually on a CPU right now, against how many exist.
+    if let Some(loadavg) = read_line("/proc/loadavg") {
+        let fields: Vec<&str> = loadavg.split_whitespace().collect();
+        if let Some(tasks) = fields.get(3) {
+            section.push("Tarefas", format!("{tasks}  (executando/total)"));
+        }
+        if let Some(last_pid) = fields.get(4) {
+            section.push("Último PID criado", last_pid.to_string());
+        }
+    }
+    section
+}
+
+fn user_section() -> DetailSection {
+    let mut section = DetailSection::new("Usuário");
+    let name = current_user();
+    section.push("Login", name.clone());
+    match passwd_entry(&name) {
+        Some(fields) => {
+            if let Some(uid) = fields.get(2) {
+                section.push("UID", uid.clone());
+            }
+            if let Some(gid) = fields.get(3) {
+                let group = gid.parse().ok().and_then(user_group_name);
+                section.push(
+                    "Grupo primário",
+                    match group {
+                        Some(group) => format!("{group} (gid {gid})"),
+                        None => format!("gid {gid}"),
+                    },
+                );
+            }
+            if let Some(gecos) = fields.get(4).filter(|g| !g.is_empty()) {
+                section.push("Nome completo", gecos.clone());
+            }
+            if let Some(home) = fields.get(5) {
+                section.push("Home", home.clone());
+            }
+            if let Some(shell) = fields.get(6) {
+                section.push("Shell", shell.clone());
+            }
+        }
+        None => section.push(
+            "Cadastro",
+            "não está em /etc/passwd — usuário de um diretório remoto (LDAP/SSSD)",
+        ),
+    }
+    let groups = groups_of(&name);
+    if !groups.is_empty() {
+        section.push("Outros grupos", groups.join(", "));
+    }
+    // Who monitorzinho itself runs as, which is only interesting when it differs.
+    if let Some(process_user) = std::env::var("USER").ok().filter(|u| *u != name) {
+        section.push("Processo rodando como", process_user);
+    }
+    section
+}
+
+/// Group name for a gid, from `/etc/group` — the group-side twin of `user_name`.
+fn user_group_name(gid: u32) -> Option<String> {
+    let content = fs::read_to_string("/etc/group").ok()?;
+    content.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        let group = fields.first()?;
+        (fields.get(2)?.parse::<u32>().ok()? == gid).then(|| group.to_string())
+    })
+}
+
+fn dns_section() -> DetailSection {
+    let mut section = DetailSection::new("Resolução de nomes");
+    let servers = resolv_conf("nameserver", "/etc/resolv.conf");
+    if servers.is_empty() {
+        section.push("Servidores", "nenhum em /etc/resolv.conf");
+    }
+    for (i, server) in servers.iter().enumerate() {
+        section.push(&format!("Servidor {}", i + 1), server.clone());
+    }
+    for search in resolv_conf("search", "/etc/resolv.conf") {
+        section.push("Domínios de busca", search);
+    }
+    for option in resolv_conf("options", "/etc/resolv.conf") {
+        section.push("Opções", option);
+    }
+    // A stub resolver listening on loopback answers every query itself; the servers it
+    // actually forwards to are the ones worth knowing, and they're in its own file.
+    if servers.iter().any(|s| s.starts_with("127.")) {
+        let upstream = resolv_conf("nameserver", "/run/systemd/resolve/resolv.conf");
+        section.push(
+            "Encaminha para",
+            if upstream.is_empty() {
+                "stub local (127.x) — o destino real não está publicado em /run/systemd/resolve"
+                    .to_string()
+            } else {
+                upstream.join(", ")
+            },
+        );
+    }
+    section
+}
+
+fn cpu_section(state: &SystemState) -> DetailSection {
+    let mut section = DetailSection::new("Processador");
+    let blocks = cpuinfo();
+    let first = blocks.first();
+    if let Some(model) = first.and_then(|b| b.get("model name")) {
+        section.push("Modelo", model.clone());
+    }
+    if let Some(vendor) = first.and_then(|b| b.get("vendor_id")) {
+        section.push("Fabricante", vendor.clone());
+    }
+    let logical = state.sys.cpus().len().max(blocks.len());
+    match sysinfo::System::physical_core_count() {
+        Some(physical) => {
+            section.push("Núcleos", format!("{physical} físicos · {logical} lógicos"))
+        }
+        None => section.push("Núcleos", format!("{logical} lógicos")),
+    }
+    // Read per-core rather than from the first block alone: on a machine with efficiency
+    // cores, or one whose governor has half the cores parked, a single number is a lie.
+    let clocks: Vec<f64> = blocks
+        .iter()
+        .filter_map(|b| b.get("cpu MHz")?.parse().ok())
+        .collect();
+    if let (Some(min), Some(max)) = (
+        clocks.iter().cloned().reduce(f64::min),
+        clocks.iter().cloned().reduce(f64::max),
+    ) {
+        let average = clocks.iter().sum::<f64>() / clocks.len() as f64;
+        section.push(
+            "Frequência agora",
+            format!("{average:.0} MHz em média · {min:.0} a {max:.0} MHz entre os núcleos"),
+        );
+    }
+    if let (Some(min), Some(max)) = (
+        read_line("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq"),
+        read_line("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"),
+    ) {
+        let mhz = |khz: String| khz.parse::<f64>().unwrap_or(0.0) / 1000.0;
+        section.push(
+            "Faixa do hardware",
+            format!("{:.0} a {:.0} MHz", mhz(min), mhz(max)),
+        );
+    }
+    if let Some(governor) = read_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") {
+        section.push("Governador", governor);
+    }
+    for level in 1..=3 {
+        let caches: Vec<String> = (0..8)
+            .filter_map(|index| {
+                let base = format!("/sys/devices/system/cpu/cpu0/cache/index{index}");
+                (read_line(&format!("{base}/level"))? == level.to_string())
+                    .then(|| {
+                        Some(format!(
+                            "{} ({})",
+                            read_line(&format!("{base}/size"))?,
+                            read_line(&format!("{base}/type"))?
+                        ))
+                    })
+                    .flatten()
+            })
+            .collect();
+        if !caches.is_empty() {
+            section.push(&format!("Cache L{level}"), caches.join(" · "));
+        }
+    }
+    // A handful of flags worth recognising, rather than the two hundred the kernel
+    // prints: what accelerates what, and whether this is a guest.
+    if let Some(flags) = first.and_then(|b| b.get("flags")) {
+        let present: Vec<&str> = [
+            "avx512f",
+            "avx2",
+            "avx",
+            "aes",
+            "sha_ni",
+            "vmx",
+            "svm",
+            "hypervisor",
+        ]
+        .into_iter()
+        .filter(|flag| flags.split_whitespace().any(|f| f == *flag))
+        .collect();
+        if !present.is_empty() {
+            section.push("Recursos", present.join(", "));
+        }
+    }
+    section
+}
+
+fn memory_section() -> DetailSection {
+    let info = meminfo();
+    let mut section = DetailSection::new("Memória");
+    let bytes = |key: &str| info.get(key).copied();
+    let show = |section: &mut DetailSection, label: &str, key: &str| {
+        if let Some(value) = bytes(key) {
+            section.push(label, format::human_bytes(value as f64));
+        }
+    };
+    show(&mut section, "Total", "MemTotal");
+    if let (Some(total), Some(available)) = (bytes("MemTotal"), bytes("MemAvailable")) {
+        let used = total.saturating_sub(available);
+        section.push(
+            "Em uso",
+            format!(
+                "{}  ({:.1}%)",
+                format::human_bytes(used as f64),
+                used as f64 / total.max(1) as f64 * 100.0
+            ),
+        );
+        // Not the same as free: what the cache is holding can be handed back on demand,
+        // which is why a Linux machine with almost no "free" memory is usually fine.
+        section.push("Disponível", format::human_bytes(available as f64));
+    }
+    show(&mut section, "Livre de fato", "MemFree");
+    show(&mut section, "Cache de páginas", "Cached");
+    show(&mut section, "Buffers", "Buffers");
+    show(&mut section, "Sujas (a gravar)", "Dirty");
+    show(&mut section, "Compartilhada (tmpfs)", "Shmem");
+    show(&mut section, "Swap total", "SwapTotal");
+    if let (Some(total), Some(free)) = (bytes("SwapTotal"), bytes("SwapFree")) {
+        section.push(
+            "Swap em uso",
+            format::human_bytes(total.saturating_sub(free) as f64),
+        );
+    }
+    section
+}
+
+fn disk_section(disks: &Disks) -> DetailSection {
+    let mut section = DetailSection::new("Sistemas de arquivos");
+    for disk in disks.list() {
+        let total = disk.total_space();
+        let free = disk.available_space();
+        let used = total.saturating_sub(free);
+        let percent = if total > 0 {
+            used as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        section.push(
+            &disk.mount_point().to_string_lossy(),
+            format!(
+                "{} de {} ({:.0}%) · livre {} · {}{}",
+                format::human_bytes(used as f64),
+                format::human_bytes(total as f64),
+                percent,
+                format::human_bytes(free as f64),
+                disk.file_system().to_string_lossy(),
+                if disk.is_removable() {
+                    " · removível"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
+    if section.fields.is_empty() {
+        section.push("Montagens", "nenhuma legível");
+    }
+    section
+}
+
+/// Every interface with what it is and where it is, for the rows that are about the
+/// machine's place on the network. The Interfaces panel next door goes deeper on one;
+/// this is the whole list at a glance.
+fn network_section(networks: &Networks) -> DetailSection {
+    let mut section = DetailSection::new("Interfaces");
+    for interface in iface::interfaces(networks) {
+        let mut value = format!("{}  ·  {}", interface.address_summary(), interface.kind);
+        if let Some(mac) = &interface.mac {
+            value.push_str(&format!("  ·  {mac}"));
+        }
+        section.push(&interface.name, value);
+    }
+    if section.fields.is_empty() {
+        section.push("Interfaces", "nenhuma encontrada em /sys/class/net");
+    }
+    section
+}
+
+fn gateway_section() -> DetailSection {
+    let mut section = DetailSection::new("Saída para a rede");
+    let routes = default_routes();
+    if routes.is_empty() {
+        section.push(
+            "Rota padrão",
+            "nenhuma — esta máquina não tem saída roteada",
+        );
+    }
+    for (interface, gateway, metric) in &routes {
+        section.push(
+            &format!("Via {interface}"),
+            format!("{gateway}  ·  métrica {metric}"),
+        );
+        if let Some(mac) = arp_mac(&gateway.to_string()) {
+            section.push("MAC do gateway", mac);
+        }
+    }
+    if let Some(ip) = outbound_ip() {
+        section.push("Endereço de origem", ip.to_string());
+    }
+    section
+}
+
+fn gpu_section(nvml: &Nvml) -> DetailSection {
+    let mut section = DetailSection::new("GPU");
+    if let Ok(version) = nvml.sys_driver_version() {
+        section.push("Driver", version);
+    }
+    let Ok(device) = nvml.device_by_index(0) else {
+        section.push("Dispositivo", "não pôde ser aberto");
+        return section;
+    };
+    if let Ok(name) = device.name() {
+        section.push("Modelo", name);
+    }
+    if let Ok(memory) = device.memory_info() {
+        section.push(
+            "Memória",
+            format!(
+                "{} de {} em uso",
+                format::human_bytes(memory.used as f64),
+                format::human_bytes(memory.total as f64)
+            ),
+        );
+    }
+    if let Ok(utilization) = device.utilization_rates() {
+        section.push(
+            "Utilização",
+            format!(
+                "{}% núcleo · {}% memória",
+                utilization.gpu, utilization.memory
+            ),
+        );
+    }
+    if let Ok(temperature) =
+        device.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
+    {
+        section.push("Temperatura", format!("{temperature} °C"));
+    }
+    if let Ok(power) = device.power_usage() {
+        section.push("Consumo", format!("{:.1} W", power as f64 / 1000.0));
+    }
+    section
+}
+
+impl SummaryMonitor {
+    /// The rest of one summarised fact. `None` for a field with nothing more behind it
+    /// than the row already shows, which is how a row opts out of Enter.
+    fn detail_for(&mut self, state: &SystemState, field: &str) -> Option<Detail> {
+        let sections = match field {
+            "Host" => {
+                let mut section = DetailSection::new("Identidade");
+                section.push("Nome", hostname());
+                if let Some(domain) = resolv_conf("search", "/etc/resolv.conf").first() {
+                    section.push("Domínio de busca", domain.clone());
+                }
+                if let Some(id) = read_line("/etc/machine-id") {
+                    section.push("machine-id", id);
+                }
+                if let Some(boot) = read_line("/proc/sys/kernel/random/boot_id") {
+                    section.push("boot-id (muda a cada boot)", boot);
+                }
+                section.push(
+                    "Ligado há",
+                    format::human_duration(sysinfo::System::uptime()),
+                );
+                vec![section]
+            }
+            "OS" => os_detail(),
+            "Machine" | "Board" => vec![machine_section()],
+            "Virtual" => {
+                let mut section = DetailSection::new("Virtualização");
+                section.push(
+                    "Detectado",
+                    virtualization().unwrap_or_else(|| "nada — parece metal puro".to_string()),
+                );
+                if let Ok(cgroup) = fs::read_to_string("/proc/1/cgroup") {
+                    section.push("cgroup do pid 1", cgroup.trim().to_string());
+                }
+                if fs::metadata("/.dockerenv").is_ok() {
+                    section.push("Marcador", "/.dockerenv existe");
+                }
+                if let Some(hint) = dmi("sys_vendor") {
+                    section.push("Fabricante segundo o DMI", hint);
+                }
+                vec![section]
+            }
+            "Uptime" => vec![uptime_section()],
+            "User" => vec![user_section()],
+            "IP" | "Interfaces" => vec![network_section(&state.networks), gateway_section()],
+            "Gateway" => vec![gateway_section(), network_section(&state.networks)],
+            "DNS" => vec![dns_section()],
+            "CPU" => vec![cpu_section(state), uptime_section()],
+            "Memory" => vec![memory_section()],
+            "Disk" => vec![disk_section(&self.disks)],
+            "GPU" => vec![gpu_section(self.nvml.as_ref()?)],
+            _ => return None,
+        };
+        Some(Detail {
+            title: field.to_string(),
+            gone_note: "indisponível",
+            sections,
+            rates: None,
+            handoffs: Vec::new(),
+            handoff_title: "",
+        })
     }
 }
