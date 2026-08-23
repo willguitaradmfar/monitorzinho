@@ -550,42 +550,77 @@ fn parse_dump(data: &[u8], protocol: u8, out: &mut Vec<RawConn>) -> bool {
 /// byte counters — and the row says so rather than showing a zero.
 fn namespace_connections(watcher: &mut netns::Watcher) -> (Vec<RawConn>, usize) {
     let (namespaces, unreadable) = watcher.current();
-    let mut found = Vec::new();
-    for namespace in namespaces {
-        for (proto, family, path) in netns::socket_tables(namespace.pid) {
-            let tcp = proto == "TCP";
-            // Same rule as the host's dump: what's listening belongs to the Ports panel,
-            // and the post-close states are noise nobody owns. Applied while parsing, so
-            // a table that is nine-tenths listeners costs a tenth of the formatting.
-            let wanted = move |state: u8| {
-                if tcp {
-                    TCP_OPEN_STATES & (1 << state as u32) != 0
-                } else {
-                    state as u32 == TCP_ESTABLISHED
-                }
-            };
-            for row in ports::parse_table_where(proto, family, &path, wanted) {
-                found.push(RawConn {
-                    protocol: if tcp { IPPROTO_TCP } else { IPPROTO_UDP },
-                    family: if family == "IPv4" { AF_INET } else { AF_INET6 },
-                    state: row.state,
-                    timer: 0,
-                    expires_ms: 0,
-                    local_ip: row.local_ip.clone(),
-                    local_port: row.local_port,
-                    remote_ip: row.remote_ip.clone(),
-                    remote_port: row.remote_port,
-                    rqueue: row.rx_queue as u32,
-                    wqueue: row.tx_queue as u32,
-                    uid: row.uid,
-                    inode: row.inode as u32,
-                    info: TcpInfo::default(),
-                    namespace: Some(namespace.label.clone()),
-                });
+    // Read in parallel, because each of these files costs the kernel a full walk of that
+    // namespace's socket table formatted as text. On a Kubernetes node — forty-four
+    // namespaces, some with hundreds of sockets — doing it one after another took 440 ms,
+    // which is a keypress that visibly waits. The work is the kernel's, not ours, so
+    // spreading it across cores turns most of that into wall time nobody notices.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
+        .min(namespaces.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let found: Vec<RawConn> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let next = &next;
+                scope.spawn(move || {
+                    let mut mine = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(namespace) = namespaces.get(index) else {
+                            break;
+                        };
+                        read_namespace(namespace, &mut mine);
+                    }
+                    mine
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .flatten()
+            .collect()
+    });
+    (found, unreadable)
+}
+
+/// Every open connection in one namespace, appended to `out`.
+fn read_namespace(namespace: &netns::Namespace, out: &mut Vec<RawConn>) {
+    for (proto, family, path) in netns::socket_tables(namespace.pid) {
+        let tcp = proto == "TCP";
+        // Same rule as the host's dump: what's listening belongs to the Ports panel, and
+        // the post-close states are noise nobody owns. Applied while parsing, so a table
+        // that is nine-tenths listeners costs a tenth of the formatting.
+        let wanted = move |state: u8| {
+            if tcp {
+                TCP_OPEN_STATES & (1 << state as u32) != 0
+            } else {
+                state as u32 == TCP_ESTABLISHED
             }
+        };
+        for row in ports::parse_table_where(proto, family, &path, wanted) {
+            out.push(RawConn {
+                protocol: if tcp { IPPROTO_TCP } else { IPPROTO_UDP },
+                family: if family == "IPv4" { AF_INET } else { AF_INET6 },
+                state: row.state,
+                timer: 0,
+                expires_ms: 0,
+                local_ip: row.local_ip.clone(),
+                local_port: row.local_port,
+                remote_ip: row.remote_ip.clone(),
+                remote_port: row.remote_port,
+                rqueue: row.rx_queue as u32,
+                wqueue: row.tx_queue as u32,
+                uid: row.uid,
+                inode: row.inode as u32,
+                info: TcpInfo::default(),
+                namespace: Some(namespace.label.clone()),
+            });
         }
     }
-    (found, unreadable)
 }
 
 /// Every `protocol` connection (IPv4 and IPv6) whose state is in `states`. Empty on any

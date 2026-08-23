@@ -52,6 +52,43 @@ A tabela de sockets de um container é quase toda `LISTEN` e `TIME_WAIT`. O
 parser formatava os dois endereços de **cada linha** para depois descartar; agora
 o estado é conferido antes, e só o que interessa vira texto.
 
+## Segunda rodada: o lag do Tab (v0.22.2)
+
+O consumo em regime já estava resolvido, mas **trocar de aba continuava travando**
+na máquina com k3s. A causa é outra: `switch_tab` amostrava **antes** de desenhar,
+e essa amostragem custava, medida com o `--bench` novo:
+
+```
+refresh do /proc (sysinfo)     121.6 ms
+Ports                          110.9 ms
+Connections                    457.8 ms   ← netlink 11 ms · namespaces 440 ms
+Interfaces / System Info        27.4 ms
+TOTAL                          718.1 ms
+```
+
+Quatro mudanças, e o mesmo comando agora dá **291 ms** — e nenhum deles é sentido,
+porque a tela é desenhada primeiro:
+
+1. **Ler os 44 namespaces em paralelo** (440 → 111 ms). Cada `/proc/<pid>/net/tcp`
+   faz o kernel percorrer e formatar a tabela inteira; o trabalho é dele, não
+   nosso, então espalhar por núcleos vira tempo de parede que ninguém espera.
+2. **Varrer `/proc/*/fd` em paralelo** (111 → 43 ms) — dezenas de milhares de
+   `readlink` numa máquina cheia.
+3. **`cwd` lido uma vez por processo, não a cada tick.** Era um `readlink` por
+   processo, por tick, e só serve para o detalhe — que agora recarrega o **seu**
+   processo por inteiro (`refresh_one`).
+4. **O `Tab` desenha antes de amostrar.** A aba aparece na hora com o que já tinha,
+   e os números entram logo atrás.
+
+### `--bench`
+
+```sh
+monitorzinho --bench
+```
+Mede uma amostragem da aba Processos — exatamente o que uma troca de aba paga — e
+imprime onde o tempo foi, painel por painel. Duas passagens: a segunda é a que
+conta.
+
 ## Como testar
 
 ### 1. Medir, não achar
@@ -95,3 +132,6 @@ o cache não está expirando; se aparecer instantaneamente, ele não está sendo
 - Trocar de aba demorando visivelmente
 - `strace` mostrando leitura de `/proc/*/net/tcp` por processo
 - Container novo demorando muito mais que 5s para entrar na lista
+- `--bench` acima de ~350 ms num nó de porte grande (o valor de referência aqui é
+  291 ms com 787 processos e 44 namespaces)
+- A aba não aparecer imediatamente ao teclar Tab, mesmo que os números demorem

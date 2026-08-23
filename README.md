@@ -559,6 +559,14 @@ socket tables are read fresh every tick because that is what the panel is about.
 Facts that cannot change while the machine is running — DMI, kernel, model — are
 read once at startup.
 
+Switching to a tab draws it before sampling it, not after: on a busy node the
+sample takes a third of a second, and paying for it before the first frame is
+what turns a keypress into a wait. The two walks that dominate it — the container
+namespaces' socket tables and the `/proc/<pid>/fd` scan — are read across cores,
+since the expensive part is the kernel formatting those tables and that work
+parallelises even though ours barely exists. `monitorzinho --bench` times one such
+sample panel by panel, which is how any of this was decided.
+
 On a Kubernetes node with 789 processes and 44 network namespaces, the Processes
 tab costs about a fifth of one core; getting there meant finding that the first
 version of the namespace scan read a socket table *per process* to test whether it

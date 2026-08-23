@@ -1,6 +1,6 @@
 [package]
 name = "monitorzinho"
-version = "0.22.1"
+version = "0.22.2"
 edition = "2024"
 description = "A lightweight terminal system monitor: CPU, memory, disk, network, and GPU"
 license = "MIT"

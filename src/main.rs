@@ -49,6 +49,11 @@ fn handle_flags() -> bool {
     };
     match flag.as_str() {
         "--version" | "-V" => println!("monitorzinho {}", env!("CARGO_PKG_VERSION")),
+        // A stopwatch on the work that happens when you press Tab. Switching tabs
+        // samples synchronously — the point is to show a filled screen rather than an
+        // empty one — so anything slow in that path is felt as lag, and guessing which
+        // part is slow on somebody else's machine is how the wrong thing gets optimised.
+        "--bench" => app::bench(),
         "--help" | "-h" => {
             println!("monitorzinho {}", env!("CARGO_PKG_VERSION"));
             println!();
@@ -58,7 +63,10 @@ fn handle_flags() -> bool {
             println!("DNS, scanner de rede, inspetor de certificado, receptor de");
             println!("requisições e seguidor de arquivo.");
             println!();
-            println!("uso: monitorzinho [--version] [--help]");
+            println!("uso: monitorzinho [--version] [--help] [--bench]");
+            println!();
+            println!("--bench mede o custo de uma amostragem da aba Processos, que é o");
+            println!("que acontece ao trocar de aba, e imprime onde o tempo foi.");
             println!();
             println!("Não há opções de configuração na linha de comando: tudo é escolhido");
             println!("de dentro, e as teclas de cada tela estão no rodapé dela. Tab troca");
@@ -124,6 +132,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::ZERO)
             .min(REDRAW_SLICE);
+
+        // The tab was just switched and drawn with what it had; now fill it in. Doing
+        // this after the draw rather than before is the whole difference between a
+        // keypress that answers instantly and one that waits for /proc.
+        if app.take_pending_sample() {
+            app.tick();
+            last_tick = Instant::now();
+            dirty = true;
+            continue;
+        }
 
         if event::poll(timeout)? {
             let event = event::read()?;

@@ -72,6 +72,21 @@ impl SystemState {
             .get_or_init(|| iface::interfaces(&self.networks))
     }
 
+    /// Re-reads one process in full, including the fields the per-tick refresh skips
+    /// because they cost a syscall each across the whole machine. Called by a detail
+    /// view, which is about one process and can afford to know everything about it.
+    pub(crate) fn refresh_one(&mut self, pid: u32) {
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+            true,
+            ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_cpu()
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                .with_cwd(UpdateKind::Always),
+        );
+    }
+
     /// Forgets everything memoised for the previous tick. Called at the start of each
     /// refresh, which is the only moment at which any of it could still be true.
     fn start_tick(&mut self) {
@@ -107,9 +122,12 @@ impl SystemState {
                 // A process' argv never changes, so fetch it once and cache it instead
                 // of re-reading /proc/<pid>/cmdline for every process on every tick.
                 .with_cmd(UpdateKind::OnlyIfNotSet)
-                // Unlike argv, cwd can change over a process' lifetime (e.g. a shell
-                // after `cd`), so this one's refreshed every tick.
-                .with_cwd(UpdateKind::Always),
+                // Read once, not every tick. A working directory does change over a
+                // process' lifetime, but reading it means a `readlink` per process on
+                // the machine, and on a busy server that was a measurable slice of what
+                // pressing Tab costs. The one place a stale cwd would mislead is a
+                // detail view, and that refreshes its own process — see `refresh_one`.
+                .with_cwd(UpdateKind::OnlyIfNotSet),
         );
     }
 }

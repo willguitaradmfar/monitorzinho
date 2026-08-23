@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
 use sysinfo::{Pid, Signal};
@@ -205,6 +205,59 @@ impl TableFocus {
             }
         };
         self.focus_row(matches[new_pos as usize]);
+    }
+}
+
+/// Times one full sample of the Processes tab and prints where the time went.
+///
+/// That sample is exactly what a keypress on Tab pays for, so this is the measurement
+/// that matters for how the app *feels*, as opposed to the steady-state CPU a `top`
+/// would show. Run on the machine that feels slow: the answer differs by an order of
+/// magnitude between a laptop and a node running hundreds of containers.
+pub fn bench() {
+    let mut state = SystemState::new();
+    let mut monitors = monitor::all_table_monitors();
+
+    println!(
+        "monitorzinho {} — amostragem da aba Processos",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!();
+    // Twice: the first pass fills every cache in the process and in the kernel, and the
+    // second is what a running app actually pays each time.
+    for pass in 1..=2 {
+        let started = Instant::now();
+        state.refresh_processes();
+        let refreshed = started.elapsed();
+        println!(
+            "passagem {pass}{}",
+            if pass == 1 {
+                " (fria)"
+            } else {
+                " (quente — é esta que conta)"
+            }
+        );
+        println!(
+            "  {:<28}{:>8.1} ms",
+            "refresh do /proc (sysinfo)",
+            refreshed.as_secs_f64() * 1000.0
+        );
+
+        let mut total = refreshed;
+        for monitor in monitors.iter_mut() {
+            let at = Instant::now();
+            let rows = monitor.sample(&state, Some(OVERVIEW_TABLE_ROWS));
+            let elapsed = at.elapsed();
+            total += elapsed;
+            println!(
+                "  {:<28}{:>8.1} ms   ({} linha(s))",
+                monitor.title(),
+                elapsed.as_secs_f64() * 1000.0,
+                rows.len()
+            );
+        }
+        println!("  {:<28}{:>8.1} ms", "TOTAL", total.as_secs_f64() * 1000.0);
+        println!();
     }
 }
 
@@ -758,6 +811,9 @@ pub struct App {
     /// second Ctrl+C pressed straight after the first, so a stray one never kills a
     /// session that's carrying live executions.
     pub quit_armed: bool,
+    /// Set when the tab changed and its data hasn't been refreshed yet — see
+    /// `switch_tab`.
+    pending_sample: bool,
     /// A destructive key waiting to be confirmed. Sits above every screen and takes
     /// every key while it's open, so nothing underneath can act on the keypress that
     /// dismisses it.
@@ -829,6 +885,7 @@ impl App {
             focus: Focus::None,
             tab: Tab::Overview,
             quit_armed: false,
+            pending_sample: false,
             pending: None,
             state: SystemState::new(),
             ticks_since_save: 0,
@@ -850,7 +907,19 @@ impl App {
             return;
         }
         self.tab = tab;
-        self.sample_active_tab();
+        // Not sampled here. Sampling the Processes tab means reading /proc for every
+        // process on the machine, which on a busy server is a third of a second — and
+        // doing it before the first draw is what turns a keypress into a wait. The tab
+        // is drawn with what it already has and `pending_sample` makes the loop fill it
+        // in immediately afterwards, so the key answers at once and the numbers land a
+        // moment later.
+        self.pending_sample = true;
+    }
+
+    /// Whether the loop owes the newly-shown tab a sample. Taken, not peeked: asking is
+    /// what clears it.
+    pub fn take_pending_sample(&mut self) -> bool {
+        std::mem::take(&mut self.pending_sample)
     }
 
     /// Cycles to the next/previous tab, wrapping around.
@@ -912,23 +981,36 @@ impl App {
                     _ => None,
                 };
                 if let Some(idx) = frozen_idx {
+                    // Before the monitor is borrowed: a detail view is about one process
+                    // and can afford to know everything about it, including the fields
+                    // the machine-wide refresh skips because they cost a syscall each,
+                    // across every process, on every tick.
+                    if let Focus::Detail(df) = &self.focus
+                        && df.row.pid != 0
+                    {
+                        let pid = df.row.pid;
+                        self.state.refresh_one(pid);
+                    }
                     let monitor = self.table_monitors[idx].as_mut();
                     match &mut self.focus {
                         Focus::Table(tf) => monitor.refresh_values(&self.state, &mut tf.rows),
                         // Rebuilt rather than patched in place: a detail is a few dozen
                         // formatted strings, cheap enough that tracking which of them
                         // changed would cost more than just building them again.
-                        Focus::Detail(df) => match monitor.detail(&self.state, &df.row) {
-                            Some(detail) => {
-                                if let Some(rates) = &detail.rates {
-                                    df.down.push(rates.values.0);
-                                    df.up.push(rates.values.1);
+                        Focus::Detail(df) => {
+                            let detail = monitor.detail(&self.state, &df.row);
+                            match detail {
+                                Some(detail) => {
+                                    if let Some(rates) = &detail.rates {
+                                        df.down.push(rates.values.0);
+                                        df.up.push(rates.values.1);
+                                    }
+                                    df.detail = detail;
+                                    df.gone = false;
                                 }
-                                df.detail = detail;
-                                df.gone = false;
+                                None => df.gone = true,
                             }
-                            None => df.gone = true,
-                        },
+                        }
                         _ => {}
                     }
                 }

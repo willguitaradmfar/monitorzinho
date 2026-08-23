@@ -175,15 +175,52 @@ fn listening_ports(sockets: &[SocketRow]) -> BTreeMap<(&'static str, u16), u64> 
 /// permission to inspect are silently skipped — their ports just show no owner.
 /// Shared with `connections`, which needs the same inode→pid mapping.
 pub(super) fn inode_to_pid() -> HashMap<u64, u32> {
-    let mut map = HashMap::new();
     let Ok(proc_dir) = fs::read_dir("/proc") else {
-        return map;
+        return HashMap::new();
     };
-    for entry in proc_dir.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        for inode in socket_inodes(pid) {
+    let pids: Vec<u32> = proc_dir
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
+        .collect();
+
+    // Split across cores: this is one `readdir` plus a `readlink` per descriptor for
+    // every process on the machine, which on a busy server is tens of thousands of
+    // syscalls and the second-largest thing a tick pays for. Every worker builds its own
+    // map and they are merged, so nothing is shared while the walking happens.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
+        .min(pids.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let maps: Vec<HashMap<u64, u32>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let (next, pids) = (&next, &pids);
+                scope.spawn(move || {
+                    let mut mine = HashMap::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&pid) = pids.get(index) else { break };
+                        for inode in socket_inodes(pid) {
+                            mine.entry(inode).or_insert(pid);
+                        }
+                    }
+                    mine
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect()
+    });
+
+    let mut map = HashMap::new();
+    for partial in maps {
+        for (inode, pid) in partial {
+            // First writer wins, as before: a socket shared by a parent and its child
+            // belongs to whichever we happened to see first, and both are true.
             map.entry(inode).or_insert(pid);
         }
     }
