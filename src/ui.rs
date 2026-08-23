@@ -1824,21 +1824,13 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
         return;
     };
 
-    let mut hint = if monitor.query.is_empty() {
+    let hint = if monitor.query.is_empty() {
         "digite p/ buscar · Tab hex · Ctrl+L limpar · ↑/↓ e PgUp/PgDn rolar · End seguir · Esc voltar"
             .to_string()
     } else {
         "↑/↓ resultado anterior/próximo · Ctrl+F filtrar · Tab hex · Ctrl+L limpar log · End seguir · Esc limpar busca"
             .to_string()
     };
-    // Offered only once this execution has found something to hand over: on a tunnel,
-    // or on a scan that hasn't run yet, Ctrl+P opens nothing.
-    if app
-        .tool_for(execution)
-        .is_some_and(|tool| !tool.handoffs(execution).is_empty())
-    {
-        hint = format!("Ctrl+P criar execução · {hint}");
-    }
     // The borders are drawn only once the title is known, and the title carries the
     // match count — so the inner area comes from the same block shape up front.
     let outer = Block::default().borders(Borders::ALL);

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::monitor::resolve;
 
-use super::{EventKind, Execution, Handoff, ParamSpec, Recorder, Tool};
+use super::{EventKind, Execution, ParamSpec, Recorder, Tool};
 
 /// Ports probed to provoke *any* answer. Chosen to cover the things that tend to be
 /// listening on a LAN, but a refusal from a closed one counts just as much.
@@ -152,20 +152,6 @@ impl Tool for NetTool {
 
     fn columns(&self, execution: &Execution) -> (String, String) {
         execution.outcome()
-    }
-
-    /// Every host found, ready to be handed to the port scanner. This is the pair the
-    /// tool exists for: find what's out there, then look at one of them properly.
-    fn handoffs(&self, execution: &Execution) -> Vec<Handoff> {
-        execution
-            .findings("ip")
-            .into_iter()
-            .map(|address| Handoff {
-                label: format!("varrer portas de {address}"),
-                tool: "scan",
-                params: vec![("alvo", address), ("faixa", "comuns".to_string())],
-            })
-            .collect()
     }
 }
 

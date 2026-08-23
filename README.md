@@ -389,9 +389,16 @@ Three small traits drive everything:
 - `Tool` — something that runs: it declares the parameters the wizard should
   ask for, then starts threads and reports back through a shared event log and
   two columns of its execution's row. Say `on_demand()` and it starts nothing
-  until the user opens it; return `handoffs()` and what it found becomes
-  another tool's input. Implement it in `src/tools/<name>.rs` and add it to
+  until the user opens it. Implement it in `src/tools/<name>.rs` and add it to
   `all_tools()`.
+
+Findings are typed, and what a finding is *worth doing* is decided by its type in
+one place (`tools::offers_for`), not by the tool that found it. An address is an
+address whether a network sweep, a DNS investigation or a certificate turned it
+up, and it is always worth scanning and always worth reading a certificate off.
+So a tool records what it found — `found("ip", …)`, `found("dominio", …)`,
+`found("porta-tls", …)` — and is wired into every other tool for free; a new tool
+that consumes addresses becomes reachable from every existing one at once.
 
 There are no bindings crates for the Linux-specific parts: the socket tables
 come from a hand-rolled netlink `SOCK_DIAG` client and from `/proc/net/{tcp,udp}`

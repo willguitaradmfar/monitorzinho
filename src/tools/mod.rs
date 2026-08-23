@@ -141,8 +141,13 @@ pub trait Tool: Send + Sync {
     /// holding a list of addresses and the port scanner starts by asking for one, so
     /// the answer to the first is the input to the second — retyping it by hand is
     /// busywork the tools can spare the user.
-    fn handoffs(&self, _execution: &Execution) -> Vec<Handoff> {
-        Vec::new()
+    ///
+    /// The default is the whole answer for every tool shipped so far: record findings
+    /// with `Recorder::found` and what they're worth doing is decided by their kind in
+    /// `offers_for`. Override it only for an offer that depends on something other than
+    /// the findings themselves.
+    fn handoffs(&self, execution: &Execution) -> Vec<Handoff> {
+        offers_from(execution)
     }
 }
 
@@ -154,6 +159,153 @@ pub struct Handoff {
     pub tool: &'static str,
     /// Parameters to pre-fill; anything not named keeps the tool's default.
     pub params: Vec<(&'static str, String)>,
+}
+
+/// What can be done with one finding, decided by what the finding *is*.
+///
+/// This is the whole point of typed findings. An address is an address whether a network
+/// sweep, a DNS investigation or a certificate reader turned it up, and what an address
+/// is worth doing — scan its ports, read its certificate — is a property of addresses,
+/// not of the tool that happened to produce one. Writing the offers here instead of in
+/// each tool means a tool earns every hand-off in the app by recording what it found,
+/// and a new tool that consumes addresses becomes available to every existing tool at
+/// once.
+///
+/// The kinds, and what they carry:
+///
+/// * `ip` — a bare address
+/// * `dominio` — a domain or host name
+/// * `mx` — a mail exchanger's host name
+/// * `porta` — `host:porta`, open, plaintext as far as anyone knows
+/// * `porta-tls` — `host:porta`, open and answered a TLS handshake
+/// * `rede` — a CIDR
+pub fn offers_for(kind: &str, value: &str) -> Vec<Handoff> {
+    match kind {
+        "ip" => vec![
+            Handoff {
+                label: format!("varrer portas de {value}"),
+                tool: "scan",
+                params: vec![("alvo", value.to_string()), ("faixa", "comuns".to_string())],
+            },
+            Handoff {
+                label: format!("ler o certificado de {value}:443"),
+                tool: "cert",
+                params: vec![("alvo", value.to_string()), ("porta", "443".to_string())],
+            },
+        ],
+        "dominio" => vec![
+            Handoff {
+                label: format!("investigar o DNS de {value}"),
+                tool: "dns",
+                params: vec![("dominio", value.to_string())],
+            },
+            Handoff {
+                label: format!("ler o certificado de {value}"),
+                tool: "cert",
+                params: vec![
+                    ("alvo", value.to_string()),
+                    ("porta", "443".to_string()),
+                    ("sni", value.to_string()),
+                ],
+            },
+            Handoff {
+                label: format!("varrer portas de {value}"),
+                tool: "scan",
+                params: vec![("alvo", value.to_string()), ("faixa", "comuns".to_string())],
+            },
+        ],
+        // A mail exchanger is a host name like any other, plus the one thing that is
+        // only true of mail exchangers: its certificate lives behind STARTTLS on 25.
+        "mx" => vec![
+            Handoff {
+                label: format!("ler o certificado de {value} (SMTP, porta 25)"),
+                tool: "cert",
+                params: vec![
+                    ("alvo", value.to_string()),
+                    ("porta", "25".to_string()),
+                    ("starttls", "smtp".to_string()),
+                ],
+            },
+            Handoff {
+                label: format!("investigar o DNS de {value}"),
+                tool: "dns",
+                params: vec![("dominio", value.to_string())],
+            },
+        ],
+        "porta" | "porta-tls" => {
+            let Some((host, port)) = value.rsplit_once(':') else {
+                return Vec::new();
+            };
+            let Ok(number) = port.parse::<u16>() else {
+                return Vec::new();
+            };
+            let tls = kind == "porta-tls";
+            let mut offers = Vec::new();
+            if tls {
+                offers.push(Handoff {
+                    label: format!("ler o certificado de {value}"),
+                    tool: "cert",
+                    params: vec![
+                        ("alvo", host.to_string()),
+                        ("porta", port.to_string()),
+                        ("sni", host.to_string()),
+                    ],
+                });
+            }
+            offers.push(Handoff {
+                label: if tls {
+                    format!("túnel decifrando o tráfego de {value}")
+                } else {
+                    format!("túnel gravando o tráfego de {value}")
+                },
+                tool: "tunnel",
+                params: vec![
+                    ("proto", "TCP".to_string()),
+                    // One number to the right, since the port itself is taken on the
+                    // far side and usually on this one too.
+                    ("listen", format!("127.0.0.1:{}", number.saturating_add(1))),
+                    ("target", value.to_string()),
+                    (
+                        "tls",
+                        if tls {
+                            // The scanner never verified anything either — it's a probe,
+                            // not a client that trusts the port.
+                            "sim, sem validar certificado".to_string()
+                        } else {
+                            "não".to_string()
+                        },
+                    ),
+                ],
+            });
+            offers
+        }
+        "rede" => vec![Handoff {
+            label: format!("varrer a rede {value}"),
+            tool: "net",
+            params: vec![("rede", value.to_string())],
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// Every offer an execution's findings add up to, deduplicated and in a stable order:
+/// the default answer for every tool, and the reason a tool only has to record what it
+/// found to be wired into all the others.
+pub fn offers_from(execution: &Execution) -> Vec<Handoff> {
+    let mut offers: Vec<Handoff> = Vec::new();
+    for (kind, value) in execution.all_findings() {
+        for offer in offers_for(&kind, &value) {
+            // The same address can be found twice over — as an A record and again in
+            // the reverse lookup — and the picker should show one row for it.
+            if !offers
+                .iter()
+                .any(|seen| seen.tool == offer.tool && seen.params == offer.params)
+            {
+                offers.push(offer);
+            }
+        }
+    }
+    offers
 }
 
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
@@ -469,11 +621,18 @@ impl Recorder {
     /// Records something structured the tool found — an address, a hostname — for
     /// another tool to be offered. The log is for reading; this is for acting on.
     pub fn found(&self, kind: &str, value: impl Into<String>) {
+        let value = value.into();
+        // A domain whose MX is the root label — RFC 7505's way of saying "this domain
+        // takes no mail" — trims to nothing, and an offer to read the certificate of
+        // nowhere helps no one.
+        if value.trim().is_empty() {
+            return;
+        }
         let mut findings = self
             .findings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = (kind.to_string(), value.into());
+        let entry = (kind.to_string(), value);
         if !findings.contains(&entry) {
             findings.push(entry);
         }
@@ -609,15 +768,13 @@ impl Execution {
         }
     }
 
-    /// What the tool found of one kind, in the order it found it.
-    pub fn findings(&self, kind: &str) -> Vec<String> {
+    /// Everything this execution found, kind and value, in the order it was found.
+    /// What each kind is *worth doing* is decided in one place — see `offers_for`.
+    pub fn all_findings(&self) -> Vec<(String, String)> {
         self.findings
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .filter(|(found, _)| found == kind)
-            .map(|(_, value)| value.clone())
-            .collect()
+            .clone()
     }
 
     /// The tool's own two result columns, blank until it has run.

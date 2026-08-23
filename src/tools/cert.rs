@@ -18,7 +18,7 @@ use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use super::x509::Cert;
-use super::{EventKind, Execution, Handoff, ParamSpec, Recorder, Tool, x509};
+use super::{EventKind, Execution, ParamSpec, Recorder, Tool, x509};
 
 /// Certificates issued for longer than this stopped being accepted by browsers in 2020.
 /// One that still has it was issued by something that isn't watching.
@@ -141,18 +141,6 @@ impl Tool for CertTool {
     fn columns(&self, execution: &Execution) -> (String, String) {
         execution.outcome()
     }
-
-    fn handoffs(&self, execution: &Execution) -> Vec<Handoff> {
-        execution
-            .findings("ip")
-            .into_iter()
-            .map(|address| Handoff {
-                label: format!("varrer portas de {address}"),
-                tool: "scan",
-                params: vec![("alvo", address), ("faixa", "comuns".to_string())],
-            })
-            .collect()
-    }
 }
 
 struct Plan {
@@ -229,6 +217,12 @@ fn inspect(plan: Plan, rec: &Recorder) {
         ),
     );
     rec.found("ip", plan.address.ip().to_string());
+    // The name asked for, and every name the certificate turned out to cover: a
+    // certificate is one of the better sources of domains there is, and each of them is
+    // worth investigating or reading in its own right.
+    if plan.target.parse::<std::net::IpAddr>().is_err() {
+        rec.found("dominio", plan.target.clone());
+    }
 
     // Accepting anything first: a certificate that fails verification is exactly the one
     // worth reading, and refusing to read it would answer the question with silence.
@@ -267,6 +261,12 @@ fn inspect(plan: Plan, rec: &Recorder) {
 
     section(rec, "Certificado do servidor");
     report_certificate(rec, leaf, true);
+    for name in &leaf.dns_names {
+        // A wildcard names no host in particular, so there is nothing to point a tool at.
+        if !name.starts_with('*') {
+            rec.found("dominio", name.clone());
+        }
+    }
 
     if chain.certificates.len() > 1 {
         section(rec, "Cadeia enviada pelo servidor");

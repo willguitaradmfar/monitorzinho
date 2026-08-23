@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::{EventKind, Execution, Handoff, ParamSpec, Recorder, Tool};
+use super::{EventKind, Execution, ParamSpec, Recorder, Tool};
 use wire::{Rdata, Record, Response};
 
 /// Names tried under the domain when subdomain discovery is on. Not a wordlist in the
@@ -278,21 +278,6 @@ impl Tool for DnsTool {
     fn columns(&self, execution: &Execution) -> (String, String) {
         execution.outcome()
     }
-
-    /// Every address the investigation turned up, offered to the port scanner. Finding
-    /// where a domain lives and then having to retype the address into another form is
-    /// exactly the busywork this pair of tools should save.
-    fn handoffs(&self, execution: &Execution) -> Vec<Handoff> {
-        execution
-            .findings("ip")
-            .into_iter()
-            .map(|address| Handoff {
-                label: format!("varrer portas de {address}"),
-                tool: "scan",
-                params: vec![("alvo", address), ("faixa", "comuns".to_string())],
-            })
-            .collect()
-    }
 }
 
 #[derive(Clone)]
@@ -417,6 +402,7 @@ fn investigate(plan: Plan, rec: &Recorder) {
     );
     rec.report("investigando…", "");
 
+    rec.found("dominio", plan.domain.clone());
     let apex = sweep_apex(&plan, rec, &mut tally);
     let servers = authoritative(&plan, rec, &mut tally);
     compare_serials(&plan, rec, &servers);
@@ -914,6 +900,9 @@ fn mail(plan: &Plan, rec: &Recorder, apex: &[Record], tally: &mut Tally) {
         );
     }
     for (preference, host) in &hosts {
+        // Published so the certificate reader can be pointed at it: a mail exchanger
+        // has a certificate too, and nobody ever remembers to check it.
+        rec.found("mx", host.trim_end_matches('.'));
         let mut addresses = Vec::new();
         for rtype in [wire::A, wire::AAAA] {
             if let Ok(answer) = ask(plan, host, rtype) {
@@ -1182,6 +1171,11 @@ fn subdomains(plan: &Plan, rec: &Recorder, tally: &mut Tally) {
 
     let names: HashSet<&String> = found.iter().map(|record| &record.name).collect();
     tally.subdomains = names.len();
+    // Each name that exists is a domain in its own right — worth its own investigation
+    // or its own certificate, and the hand-off picker is where that gets decided.
+    for name in &names {
+        rec.found("dominio", name.trim_end_matches('.'));
+    }
     if found.is_empty() {
         rec.record(
             0,
@@ -1262,6 +1256,9 @@ fn derived_names(
                 "   {published} nome(s) citados nos registros do domínio"
             )),
         );
+    }
+    for name in &names {
+        rec.found("dominio", name.trim_end_matches('.'));
     }
 
     let mut external: HashSet<String> = HashSet::new();

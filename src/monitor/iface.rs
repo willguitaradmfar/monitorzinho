@@ -527,15 +527,12 @@ impl TableMonitor for InterfacesMonitor {
 
         // A sweep of the network this interface is on: the addresses are right here, and
         // typing a CIDR back in by hand while looking at it is work the app can spare.
+        // What a network is worth doing is decided where it is for every other tool.
         let handoffs = interface
             .addresses
             .iter()
             .filter(|address| !address.contains(':'))
-            .map(|address| crate::tools::Handoff {
-                label: format!("varrer a rede de {} ({address})", interface.name),
-                tool: "net",
-                params: vec![("rede", address.clone())],
-            })
+            .flat_map(|address| crate::tools::offers_for("rede", address))
             .collect();
 
         Some(Detail {

@@ -357,6 +357,20 @@ fn scan(plan: Plan, rec: &Recorder) {
                 found.detail
             )),
         );
+        // Published for the other tools. An open port is a tunnel's whole
+        // configuration, and one that answered a TLS handshake is a certificate
+        // waiting to be read — both carry the host, since a hand-off is built from
+        // the finding alone.
+        rec.found(
+            // One kind or the other, never both: a TLS port's offers include the plain
+            // ones, and recording it twice would put the same tunnel in the list twice.
+            if found.detail.contains("TLS (") {
+                "porta-tls"
+            } else {
+                "porta"
+            },
+            format!("{}:{}", plan.host, found.port),
+        );
     }
 
     let seen = done.load(Ordering::Relaxed);

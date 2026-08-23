@@ -380,6 +380,19 @@ impl RawConn {
 /// Both ends are offered because which one is the server depends on which way the
 /// connection was opened, and reading that off the port numbers would be guessing. They
 /// are labelled as what they are, and identical ends collapse to one.
+/// What a connection is worth doing next. Relaying either end is particular to a
+/// connection — it's the one thing that needs both addresses and the protocol — and
+/// everything else the remote address is worth is decided by it being an address, in
+/// the one table that decides that for every tool.
+fn offers(c: &RawConn, proto: &str) -> Vec<Handoff> {
+    let mut offers = tunnels(c, proto);
+    let loopback = c.remote_ip.starts_with("127.") || c.remote_ip == "::1";
+    if !c.remote_ip.is_empty() && !loopback {
+        offers.extend(crate::tools::offers_for("ip", &c.remote_ip));
+    }
+    offers
+}
+
 fn tunnels(c: &RawConn, proto: &str) -> Vec<Handoff> {
     let mut offers: Vec<Handoff> = Vec::new();
     for (side, ip, port) in [
@@ -760,8 +773,8 @@ impl ConnectionsMonitor {
                 labels: ("↓ Recebendo", "↑ Enviando"),
                 values: (down, up),
             }),
-            handoffs: tunnels(c, proto),
-            handoff_title: "Túnel a partir desta conexão",
+            handoffs: offers(c, proto),
+            handoff_title: "A partir desta conexão",
         }
     }
 
