@@ -36,17 +36,22 @@ const UT_HOST: usize = 76;
 const UT_HOST_LEN: usize = 256;
 const UT_TV_SEC: usize = 340;
 
-/// A live login slot from utmp — one per tty session, however it was opened (SSH,
-/// console, X, a re-attached tmux, ...). `is_ssh_session` below narrows this down to
-/// genuine SSH logins, since a non-empty `host` alone isn't a reliable signal — e.g. a
-/// local tmux re-attach or the X display both populate it too (as `will(tmux(...).%1)`
-/// or `:0`).
-struct UtmpEntry {
+/// A live login session, as either source records it — one per tty session, however it
+/// was opened (SSH, console, X, a re-attached tmux, ...).
+struct Session {
     pid: u32,
+    /// The terminal, when the source names it. utmp always does; logind mostly
+    /// doesn't, and `tty_of` reads it back off the processes instead.
     line: String,
     user: String,
     host: String,
     login_time: u64,
+    /// Whether the source itself vouched that this is an SSH login. utmp doesn't — a
+    /// non-empty `host` alone isn't a reliable signal there, since a local tmux
+    /// re-attach or the X display populate it too (as `will(tmux(...).%1)` or `:0`) —
+    /// so those entries still go through `is_ssh_session`. logind names the PAM
+    /// service that opened the session, which is a direct answer.
+    vouched_ssh: bool,
 }
 
 fn cstr(bytes: &[u8]) -> String {
@@ -54,17 +59,16 @@ fn cstr(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// Every logged-in session in the system's utmp database. Empty if it can't be read
-/// (unsupported platform, permissions) — same best-effort fallback used elsewhere in
-/// this module for `/proc`-derived data.
-fn read_utmp() -> Vec<UtmpEntry> {
-    let Some(data) = UTMP_PATHS.iter().find_map(|p| fs::read(p).ok()) else {
-        return Vec::new();
-    };
+/// Every logged-in session in the system's utmp database, or `None` when the machine
+/// keeps no utmp at all — which is the one case `sessions` has to tell apart from an
+/// utmp that's simply empty because nobody is logged in.
+fn read_utmp() -> Option<Vec<Session>> {
+    let data = UTMP_PATHS.iter().find_map(|p| fs::read(p).ok())?;
     // `as_chunks` rather than `chunks_exact`: the record size is a constant, so each
     // chunk comes back as a fixed-size array and the trailing partial record (a
     // truncated utmp) is dropped by the same token.
-    data.as_chunks::<RECORD_SIZE>()
+    let entries = data
+        .as_chunks::<RECORD_SIZE>()
         .0
         .iter()
         .filter_map(|rec| {
@@ -78,34 +82,108 @@ fn read_utmp() -> Vec<UtmpEntry> {
             }
             let login_time =
                 i32::from_ne_bytes(rec[UT_TV_SEC..UT_TV_SEC + 4].try_into().unwrap()).max(0) as u64;
-            Some(UtmpEntry {
+            Some(Session {
                 pid: pid as u32,
                 line: cstr(&rec[UT_LINE..UT_LINE + UT_LINE_LEN]),
                 user: cstr(&rec[UT_USER..UT_USER + UT_USER_LEN]),
                 host: cstr(&rec[UT_HOST..UT_HOST + UT_HOST_LEN]),
                 login_time,
+                vouched_ssh: false,
             })
         })
+        .collect();
+    Some(entries)
+}
+
+// --- logind sessions -----------------------------------------------------------------
+//
+// systemd can be built without utmp support (`-UTMP` in `systemctl --version`), and
+// from systemd 257 distributions have started shipping it that way — Debian 13 does.
+// On those machines `/run/utmp` doesn't exist at all and `who` reads logind instead;
+// without this fallback the panel is simply empty there, since the file it wants is
+// never coming back.
+//
+// The session files carry the same four facts utmp did — who, from where, since when,
+// and the pid of the session leader — as plain `KEY=value` lines, world-readable. Their
+// header says "This is private data. Do not parse.", which is about the format being
+// unstable rather than secret: the supported route is libsystemd, and linking a C
+// library for four strings is a worse trade than parsing them. So every field is read
+// defensively and a session missing any of them is dropped, which costs a row rather
+// than a crash if the format does move.
+
+const LOGIND_SESSIONS: &str = "/run/systemd/sessions";
+
+/// The PAM service names that mean "somebody logged in over SSH". OpenSSH asks for
+/// `sshd` unless it was built to ask for something else, and `ssh` is the one other
+/// spelling packagers pick — both are accepted rather than betting on the first.
+const SSH_SERVICES: [&str; 2] = ["sshd", "ssh"];
+
+/// Every SSH login logind currently holds open. Sessions of any other class or service
+/// — logind's own `manager-early` bookkeeping, a console login, a display manager —
+/// aren't this panel's subject and are dropped here rather than downstream.
+fn read_logind() -> Vec<Session> {
+    let Ok(dir) = fs::read_dir(LOGIND_SESSIONS) else {
+        return Vec::new();
+    };
+    dir.filter_map(Result::ok)
+        // Beside each session file sits a `<id>.ref` FIFO that logind keeps open for as
+        // long as the session lives; opening it here would block on the writer.
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .filter_map(|content| parse_logind_session(&content))
         .collect()
+}
+
+/// One session file, or `None` if it isn't an SSH login or doesn't carry what a row
+/// needs. `REALTIME` is microseconds since the epoch; `TTY` is usually absent for an
+/// SSH session, because sshd registers the session with PAM before it has allocated the
+/// pty, so the terminal is worked out later from the processes (`tty_of`).
+fn parse_logind_session(content: &str) -> Option<Session> {
+    let fields: HashMap<&str, &str> = content
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+
+    if fields.get("CLASS") != Some(&"user") {
+        return None;
+    }
+    if !SSH_SERVICES.contains(fields.get("SERVICE")?) {
+        return None;
+    }
+    Some(Session {
+        pid: fields.get("LEADER")?.parse().ok()?,
+        line: fields.get("TTY").unwrap_or(&"").to_string(),
+        user: fields.get("USER")?.to_string(),
+        host: fields.get("REMOTE_HOST").unwrap_or(&"").to_string(),
+        login_time: fields.get("REALTIME")?.parse::<u64>().ok()? / 1_000_000,
+        vouched_ssh: true,
+    })
+}
+
+/// Every live login the system will tell us about. utmp stays the source wherever the
+/// machine still keeps one — it's what `who` has always read, and it records the
+/// terminal directly — with logind as the fallback for machines that no longer have the
+/// file at all.
+fn sessions() -> Vec<Session> {
+    read_utmp().unwrap_or_else(read_logind)
 }
 
 const MAX_ANCESTOR_DEPTH: usize = 8;
 
-/// Whether `pid` (utmp's login-slot pid — the session's shell) descends from an `sshd`
-/// process within a handful of generations. This, not a non-empty utmp host, is what
-/// actually distinguishes an SSH login from a local tty/X/tmux session.
+/// The process names OpenSSH runs a login under. Up to 9.7 that was one binary,
+/// `sshd`, for the listener and every connection alike; 9.8 split the per-connection
+/// work out into `sshd-session` (and the authentication step again into `sshd-auth`),
+/// leaving only the listener called `sshd`. Matching just the old name still finds the
+/// listener at the top of the ancestry, so the sessions kept being recognised — but
+/// `sshd_ancestor` would then answer with the *listener*, whose sockets are the ones it
+/// accepts on, not the one this session is.
+const SSHD_NAMES: [&str; 2] = ["sshd", "sshd-session"];
+
+/// Whether `pid` (the session's registered pid) descends from an sshd process within a
+/// handful of generations. This, not a non-empty utmp host, is what actually
+/// distinguishes an SSH login from a local tty/X/tmux session.
 fn is_ssh_session(state: &SystemState, pid: u32) -> bool {
-    let mut current = Some(Pid::from_u32(pid));
-    for _ in 0..MAX_ANCESTOR_DEPTH {
-        let Some(p) = current.and_then(|pid| state.sys.process(pid)) else {
-            return false;
-        };
-        if p.name().to_string_lossy() == "sshd" {
-            return true;
-        }
-        current = p.parent();
-    }
-    false
+    sshd_ancestor(state, pid).is_some()
 }
 
 /// Every descendant pid of `root`, however many generations deep — not just its direct
@@ -182,7 +260,7 @@ fn kill_targets(state: &SystemState, session_pid: u32, subtree: &[u32]) -> Vec<u
 /// looks like its current activity (see `most_active`) — falling back to the session's
 /// own registered pid when it's simply sitting idle at a prompt with no active
 /// descendant yet.
-fn build_row(state: &SystemState, entry: &UtmpEntry, now: u64) -> TableRow {
+fn build_row(state: &SystemState, entry: &Session, now: u64) -> TableRow {
     let subtree = subtree_pids(state, entry.pid);
     let owner = state.sys.process(Pid::from_u32(entry.pid));
     let active = most_active(state, &subtree);
@@ -208,7 +286,7 @@ fn build_row(state: &SystemState, entry: &UtmpEntry, now: u64) -> TableRow {
         cells: vec![
             entry.user.clone(),
             host,
-            entry.line.clone(),
+            tty_of(state, entry, &subtree),
             format::human_duration(now.saturating_sub(entry.login_time)),
             folder,
             command,
@@ -224,6 +302,60 @@ fn build_row(state: &SystemState, entry: &UtmpEntry, now: u64) -> TableRow {
     }
 }
 
+/// The session's terminal. utmp records it directly; logind's session file usually
+/// doesn't, so it's read back off the session's processes instead — from `tty_nr` in
+/// `/proc/<pid>/stat` rather than `/proc/<pid>/fd/0`, because that file is world-
+/// readable and another user's shell's descriptors are not.
+///
+/// The login shell is asked first: every process in the session shares its controlling
+/// terminal, but one that opened a pty of its own (a `screen`, a nested `ssh`) would
+/// answer with that one instead.
+fn tty_of(state: &SystemState, entry: &Session, subtree: &[u32]) -> String {
+    if !entry.line.is_empty() {
+        return entry.line.clone();
+    }
+    login_shell(state, subtree)
+        .map(|shell| shell.pid().as_u32())
+        .and_then(tty_name)
+        .or_else(|| subtree.iter().copied().find_map(tty_name))
+        .or_else(|| tty_name(entry.pid))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Field index of `tty_nr` in `/proc/<pid>/stat`, counted from the field after the
+/// command — the 7th overall, after `state`, `ppid`, `pgrp` and `session`.
+const TTY_NR_FIELD: usize = 4;
+
+/// The terminal `pid` is attached to, or `None` if it has none.
+fn tty_name(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The second field is the command in parentheses, and a command may contain both
+    // spaces and parentheses — so the fields are counted from the last `)`, not from
+    // the start of the line.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    tty_from_dev(rest.split_whitespace().nth(TTY_NR_FIELD)?.parse().ok()?)
+}
+
+/// A terminal's device number spelled the way everything else spells it — `pts/4`,
+/// `tty1`. `tty_nr` arrives in the encoding the kernel writes device numbers with: the
+/// minor's low byte at the bottom, the major above it, and whatever is left of the
+/// minor above that. Zero is what a process with no controlling terminal has.
+fn tty_from_dev(tty_nr: u32) -> Option<String> {
+    if tty_nr == 0 {
+        return None;
+    }
+    let major = (tty_nr >> 8) & 0xfff;
+    let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00);
+    Some(match major {
+        // UNIX98 pty slaves — eight majors of 256 terminals each, numbered end to end.
+        136..=143 => format!("pts/{}", (major - 136) * 256 + minor),
+        // Virtual consoles, and the serial lines that share their major above 63.
+        4 if minor < 64 => format!("tty{minor}"),
+        4 => format!("ttyS{}", minor - 64),
+        _ => format!("{major}:{minor}"),
+    })
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -233,9 +365,16 @@ fn now_secs() -> u64 {
 
 fn sample_sessions(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
     let now = now_secs();
-    let mut entries: Vec<UtmpEntry> = read_utmp()
+    let mut entries: Vec<Session> = sessions()
         .into_iter()
-        .filter(|e| is_ssh_session(state, e.pid))
+        // A session whose leader is gone is a session that ended, whatever the source
+        // still says. utmp's own filter catches this on the way past `is_ssh_session`;
+        // logind needs it said out loud, because it holds a session open for as long as
+        // anything started under it is still running — a tmux server that outlived the
+        // login it was started from keeps its scope, and its session file, alive for
+        // days.
+        .filter(|e| state.sys.process(Pid::from_u32(e.pid)).is_some())
+        .filter(|e| e.vouched_ssh || is_ssh_session(state, e.pid))
         .collect();
     // Most recently connected first — the sessions someone's likely to care about.
     entries.sort_by_key(|e| std::cmp::Reverse(e.login_time));
@@ -249,14 +388,14 @@ fn sample_sessions(state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
 
 // --- detail view ---------------------------------------------------------------------
 
-/// The `sshd` process the session hangs below — the one that actually holds the network
-/// socket. `is_ssh_session` walks the same ancestry to answer yes/no; this returns the
-/// pid, because the socket is where the session's real origin is written down.
+/// The sshd process the session hangs below — the one that actually holds the network
+/// socket, which is where the session's real origin is written down. `is_ssh_session`
+/// is the same walk asked as a yes/no question.
 fn sshd_ancestor(state: &SystemState, pid: u32) -> Option<u32> {
     let mut current = Some(Pid::from_u32(pid));
     for _ in 0..MAX_ANCESTOR_DEPTH {
         let p = current.and_then(|pid| state.sys.process(pid))?;
-        if p.name().to_string_lossy() == "sshd" {
+        if SSHD_NAMES.contains(&p.name().to_string_lossy().as_ref()) {
             return Some(p.pid().as_u32());
         }
         current = p.parent();
@@ -310,7 +449,7 @@ fn connection_section(state: &SystemState, session_pid: u32, host: &str) -> Deta
         }
         _ => section.push(
             "Socket",
-            "não localizado — os descritores do sshd são do root e o utmp não registrou um endereço",
+            "não localizado — os descritores do sshd são do root e a sessão não registrou um endereço",
         ),
     }
     section
@@ -392,28 +531,30 @@ fn processes_section(state: &SystemState, subtree: &[u32]) -> DetailSection {
 /// hold dozens; the first screenful is what identifies it.
 const MAX_SESSION_PROCESSES: usize = 15;
 
-fn build_detail(state: &SystemState, entry: &UtmpEntry, now: u64) -> Detail {
+fn build_detail(state: &SystemState, entry: &Session, now: u64) -> Detail {
     let subtree = subtree_pids(state, entry.pid);
+    let tty = tty_of(state, entry, &subtree);
     let owner = state.sys.process(Pid::from_u32(entry.pid));
     let active = most_active(state, &subtree);
 
     let mut session = DetailSection::new("Sessão");
     session.push("Usuário", entry.user.clone());
     session.push(
-        "Origem (utmp)",
+        "Origem registrada",
         if entry.host.is_empty() {
             "não registrada".to_string()
         } else {
             entry.host.clone()
         },
     );
-    session.push("Terminal", entry.line.clone());
+    session.push("Terminal", tty.clone());
     session.push(
         "Conectado há",
         format::human_duration(now.saturating_sub(entry.login_time)),
     );
     session.push("PID da sessão", entry.pid.to_string());
-    // utmp registers the privilege-separated sshd, not the shell — see `subtree_pids`.
+    // What's registered is the privilege-separated sshd, not the shell — see
+    // `subtree_pids`.
     session.push(
         "Processo registrado",
         owner.map(command_of).unwrap_or_else(|| "?".to_string()),
@@ -441,7 +582,7 @@ fn build_detail(state: &SystemState, entry: &UtmpEntry, now: u64) -> Detail {
     );
 
     Detail {
-        title: format!("{}@{} · {}", entry.user, entry.line, entry.host),
+        title: format!("{}@{} · {}", entry.user, tty, entry.host),
         gone_note: "desconectada",
         sections: vec![
             session,
@@ -500,8 +641,7 @@ impl TableMonitor for SshSessionsMonitor {
 
     fn refresh_values(&mut self, state: &SystemState, rows: &mut [TableRow]) {
         let now = now_secs();
-        let entries: HashMap<u32, UtmpEntry> =
-            read_utmp().into_iter().map(|e| (e.pid, e)).collect();
+        let entries: HashMap<u32, Session> = sessions().into_iter().map(|e| (e.pid, e)).collect();
         for row in rows.iter_mut() {
             // A session that's since logged out just keeps showing its last known
             // values — same "stale beats missing" tradeoff as a dead pid elsewhere.
@@ -534,11 +674,80 @@ impl TableMonitor for SshSessionsMonitor {
 
     fn detail(&mut self, state: &SystemState, row: &TableRow) -> Option<Detail> {
         let now = now_secs();
-        let entry = read_utmp().into_iter().find(|e| e.pid == row.pid)?;
+        let entry = sessions().into_iter().find(|e| e.pid == row.pid)?;
         Some(build_detail(state, &entry, now))
     }
 
     fn has_detail(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session file as Debian 13 writes one for an SSH login: no `TTY`, because sshd
+    /// registers the session before the pty exists.
+    const SSH_SESSION: &str = "\
+# This is private data. Do not parse.
+UID=0
+USER=root
+ACTIVE=1
+STATE=active
+REMOTE=1
+TYPE=tty
+CLASS=user
+SCOPE=session-9.scope
+REMOTE_HOST=187.116.88.134
+SERVICE=sshd
+LEADER=2805
+REALTIME=1787699034767096
+MONOTONIC=903506521
+";
+
+    #[test]
+    fn an_ssh_login_reads_back_off_a_logind_session_file() {
+        let session = parse_logind_session(SSH_SESSION).expect("uma sessão SSH");
+        assert_eq!(session.user, "root");
+        assert_eq!(session.host, "187.116.88.134");
+        assert_eq!(session.pid, 2805);
+        // REALTIME is microseconds; the row wants seconds.
+        assert_eq!(session.login_time, 1_787_699_034);
+        assert!(session.line.is_empty(), "o terminal vem dos processos");
+        assert!(session.vouched_ssh, "o próprio logind disse que é sshd");
+    }
+
+    #[test]
+    fn logind_bookkeeping_is_not_a_login() {
+        // logind's own per-user manager: same UID, same file layout, nobody logged in.
+        let manager = SSH_SESSION
+            .replace("CLASS=user", "CLASS=manager-early")
+            .replace("SERVICE=sshd", "SERVICE=systemd-user");
+        assert!(parse_logind_session(&manager).is_none());
+        // A console login is a session, just not one this panel is about.
+        let console = SSH_SESSION.replace("SERVICE=sshd", "SERVICE=login");
+        assert!(parse_logind_session(&console).is_none());
+    }
+
+    #[test]
+    fn a_session_missing_what_a_row_needs_is_dropped() {
+        for field in ["LEADER=2805", "USER=root", "REALTIME=1787699034767096"] {
+            let without = SSH_SESSION.replace(field, "");
+            assert!(
+                parse_logind_session(&without).is_none(),
+                "sem {field} não dá para montar a linha"
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_is_named_the_way_everything_else_names_it() {
+        assert_eq!(tty_from_dev(34820).as_deref(), Some("pts/4"));
+        // The second pty major picks up where the first leaves off.
+        assert_eq!(tty_from_dev((137 << 8) | 1).as_deref(), Some("pts/257"));
+        assert_eq!(tty_from_dev((4 << 8) | 1).as_deref(), Some("tty1"));
+        assert_eq!(tty_from_dev((4 << 8) | 64).as_deref(), Some("ttyS0"));
+        assert_eq!(tty_from_dev(0), None, "processo sem terminal de controle");
     }
 }

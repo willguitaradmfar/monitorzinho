@@ -104,7 +104,12 @@ metric approaches its natural limit (e.g. memory nearing 100%).
 - **Top CPU** / **Top Memory** — the heaviest processes by each metric, shown
   as a tree: parents expand to their children with `←`/`→`.
 - **SSH Sessions** — who is logged in over SSH, from where, on which TTY,
-  since when, and what they're running.
+  since when, and what they're running. Read from utmp, the file `who` has
+  always read — and, on machines that no longer keep one (systemd built
+  `-UTMP`, which is how Debian 13 ships it), from logind's session files
+  instead. Those don't record the terminal, so it's read back off the
+  session's own processes, and a session logind is still holding open for a
+  process that outlived the login is dropped rather than shown as live.
 - **Interfaces** — every network interface the kernel knows about, up or down:
   what kind it is (Wi-Fi, Ethernet, bridge, VPN, tunnel, loopback), whether it
   has a link, its addresses, and what's moving through it right now. Read from
