@@ -11,12 +11,13 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, ChartPanel, DetailFocus, Focus, HandoffPicker, MATCH_CONTEXT, MarkEditor, ParamField,
-    RulesEditor, RulesMode, ShortcutTarget, Tab, TableFocus, ToolMonitorFocus, ToolWizard,
-    WizardStep,
+    App, ChartPanel, DetailFocus, Focus, HandoffPicker, MATCH_CONTEXT, MarkEditor, MarkField,
+    MarksScreen, ParamField, RulesEditor, RulesMode, ShortcutTarget, Tab, TableFocus,
+    ToolMonitorFocus, ToolWizard, WizardStep,
 };
 use crate::format;
 use crate::history::History;
+use crate::monitor::mark::MarkColor;
 use crate::monitor::{Danger, Detail, Monitor, TableRow};
 use crate::tools::rewrite::{self, Rule};
 use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, Stage, State, lock_log};
@@ -102,6 +103,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_screen(frame, area, app);
     // Drawn last and over everything: a question about something irreversible has no
     // business sharing the screen with the thing it's about to do.
+    if let Some(screen) = &app.marks_screen {
+        render_marks_screen(frame, area, app, screen);
+    }
+    // Over the marks screen as well as over a table: the box is opened from that list
+    // to rewrite the row it has the cursor on.
     if let Some(editor) = &app.mark_editor {
         render_mark_editor(frame, area, app, editor);
     }
@@ -216,8 +222,24 @@ fn render_confirm(frame: &mut Frame, area: Rect, danger: &Danger) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The box that writes one mark: what kind of thing to follow, the value, and — on a
-/// tree — whether the children come along.
+/// What each mark colour actually looks like. The names live in `monitor::mark`, where
+/// they're saved and compared; what a terminal paints for them is the UI's business, and
+/// they're picked from the same palette as everything else on screen so a marked row
+/// never looks pasted in from another app.
+fn mark_color(color: MarkColor) -> Color {
+    match color {
+        MarkColor::Amarelo => palette::YELLOW,
+        MarkColor::Verde => palette::GREEN,
+        MarkColor::Ciano => palette::CYAN,
+        MarkColor::Azul => palette::BLUE,
+        MarkColor::Roxo => palette::PURPLE,
+        MarkColor::Laranja => palette::ORANGE,
+        MarkColor::Vermelho => palette::RED,
+    }
+}
+
+/// The box that writes one mark: what kind of thing to follow, the value, what colour it
+/// wears, and — on a tree — whether the children come along.
 fn render_mark_editor(frame: &mut Frame, area: Rect, app: &App, editor: &MarkEditor) {
     let monitor = app.table_monitors[editor.table_index].as_ref();
     let kinds = monitor.mark_kinds();
@@ -227,18 +249,39 @@ fn render_mark_editor(frame: &mut Frame, area: Rect, app: &App, editor: &MarkEdi
 
     let width = MARK_BOX_WIDTH.min(area.width);
     let mut lines = vec![Line::raw("")];
-    lines.push(field_line(
-        "Seguir por",
-        &format!("◂ {} ▸", kind.name),
-        true,
-    ));
-    lines.push(field_line("Valor", &format!("{}▏", editor.value), false));
-    if editor.tree {
-        lines.push(field_line(
-            "Incluir a árvore",
-            if editor.subtree { "sim" } else { "não" },
-            false,
-        ));
+    for field in editor.fields() {
+        let focused = field == editor.focused();
+        lines.push(match field {
+            MarkField::Kind => field_line("Seguir por", choice(kind.name, focused), focused),
+            // The caret is only on the value while the value is what the keys are
+            // editing — a cursor blinking on a field the arrows are elsewhere on reads
+            // as two cursors.
+            MarkField::Value => field_line(
+                "Valor",
+                vec![Span::styled(
+                    if focused {
+                        format!("{}▏", editor.value)
+                    } else {
+                        editor.value.clone()
+                    },
+                    Style::default().fg(palette::YELLOW),
+                )],
+                focused,
+            ),
+            // The swatch, not just the name: nobody chooses a colour by reading it.
+            MarkField::Color => {
+                let mut spans = choice(&format!("● {}", editor.color.label()), focused);
+                for span in &mut spans {
+                    span.style = span.style.fg(mark_color(editor.color));
+                }
+                field_line("Cor", spans, focused)
+            }
+            MarkField::Subtree => field_line(
+                "Incluir a árvore",
+                choice(if editor.subtree { "sim" } else { "não" }, focused),
+                focused,
+            ),
+        });
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
@@ -252,31 +295,147 @@ fn render_mark_editor(frame: &mut Frame, area: Rect, app: &App, editor: &MarkEdi
 
     let height = (lines.len() as u16).saturating_add(4).min(area.height);
     let box_area = centered(area, width, height);
-    let hint = if editor.tree {
-        "←/→ tipo · ↑/↓ árvore · digite o valor · Enter marcar · Esc cancelar"
+    let title = if editor.editing.is_some() {
+        format!(" Editar marca em {} ", monitor.title())
     } else {
-        "←/→ tipo · digite o valor · Enter marcar · Esc cancelar"
+        format!(" Marcar em {} ", monitor.title())
     };
+    let action = if editor.editing.is_some() {
+        "Enter salvar"
+    } else {
+        "Enter marcar"
+    };
+    let hint = format!("↑/↓ campo · ←/→ escolher · digite o valor · {action} · Esc cancelar");
     let block = Block::default()
-        .title(format!(" Marcar em {} ", monitor.title()))
+        .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette::YELLOW))
-        .title_bottom(hint_line(hint));
+        .border_style(Style::default().fg(mark_color(editor.color)))
+        .title_bottom(hint_line(&hint));
     let inner = block.inner(box_area);
     frame.render_widget(Clear, box_area);
     frame.render_widget(block, box_area);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// A one-of-several value, wearing the arrows that cycle it only while the cursor is on
+/// it — arrows on every line at once would say every line takes them.
+fn choice(value: &str, focused: bool) -> Vec<Span<'static>> {
+    let text = if focused {
+        format!("◂ {value} ▸")
+    } else {
+        format!("  {value}")
+    };
+    vec![Span::styled(text, value_style(focused))]
+}
+
 /// One `label   value` line of the mark box, laid out like the wizard's fields.
-fn field_line(label: &str, value: &str, first: bool) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!(" {} {label:<18}", if first { "▶" } else { " " }),
+fn field_line(label: &str, value: Vec<Span<'static>>, focused: bool) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!(" {} {label:<18}", if focused { "▶" } else { " " }),
+        Style::default().fg(palette::DIM),
+    )];
+    spans.extend(value);
+    Line::from(spans)
+}
+
+/// The list of every mark on this machine: what it follows, in which table, and in what
+/// colour — with the keys to recolour, rewrite or drop the one under the cursor.
+fn render_marks_screen(frame: &mut Frame, area: Rect, app: &App, screen: &MarksScreen) {
+    let marks = app.marks.all();
+    let width = MARKS_SCREEN_WIDTH.min(area.width);
+    let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
+
+    let mut lines = vec![Line::raw("")];
+    if marks.is_empty() {
+        lines.push(Line::styled(
+            "   Nenhuma marca ainda. Ctrl+E numa linha de uma tabela cria a primeira.",
             Style::default().fg(palette::DIM),
-        ),
-        Span::styled(value.to_string(), Style::default().fg(palette::YELLOW)),
-    ])
+        ));
+    }
+    // The table's own name, not its id: the id is what the file keeps so a renamed panel
+    // never orphans a mark, and is exactly what nobody wants to read here.
+    let widest_table = marks
+        .iter()
+        .map(|mark| table_name(app, &mark.table).chars().count())
+        .max()
+        .unwrap_or(0);
+    let widest_kind = marks
+        .iter()
+        .map(|mark| mark.kind.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (i, mark) in marks.iter().enumerate() {
+        let selected = i == screen.selected;
+        let style = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette::DIM)
+        };
+        // One line each, columns lined up, the value clipped where it runs long — a mark
+        // on a command line is a mark on the first word of it, and a list is read down
+        // the left edge. Wrapping the long ones would put the column somewhere different
+        // on every row, which is the one thing a list of four fields can't afford.
+        let head = format!(
+            "{:table$}  {:kind$}  ",
+            table_name(app, &mark.table),
+            mark.kind,
+            table = widest_table,
+            kind = widest_kind,
+        );
+        let tail = if mark.subtree { "  + árvore" } else { "" };
+        let room = text_width.saturating_sub(head.chars().count() + tail.chars().count() + 2);
+        let value = format!("«{}»", clip(&mark.value, room.saturating_sub(2)));
+        // The star wears the mark's colour, which is the only way to read this list
+        // against the tables it's about: the row you're wondering about is green, so you
+        // look for the green one here.
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {}", if selected { "▶ " } else { "  " }),
+                Style::default().fg(palette::DIM),
+            ),
+            Span::styled(
+                "★ ",
+                Style::default()
+                    .fg(mark_color(mark.color))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(head, Style::default().fg(palette::DIM)),
+            Span::styled(value, style),
+            Span::styled(tail.to_string(), Style::default().fg(palette::DIM)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "   Salvas por máquina, e valem entre execuções do app.",
+        Style::default().fg(palette::DIM),
+    ));
+
+    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let box_area = centered(area, width, height);
+    let hint = if marks.is_empty() {
+        "Esc voltar".to_string()
+    } else {
+        "↑/↓ navegar · ←/→ cor · Enter/e editar · Del remover · Esc voltar".to_string()
+    };
+    let block = Block::default()
+        .title(" Marcas ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::YELLOW))
+        .title_bottom(hint_line(&hint));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The title of the table a mark belongs to — or the raw id, for a mark left behind by a
+/// table this build no longer has. Showing the id rather than hiding the row: a mark
+/// that can't be explained is still a mark that Del can reach.
+fn table_name(app: &App, id: &str) -> String {
+    match app.table_index_of(id) {
+        Some(index) => app.table_monitors[index].title().to_string(),
+        None => id.to_string(),
+    }
 }
 
 /// Slim header showing the two tabs (the active one highlighted), plus the app
@@ -566,17 +725,16 @@ fn render_panel(frame: &mut Frame, area: Rect, panel: &ChartPanel, chrome: Panel
 /// never shifts the table sideways under the reader.
 const MARK_WIDTH: u16 = 2;
 
-/// The mark cell for one row.
+/// The mark cell for one row, in the colour of the mark that put it there.
 fn mark_cell(row: &TableRow) -> Cell<'static> {
-    if row.marked {
-        Cell::from(Span::styled(
+    match row.mark {
+        Some(color) => Cell::from(Span::styled(
             "★",
             Style::default()
-                .fg(palette::YELLOW)
+                .fg(mark_color(color))
                 .add_modifier(Modifier::BOLD),
-        ))
-    } else {
-        Cell::from(" ")
+        )),
+        None => Cell::from(" "),
     }
 }
 
@@ -658,11 +816,11 @@ fn tree_row(row: &TableRow, next: Option<&TableRow>) -> UiRow<'static> {
     cells.extend(own.into_iter().map(Cell::from));
     let ui_row = UiRow::new(cells);
     // A followed row is coloured as well as starred: the star says which one, the colour
-    // is what the eye catches when the list reorders under it.
-    if row.marked {
-        ui_row.style(Style::default().fg(palette::YELLOW))
-    } else {
-        ui_row
+    // is what the eye catches when the list reorders under it — and with a colour per
+    // mark, which of the followed things it is.
+    match row.mark {
+        Some(color) => ui_row.style(Style::default().fg(mark_color(color))),
+        None => ui_row,
     }
 }
 
@@ -758,6 +916,7 @@ fn render_fullscreen_table(
         // Named for what it does rather than for the key: "marcar" is the verb, and the
         // star it leaves is what the reader will be looking for afterwards.
         parts.push("Ctrl+E marcar ★".to_string());
+        parts.push("Ctrl+G marcas".to_string());
     }
     if table_focus.query.is_empty() {
         parts.push("↑/↓ navegar".to_string());
@@ -1565,8 +1724,11 @@ const PARAM_LABEL_WIDTH: usize = 20;
 /// Narrower than the wizard: a confirmation is a short question, and a wide box for
 /// three lines reads as a form to fill in rather than a thing to answer.
 const CONFIRM_WIDTH: u16 = 76;
-/// The mark box: three short fields and two lines of explanation.
+/// The mark box: four short fields and two lines of explanation.
 const MARK_BOX_WIDTH: u16 = 72;
+/// Wider than the box that writes one mark: a list is read across, and a mark's value is
+/// a command line often enough that a narrow column would wrap most of them.
+const MARKS_SCREEN_WIDTH: u16 = 96;
 const WIZARD_WIDTH: u16 = 92;
 /// Borders plus the indent the wizard's prose sits at — subtracted from the box width
 /// to get the column that help text and descriptions wrap to.

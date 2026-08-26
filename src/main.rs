@@ -171,7 +171,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     code if app.confirm_open() => app.confirm_key(code),
                     // The mark box sits over a fullscreened table, whose every letter is
                     // search input — so like the others, it has to see the keys first.
+                    // Above the marks screen too: the box is opened from it, to edit the
+                    // row the list has the cursor on.
                     code if app.mark_editor_open() => app.mark_key(code),
+                    // The marks screen sits over whatever it was opened from, table or
+                    // dashboard, and takes every key including 'q' and the letters that
+                    // would otherwise be search input or panel shortcuts.
+                    code if app.marks_screen_open() => app.marks_key(code),
                     // The rules screen sits on top of the wizard and takes every key,
                     // including Esc and 'q': in its Edit mode they're just characters.
                     code if app.rules_editor_open() => app.rules_key(code),
@@ -205,6 +211,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                             Focus::Detail(_) => app.close_detail(),
                             _ => app.exit_focus(),
                         }
+                    }
+
+                    // Ctrl+G, next door to the key that makes a mark: the list of what
+                    // has been marked opens from the table it was marked in, and from
+                    // the dashboard, since marks span every table and outlive all of it.
+                    KeyCode::Char('g')
+                        if matches!(app.focus, Focus::Table(_) | Focus::None)
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.open_marks_screen();
                     }
 
                     // --- add-an-execution wizard ---

@@ -207,9 +207,9 @@ pub struct TableRow {
     /// child of its own siblings (draw blank space at that column), `false` if it had
     /// a later sibling (draw a continuing `│`).
     pub guides: Vec<bool>,
-    /// Whether a mark is watching this row — see `mark`. Set after sampling, from
-    /// state the monitor itself knows nothing about.
-    pub marked: bool,
+    /// The colour of the mark watching this row, or `None` where none is — see `mark`.
+    /// Set after sampling, from state the monitor itself knows nothing about.
+    pub mark: Option<mark::MarkColor>,
     /// Number of direct children. 0 means this row is a leaf.
     pub child_count: usize,
     /// Every pid in this row's subtree (not including its own pid) — used for
@@ -231,7 +231,7 @@ impl TableRow {
             depth: 0,
             is_last_sibling: true,
             guides: Vec::new(),
-            marked: false,
+            mark: None,
             child_count: 0,
             descendant_pids: Vec::new(),
             key: String::new(),
@@ -327,6 +327,13 @@ pub trait TableMonitor: Send {
     /// row worth following.
     fn mark_kinds(&self) -> &'static [mark::MarkKind] {
         &[]
+    }
+    /// Whether this table's rows form a tree, so a mark on it can be asked to reach the
+    /// children. Answered by the monitor rather than read off the rows, because the two
+    /// process tables are trees only once fullscreened — the marks screen has to know
+    /// whether to offer the question with no rows in front of it at all.
+    fn tree(&self) -> bool {
+        false
     }
     /// Column headers; each `TableRow::cells` must have the same length as this.
     fn headers(&self) -> &'static [&'static str];

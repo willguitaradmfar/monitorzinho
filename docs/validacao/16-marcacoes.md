@@ -10,7 +10,8 @@ que estar no topo. O efeito colateral é que seguir **uma** linha é impossível
 Você acha a conexão que interessa, olha para o lado, e ela mudou de lugar.
 
 Uma marcação prende a linha **visualmente**: ela continua onde o ranking a puser,
-e passa a usar uma **★** amarela onde quer que caia.
+e passa a usar uma **★** onde quer que caia — na cor da marca (ver
+[22 — Cores e a tela de marcas](22-cores-e-tela-de-marcas.md)).
 
 ## Como marcar
 
@@ -45,9 +46,10 @@ texto. Numa conexão, isso quer dizer que qualquer das duas portas serve.
 saber o que é expressão regular; digitar `^ssh(d)?$` não é tratado literalmente.
 A decisão é pela presença de `^ $ * + ? [ ] ( ) |`.
 
-**Árvore.** Nas tabelas de processo, `↑/↓` na caixa alterna *Incluir a árvore*.
-Com ela ligada, o processo marcado **e todos os descendentes** ganham a estrela —
-um build que importa é o build mais tudo que ele lançou.
+**Árvore.** Nas tabelas de processo, a caixa mostra *Incluir a árvore*: `↑/↓`
+levam o cursor até esse campo e `←/→` o alternam. Com ele ligado, o processo
+marcado **e todos os descendentes** ganham a estrela — um build que importa é o
+build mais tudo que ele lançou.
 
 ## Como testar
 
@@ -57,14 +59,15 @@ um build que importa é o build mais tudo que ele lançou.
 2. `Ctrl+E` → a caixa abre com `Seguir por ◂ porta ▸` e `Valor 5432`
 3. `Enter`
 
-**Esperado:** a linha ganha **★** e fica amarela. Sai da busca (`Esc`) e a estrela
-continua lá, onde quer que a linha tenha ido parar.
+**Esperado:** a linha ganha **★** e fica na cor da marca. Sai da busca (`Esc`) e a
+estrela continua lá, onde quer que a linha tenha ido parar.
 
 ```sh
 cat ~/.local/share/monitorzinho/marks.json
 ```
 ```json
-[ { "table": "ports", "kind": "porta", "value": "5432", "subtree": false } ]
+[ { "table": "ports", "kind": "porta", "value": "5432", "subtree": false,
+    "color": "amarelo" } ]
 ```
 
 **Feche e reabra o app:** a estrela tem que voltar, inclusive **no painel
@@ -79,7 +82,7 @@ ser textual — há teste automatizado disso (`cargo test mark`).
 ### 3. Árvore
 
 1. `3` (Top CPU) → ache um processo com filhos (`rootlesskit`, `dockerd`, um `make`)
-2. `Ctrl+E` → tipo `comando`, *Incluir a árvore* em `sim` → `Enter`
+2. `Ctrl+E` → tipo `comando`, `↓` até *Incluir a árvore*, `→` para `sim` → `Enter`
 3. `→` para expandir o nó
 
 **Esperado:** o processo e **cada descendente** com estrela. Na validação:
@@ -94,7 +97,7 @@ seguido de fim). Teste os dois valores e compare.
 ### 5. Remoção
 
 `Ctrl+E` sobre uma linha marcada: a estrela some, e o `marks.json` perde a
-entrada. Se várias marcas casarem com a mesma linha, todas saem — é o que
+entrada. (`Ctrl+G` → `Del` remove pela lista, sem precisar achar a linha de novo.) Se várias marcas casarem com a mesma linha, todas saem — é o que
 "pare de seguir isto" quer dizer.
 
 ### 6. Onde a tecla não é oferecida

@@ -146,7 +146,7 @@ fn flatten(
         depth,
         is_last_sibling,
         guides: guides.clone(),
-        marked: false,
+        mark: None,
         child_count: kids.len(),
         descendant_pids: descendants.get(&pid).cloned().unwrap_or_default(),
         key: String::new(),
@@ -726,6 +726,10 @@ impl TableMonitor for TopCpuMonitor {
         }]
     }
 
+    fn tree(&self) -> bool {
+        true
+    }
+
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {
         sample_processes(state, limit, &|p| p.cpu_usage() as f64, &|p| {
             format!("{:.1}%", p.cpu_usage())
@@ -782,6 +786,10 @@ impl TableMonitor for TopMemMonitor {
             numeric: false,
             help: "trecho do comando, ou uma expressão regular",
         }]
+    }
+
+    fn tree(&self) -> bool {
+        true
     }
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {

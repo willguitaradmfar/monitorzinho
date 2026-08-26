@@ -295,7 +295,7 @@ fn build_row(state: &SystemState, entry: &Session, now: u64) -> TableRow {
         depth: 0,
         is_last_sibling: true,
         guides: Vec::new(),
-        marked: false,
+        mark: None,
         child_count: 0,
         descendant_pids: kill_targets(state, entry.pid, &subtree),
         key: String::new(),

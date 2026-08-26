@@ -139,6 +139,18 @@ everything below it in the tree; SSH sessions by user, origin or command. Typing
 `postgres` doesn't require knowing what a regular expression is, and typing
 `^ssh(d)?$` isn't taken literally. `Ctrl+E` again stops following.
 
+Each mark has a **colour**, which is what makes several at once useful: with one
+star everywhere, a list with four things followed in it says "four of these
+matter" and nothing more. A new mark opens on the first colour its table isn't
+already using, so marking three things in a row gives three different colours
+without anyone choosing, and the box changes it before saving.
+
+`Ctrl+G` opens the **list of every mark** on the machine — what it follows, in
+which table, in what colour. Marks are cheap to make and outlive the app, so
+somewhere has to answer "what am I following, and why is that row green". `←`/`→`
+recolour the one under the cursor in place, `Enter` reopens the box on it, `Del`
+drops it.
+
 Each panel has a shortcut key in its corner (`1`–`9`, then letters).
 Pressing it fullscreens that panel with every row, not just the top ten the
 compact grid shows. In a fullscreened table, typing searches immediately —
@@ -633,6 +645,7 @@ at it properly.
 | `PgUp` / `PgDn` | any list or log | move ten rows / scroll fast, stopping at the ends |
 | `←` / `→` | process tree | collapse/expand |
 | `Ctrl+E` | a fullscreened table | mark the row so it stays findable while the list reorders; again to unmark |
+| `Ctrl+G` | a fullscreened table, Visão Geral, Processos | the list of every mark: `←`/`→` recolour, `Enter` edit, `Del` remove |
 | `Del` | a fullscreened table | what it kills depends on the table — the confirmation says so before anything happens |
 | any letter | a fullscreened table | search, live |
 | `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart (or re-run) / remove an execution |

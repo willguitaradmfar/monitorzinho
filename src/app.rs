@@ -296,21 +296,92 @@ fn suggested_value(row: &TableRow, kind: &mark::MarkKind) -> String {
     }
 }
 
-/// The little form that writes one mark: what kind of thing to watch, the value, and —
-/// where the table is a tree — whether the children come along.
+/// The little form that writes one mark: what kind of thing to watch, the value, what
+/// colour it wears, and — where the table is a tree — whether the children come along.
 ///
 /// It opens over a fullscreened table with the fields already filled from the row under
 /// the cursor, because that is where the answer almost always is: you are looking at the
-/// thing you want to follow when you decide to follow it.
+/// thing you want to follow when you decide to follow it. The marks screen opens the
+/// same form on a mark that already exists, which is why `editing` is here: the two are
+/// the same question, asked once about a row and once about an answer already given.
 pub struct MarkEditor {
     pub table_index: usize,
     /// Which of the table's kinds is selected, as an index into `mark_kinds()`.
     pub kind: usize,
     pub value: String,
+    pub color: mark::MarkColor,
     pub subtree: bool,
-    /// Whether the table has a tree to extend a mark down — only then is the third
-    /// field shown, since offering it on a flat list would be a question with one answer.
+    /// Whether the table has a tree to extend a mark down — only then is that field
+    /// shown, since offering it on a flat list would be a question with one answer.
     pub tree: bool,
+    /// Which field ↑/↓ are parked on, as an index into `fields()`.
+    pub field: usize,
+    /// Position in `Marks::all()` of the mark being rewritten, or `None` when this is a
+    /// new one. Saving an edit has to land where the mark already was — the marks screen
+    /// shows that order, and a rewrite that jumped to the end would read as a delete
+    /// plus an add.
+    pub editing: Option<usize>,
+    /// Whether a row is under the box. Only then does switching kind refill the value
+    /// from it; opened from the marks screen there is no row, and the value that is
+    /// already typed is the one worth keeping.
+    pub from_row: bool,
+}
+
+/// One line of the mark box. What is on offer depends on the table — a flat one has no
+/// tree to reach down — so the fields are listed rather than numbered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MarkField {
+    Kind,
+    Value,
+    Color,
+    Subtree,
+}
+
+impl MarkEditor {
+    /// The fields this box is showing, in the order they appear.
+    pub fn fields(&self) -> Vec<MarkField> {
+        let mut fields = vec![MarkField::Kind, MarkField::Value, MarkField::Color];
+        if self.tree {
+            fields.push(MarkField::Subtree);
+        }
+        fields
+    }
+
+    pub fn focused(&self) -> MarkField {
+        let fields = self.fields();
+        fields[self.field.min(fields.len() - 1)]
+    }
+
+    /// Moves the cursor to the value, which typing does from wherever it was.
+    fn focus_value(&mut self) {
+        if let Some(index) = self
+            .fields()
+            .iter()
+            .position(|field| *field == MarkField::Value)
+        {
+            self.field = index;
+        }
+    }
+}
+
+/// The list of every mark on this machine, with the cursor on one of them.
+///
+/// Marks are cheap to make and easy to forget: they're set from a row, in a hurry, and
+/// they outlive the app. Somewhere has to answer "what am I following, and why is that
+/// row green" — and be the place to fix or drop the answer.
+pub struct MarksScreen {
+    pub selected: usize,
+}
+
+impl MarksScreen {
+    fn move_selection(&mut self, delta: i32, count: usize) {
+        if count == 0 {
+            self.selected = 0;
+            return;
+        }
+        let last = count as i32 - 1;
+        self.selected = (self.selected as i32 + delta).clamp(0, last) as usize;
+    }
 }
 
 /// One row of a table, opened with Enter for everything its monitor knows about it —
@@ -1021,6 +1092,8 @@ pub struct App {
     pub marks: mark::Marks,
     /// The mark being written, while its box is open.
     pub mark_editor: Option<MarkEditor>,
+    /// The list of every mark, while it's up.
+    pub marks_screen: Option<MarksScreen>,
     pub tools_available: Vec<Box<dyn Tool>>,
     pub tools: ToolsState,
     pub focus: Focus,
@@ -1108,6 +1181,7 @@ impl App {
             table_rows,
             marks,
             mark_editor: None,
+            marks_screen: None,
             tools_available,
             tools,
             focus: Focus::None,
@@ -1549,9 +1623,38 @@ impl App {
             table_index: index,
             kind: 0,
             value,
+            // Not the same colour every time: a second mark that comes up the same
+            // colour as the first defeats the point of having colours at all. The count
+            // of marks already on this table is what decides, so marking three things in
+            // a row gives three different colours without anyone choosing.
+            color: self.next_color(monitor.id()),
             subtree: tree,
             tree,
+            field: 0,
+            editing: None,
+            from_row: true,
         });
+    }
+
+    /// The colour to open the box with: the first one this table isn't already using.
+    /// Not simply the next one along — the colours a table wears are whatever was chosen
+    /// for them, so counting would hand out one that's already on screen.
+    ///
+    /// Once every colour is in use it starts over. Seven marks on one table and the
+    /// eighth repeats a colour is a fine place to stop being clever: what makes them
+    /// tellable apart by then is the list, not the palette.
+    fn next_color(&self, table: &str) -> mark::MarkColor {
+        let used: Vec<mark::MarkColor> = self
+            .marks
+            .all()
+            .iter()
+            .filter(|mark| mark.table == table)
+            .map(|mark| mark.color)
+            .collect();
+        mark::MarkColor::ALL
+            .into_iter()
+            .find(|color| !used.contains(color))
+            .unwrap_or(mark::MarkColor::ALL[used.len() % mark::MarkColor::ALL.len()])
     }
 
     pub fn mark_editor_open(&self) -> bool {
@@ -1559,30 +1662,54 @@ impl App {
     }
 
     /// Keys while the mark box is open. Same shape as every other small form here:
-    /// ←/→ change the kind, typing edits the value, Enter saves, Esc gives up.
+    /// ↑/↓ move between fields, ←/→ answer the one they're parked on, typing edits the
+    /// value wherever the cursor is, Enter saves, Esc gives up.
+    ///
+    /// Typing goes to the value from any field on purpose. It is the only field there is
+    /// anything to type into, and this box is opened in a hurry — a letter that went
+    /// nowhere because the cursor was one line off would be a letter lost.
     pub fn mark_key(&mut self, code: KeyCode) {
         let Some(editor) = &mut self.mark_editor else {
             return;
         };
         let kinds = self.table_monitors[editor.table_index].mark_kinds();
         match code {
+            KeyCode::Up | KeyCode::Down => {
+                let delta = if code == KeyCode::Down { 1 } else { -1 };
+                let count = editor.fields().len() as i32;
+                editor.field = (editor.field as i32 + delta).rem_euclid(count) as usize;
+            }
             KeyCode::Left | KeyCode::Right => {
                 let delta = if code == KeyCode::Right { 1 } else { -1 };
-                let count = kinds.len() as i32;
-                editor.kind = (editor.kind as i32 + delta).rem_euclid(count) as usize;
-                // The value follows the kind: switching from "porta" to "processo" with
-                // a port number still in the box would save a mark that matches nothing.
-                if let Focus::Table(tf) = &self.focus
-                    && let Some(&row_idx) = tf.visible_indices().get(tf.selected)
-                    && let Some(row) = tf.rows.get(row_idx)
-                {
-                    editor.value = suggested_value(row, &kinds[editor.kind]);
+                match editor.focused() {
+                    MarkField::Kind => {
+                        let count = kinds.len() as i32;
+                        editor.kind = (editor.kind as i32 + delta).rem_euclid(count) as usize;
+                        // The value follows the kind: switching from "porta" to
+                        // "processo" with a port number still in the box would save a
+                        // mark that matches nothing. Only from a row, though — with no
+                        // row underneath there is nothing better to put there than what
+                        // is already typed.
+                        if editor.from_row
+                            && let Focus::Table(tf) = &self.focus
+                            && let Some(&row_idx) = tf.visible_indices().get(tf.selected)
+                            && let Some(row) = tf.rows.get(row_idx)
+                        {
+                            editor.value = suggested_value(row, &kinds[editor.kind]);
+                        }
+                    }
+                    MarkField::Color => editor.color = editor.color.cycled(delta),
+                    MarkField::Subtree => editor.subtree = !editor.subtree,
+                    MarkField::Value => {}
                 }
             }
-            KeyCode::Up | KeyCode::Down if editor.tree => editor.subtree = !editor.subtree,
-            KeyCode::Char(c) => editor.value.push(c),
+            KeyCode::Char(c) => {
+                editor.value.push(c);
+                editor.focus_value();
+            }
             KeyCode::Backspace => {
                 editor.value.pop();
+                editor.focus_value();
             }
             KeyCode::Enter => {
                 let mark = Mark {
@@ -1590,15 +1717,122 @@ impl App {
                     kind: kinds[editor.kind].name.to_string(),
                     value: editor.value.trim().to_string(),
                     subtree: editor.tree && editor.subtree,
+                    color: editor.color,
                 };
+                let editing = editor.editing;
                 if !mark.value.is_empty() {
-                    self.marks.add(mark);
+                    match editing {
+                        Some(index) => self.marks.replace(index, mark),
+                        None => self.marks.add(mark),
+                    }
                 }
                 self.mark_editor = None;
+                self.clamp_marks_selection();
                 self.reapply_marks();
             }
             KeyCode::Esc => self.mark_editor = None,
             _ => {}
+        }
+    }
+
+    /// True while the marks screen is up, so key handling goes there instead of to the
+    /// table or the dashboard underneath.
+    pub fn marks_screen_open(&self) -> bool {
+        self.marks_screen.is_some()
+    }
+
+    /// Opens the list of every mark on this machine. It sits over whatever is on screen
+    /// rather than being a place you navigate to: marks are set from the tables, and
+    /// coming back to the table you were reading is the whole point of closing it.
+    pub fn open_marks_screen(&mut self) {
+        self.marks_screen = Some(MarksScreen { selected: 0 });
+    }
+
+    /// Keys on the marks screen: move, recolour in place, edit, remove, close.
+    pub fn marks_key(&mut self, code: KeyCode) {
+        let Some(screen) = &mut self.marks_screen else {
+            return;
+        };
+        let count = self.marks.all().len();
+        match code {
+            KeyCode::Up => screen.move_selection(-1, count),
+            KeyCode::Down => screen.move_selection(1, count),
+            KeyCode::PageUp => screen.move_selection(-PAGE_ROWS, count),
+            KeyCode::PageDown => screen.move_selection(PAGE_ROWS, count),
+            // Recolouring is the one edit worth doing without opening a form for it:
+            // telling two marks apart is a thing you do while looking at the list, and
+            // a round trip through the box to change one field would be all trip.
+            KeyCode::Left | KeyCode::Right => {
+                let delta = if code == KeyCode::Right { 1 } else { -1 };
+                let index = screen.selected;
+                if let Some(mark) = self.marks.all().get(index) {
+                    let mut recoloured = mark.clone();
+                    recoloured.color = recoloured.color.cycled(delta);
+                    self.marks.replace(index, recoloured);
+                    self.reapply_marks();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('e') => self.edit_selected_mark(),
+            // No confirmation: a mark is a highlight, and putting it back is the same
+            // two keys that made it. The stop-and-read box is for what can't be undone.
+            KeyCode::Delete => {
+                let index = screen.selected;
+                self.marks.remove(index);
+                self.clamp_marks_selection();
+                self.reapply_marks();
+            }
+            KeyCode::Esc => self.marks_screen = None,
+            _ => {}
+        }
+    }
+
+    /// Opens the mark box on the selected mark, filled in with what it already says.
+    fn edit_selected_mark(&mut self) {
+        let Some(screen) = &self.marks_screen else {
+            return;
+        };
+        let index = screen.selected;
+        let Some(mark) = self.marks.all().get(index) else {
+            return;
+        };
+        // A mark whose table isn't in this build any more has nothing to edit against —
+        // no kinds to choose from, no columns to match. It stays in the file and in the
+        // list, where Del can still reach it.
+        let Some(table_index) = self.table_index_of(&mark.table) else {
+            return;
+        };
+        let kinds = self.table_monitors[table_index].mark_kinds();
+        let kind = kinds
+            .iter()
+            .position(|kind| kind.name == mark.kind)
+            .unwrap_or(0);
+        self.mark_editor = Some(MarkEditor {
+            table_index,
+            kind,
+            value: mark.value.clone(),
+            color: mark.color,
+            subtree: mark.subtree,
+            tree: self.table_monitors[table_index].tree(),
+            field: 0,
+            editing: Some(index),
+            from_row: false,
+        });
+    }
+
+    /// Which table monitor a saved mark belongs to, or `None` for a mark left behind by
+    /// a table this build no longer has.
+    pub fn table_index_of(&self, id: &str) -> Option<usize> {
+        self.table_monitors
+            .iter()
+            .position(|monitor| monitor.id() == id)
+    }
+
+    /// Keeps the marks screen's cursor on a row that exists, after the list under it got
+    /// shorter — by a removal, or by an edit that merged two marks into one.
+    fn clamp_marks_selection(&mut self) {
+        let last = self.marks.all().len().saturating_sub(1);
+        if let Some(screen) = &mut self.marks_screen {
+            screen.selected = screen.selected.min(last);
         }
     }
 
