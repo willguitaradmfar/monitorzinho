@@ -81,8 +81,19 @@ appears on a machine that has containers to show — see
 
 ### Visão Geral — the charts
 
-- **System** — CPU usage (with logical core count) and memory usage
-  (+ used/total in GB).
+- **System** — CPU usage (with logical core count), CPU temperature, and memory
+  usage (+ used/total in GB). The temperature panel is only there on a machine
+  that has a CPU sensor, the same way the GPU panel is only there where there is
+  a GPU: a cloud VM has none — checked on a KVM guest, whose `/sys/class/hwmon`
+  is empty and which has no thermal zone at all, because the driver that reads
+  the temperature talks to registers on the physical CPU that the hypervisor
+  does not pass through. Only sensors that are demonstrably the CPU's are used
+  (`coretemp`, `k10temp`, `zenpower`, `cpu_thermal`, and the `x86_pkg_temp`
+  zone); `acpitz`, which is what tends to be left over, is deliberately skipped —
+  it is sometimes the CPU and sometimes the chassis, and a panel labelled "CPU
+  temp" showing something else is worse than no panel. The chart is scaled
+  against the threshold the chip itself calls critical rather than a number
+  picked here, so the colour signal means what it says.
 - **Disk** — occupancy of the root filesystem as a compact numeric line
   (it changes too slowly for a chart to be useful), plus read/write throughput
   charts.
@@ -92,7 +103,8 @@ appears on a machine that has containers to show — see
   dynamically loaded — the binary runs fine without one).
 
 Panels are grouped and color-coded by category, and turn yellow/red as a
-metric approaches its natural limit (e.g. memory nearing 100%).
+metric approaches its natural limit (e.g. memory nearing 100%, or a CPU nearing
+the temperature its own chip declares critical).
 
 ### Processos — the tables
 

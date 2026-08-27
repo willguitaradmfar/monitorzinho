@@ -23,6 +23,7 @@ pub mod process;
 pub mod resolve;
 pub mod ssh;
 pub mod summary;
+pub mod temperature;
 
 /// Shared, refreshed-once-per-tick system state passed to every monitor's `sample`.
 pub struct SystemState {
@@ -203,6 +204,17 @@ pub fn all_monitors() -> Vec<Box<dyn Monitor>> {
         Box::new(disk::DiskReadMonitor),
         Box::new(disk::DiskWriteMonitor),
     ];
+    // Logo depois do CPU, e no mesmo grupo: é ao lado do uso que a temperatura quer
+    // dizer alguma coisa.
+    //
+    // Ausente onde a máquina não tem sensor de processador, como o painel da GPU é
+    // ausente onde não há GPU. E isso não é um caso raro: conferido num convidado KVM na
+    // nuvem, `/sys/class/hwmon` está vazio e não existe `thermal_zone` nenhuma — o driver
+    // que lê a temperatura fala com registradores do processador físico, que o hipervisor
+    // não repassa.
+    if let Some(temperature) = temperature::TemperatureMonitor::probe() {
+        monitors.insert(1, Box::new(temperature));
+    }
     // Only present on machines with a working NVIDIA driver — absent everywhere else.
     if let Some(gpu) = gpu::GpuMonitor::probe() {
         monitors.push(Box::new(gpu));
