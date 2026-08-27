@@ -81,8 +81,25 @@ appears on a machine that has containers to show — see
 
 ### Visão Geral — the charts
 
-- **System** — CPU usage (with logical core count), CPU temperature, and memory
-  usage (+ used/total in GB). The temperature panel is only there on a machine
+- **System** — CPU usage (with logical core count), then whichever of CPU steal
+  and CPU temperature the machine can actually answer, then memory usage
+  (+ used/total in GB).
+
+  **CPU steal** is the share of time the machine spent *waiting for the
+  hypervisor* — queued behind another tenant on the same physical host. It is
+  the one number that separates "my system is slow" from "the machine I rented
+  isn't really mine right now": high CPU usage is your code working, and yours
+  to fix; high steal is your server standing in line, and nothing in your code
+  changes it. Under 1% is noise, 2–5% is felt as occasional sluggishness, and
+  sustained double digits means the host is oversubscribed. The chart is scaled
+  against 10% rather than 100 — scaled against 100, a catastrophic 30% would
+  draw a small bar, while against 10 it saturates, and "off the scale" is
+  exactly what 30% means. It only appears on a virtualised machine, detected by
+  the CPUID `hypervisor` flag: on dedicated hardware there is nobody to wait
+  for, the number is structurally zero, and a permanently flat panel is noise.
+  On a VM a flat zero is not — it says nobody is taking your turn right now.
+
+  The temperature panel is only there on a machine
   that has a CPU sensor, the same way the GPU panel is only there where there is
   a GPU: a cloud VM has none — checked on a KVM guest, whose `/sys/class/hwmon`
   is empty and which has no thermal zone at all, because the driver that reads

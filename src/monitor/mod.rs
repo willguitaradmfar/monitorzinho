@@ -22,6 +22,7 @@ pub mod ports;
 pub mod process;
 pub mod resolve;
 pub mod ssh;
+pub mod steal;
 pub mod summary;
 pub mod temperature;
 
@@ -195,26 +196,37 @@ pub trait Monitor: Send {
 }
 
 pub fn all_monitors() -> Vec<Box<dyn Monitor>> {
-    let mut monitors: Vec<Box<dyn Monitor>> = vec![
-        Box::new(cpu::CpuMonitor),
-        Box::new(memory::MemoryMonitor),
+    // Montada na ordem em que os painéis aparecem, e não com inserções depois: dois dos
+    // que ficam logo após o CPU são condicionais, e «insere no índice 1» duas vezes é
+    // uma ordem que só se descobre lendo o código na cabeça.
+    let mut monitors: Vec<Box<dyn Monitor>> = vec![Box::new(cpu::CpuMonitor)];
+
+    // Os dois vizinhos do CPU são o que explica o número dele, e são condicionais pela
+    // mesma razão que o painel da GPU: onde não há o que medir, não há painel. Na
+    // prática eles se excluem — ferro dedicado tem sensor e não tem hipervisor de quem
+    // esperar; máquina alugada tem o contrário.
+
+    // Steal: o tempo que o hipervisor tomou. Só numa máquina virtualizada.
+    if let Some(steal) = steal::StealMonitor::probe() {
+        monitors.push(Box::new(steal));
+    }
+    // Temperatura: só onde há sensor de processador. Conferido num convidado KVM na
+    // nuvem, `/sys/class/hwmon` está vazio e não existe `thermal_zone` nenhuma — o driver
+    // que lê a temperatura fala com registradores do processador físico, que o hipervisor
+    // não repassa.
+    if let Some(temperature) = temperature::TemperatureMonitor::probe() {
+        monitors.push(Box::new(temperature));
+    }
+
+    monitors.extend([
+        Box::new(memory::MemoryMonitor) as Box<dyn Monitor>,
         Box::new(disk::DiskMonitor),
         Box::new(network::NetRxMonitor),
         Box::new(network::NetTxMonitor),
         Box::new(disk::DiskReadMonitor),
         Box::new(disk::DiskWriteMonitor),
-    ];
-    // Logo depois do CPU, e no mesmo grupo: é ao lado do uso que a temperatura quer
-    // dizer alguma coisa.
-    //
-    // Ausente onde a máquina não tem sensor de processador, como o painel da GPU é
-    // ausente onde não há GPU. E isso não é um caso raro: conferido num convidado KVM na
-    // nuvem, `/sys/class/hwmon` está vazio e não existe `thermal_zone` nenhuma — o driver
-    // que lê a temperatura fala com registradores do processador físico, que o hipervisor
-    // não repassa.
-    if let Some(temperature) = temperature::TemperatureMonitor::probe() {
-        monitors.insert(1, Box::new(temperature));
-    }
+    ]);
+
     // Only present on machines with a working NVIDIA driver — absent everywhere else.
     if let Some(gpu) = gpu::GpuMonitor::probe() {
         monitors.push(Box::new(gpu));
