@@ -1,10 +1,14 @@
 use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+use crate::app::Tab;
+use crate::container::Store;
 use crate::tools::Handoff;
 
 pub mod connections;
+pub mod containers;
 pub mod cpu;
 pub mod disk;
 pub mod gpu;
@@ -35,6 +39,13 @@ pub struct SystemState {
     /// system at the moment of the tick, so there is exactly one right answer per tick
     /// and this is where it lives.
     scratch: Scratch,
+    /// O retrato dos containers, publicado por threads de fundo. `None` numa máquina sem
+    /// engine e sem cgroups de container, que é a mesma condição que tira a aba da barra.
+    ///
+    /// Ao contrário de tudo o mais aqui, isto não é amostrado no tick: as threads do
+    /// `Store` já mantêm o retrato atual, e ler é pegar um mutex. É por isso que a aba
+    /// Containers custa praticamente nada, contra os 87,8 ms por tick da aba Processos.
+    pub containers: Option<Arc<Store>>,
 }
 
 /// Per-tick memoisation. Cleared at the start of every refresh, so nothing here is ever
@@ -53,6 +64,7 @@ impl SystemState {
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             scratch: Scratch::default(),
+            containers: Store::start().map(Arc::new),
         }
     }
 
@@ -104,6 +116,12 @@ impl SystemState {
         self.sys.refresh_memory();
         self.disks.refresh(true);
         self.networks.refresh(true);
+    }
+
+    /// A aba Containers, que não tem o que atualizar aqui: as threads do `Store` mantêm
+    /// o retrato sozinhas, e o que o tick faz é começar um tick — nada mais.
+    pub fn refresh_containers(&mut self) {
+        self.start_tick();
     }
 
     /// Refreshes the process list (Processes tab: ports/top CPU/top memory), plus the
@@ -322,6 +340,13 @@ pub trait TableMonitor: Send {
     fn id(&self) -> &'static str;
     fn title(&self) -> &'static str;
 
+    /// Em que aba esta tabela mora. O padrão é Processos, que é onde todas moravam
+    /// quando havia um lugar só para elas — assim uma tabela existente não precisa
+    /// dizer nada, e uma nova só diz quando não é lá.
+    fn tab(&self) -> Tab {
+        Tab::Processes
+    }
+
     /// What a mark on this table can be about, in the order the picker offers them.
     /// Empty means the table takes no marks — a list of facts about the machine has no
     /// row worth following.
@@ -357,6 +382,16 @@ pub trait TableMonitor: Send {
     fn detail(&mut self, _state: &SystemState, _row: &TableRow) -> Option<Detail> {
         None
     }
+    /// Se o Enter abre um menu de operações em vez do detalhe.
+    ///
+    /// Nas tabelas de container a pergunta que se faz sobre uma linha é «o que posso
+    /// fazer com isto», e ver os detalhes é uma das respostas — então o menu vem primeiro
+    /// e o detalhe é uma entrada dele. Em toda outra tabela não há nada a fazer com uma
+    /// linha além de lê-la, e o Enter continua abrindo o detalhe direto.
+    fn actions_on_enter(&self) -> bool {
+        false
+    }
+
     /// Whether this table has a detail view at all. Only drives the fullscreen footer
     /// hint — `detail()` is what actually decides — so a table that can't say anything
     /// about its rows doesn't advertise an Enter that would do nothing.
@@ -394,5 +429,13 @@ pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {
         Box::new(ssh::SshSessionsMonitor),
         Box::new(iface::InterfacesMonitor::new()),
         Box::new(summary::SummaryMonitor::new()),
+        // A aba Containers. Ficam no mesmo vetor que as outras — `Focus::Table`, marcas,
+        // tela cheia, busca e detalhe continuam indexando um só lugar — e é o `tab()` de
+        // cada uma que diz onde aparecem.
+        Box::new(containers::ContainersMonitor::default()),
+        Box::new(containers::VolumesMonitor::default()),
+        Box::new(containers::ImagesMonitor::default()),
+        Box::new(containers::NetworksMonitor::default()),
+        Box::new(containers::ContainerSummaryMonitor),
     ]
 }

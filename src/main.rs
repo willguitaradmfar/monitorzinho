@@ -10,6 +10,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 mod app;
+mod container;
 mod format;
 mod history;
 mod monitor;
@@ -58,18 +59,20 @@ fn handle_flags() -> bool {
             println!();
             println!("Monitor de terminal: CPU, memória, disco, rede e GPU em gráficos;");
             println!("processos, portas, conexões, sessões SSH e interfaces em tabelas;");
-            println!("e ferramentas que rodam — túnel, scanner de portas, investigação");
-            println!("DNS, scanner de rede, inspetor de certificado, receptor de");
-            println!("requisições e seguidor de arquivo.");
+            println!("containers, volumes, imagens e redes — com logs, shell e as");
+            println!("operações de cada um; e ferramentas que rodam — túnel, scanner de");
+            println!("portas, investigação DNS, scanner de rede, inspetor de certificado,");
+            println!("receptor de requisições e seguidor de arquivo.");
             println!();
             println!("uso: monitorzinho [--version] [--help] [--bench]");
             println!();
-            println!("--bench mede o custo de uma amostragem da aba Processos, que é o");
-            println!("que acontece ao trocar de aba, e imprime onde o tempo foi.");
+            println!("--bench mede o custo de uma amostragem de cada aba, que é o que");
+            println!("acontece ao trocar de aba, e imprime onde o tempo foi.");
             println!();
             println!("Não há opções de configuração na linha de comando: tudo é escolhido");
             println!("de dentro, e as teclas de cada tela estão no rodapé dela. Tab troca");
-            println!("de aba, Ctrl+C duas vezes sai.");
+            println!("de aba, Ctrl+C duas vezes sai. A aba Containers só aparece onde há");
+            println!("uma engine que responda ou containers rodando.");
         }
         other => {
             eprintln!("monitorzinho: opção desconhecida «{other}» — tente --help");
@@ -108,11 +111,37 @@ fn main() -> io::Result<()> {
     result
 }
 
+/// Entrega o terminal a um shell dentro do container e o toma de volta quando acaba.
+///
+/// A tela alternativa é abandonada de propósito: o shell tem que escrever na tela normal,
+/// onde o que ele imprimiu continua no histórico do terminal depois que a sessão fecha —
+/// que é metade da razão de abrir um shell. O modo bruto continua ligado, porque é
+/// exatamente o que um terminal interativo quer.
+fn open_shell(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    container: &container::Container,
+) -> io::Result<()> {
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+    let size = crossterm::terminal::size().unwrap_or((80, 24));
+    let outcome = app.run_shell(container, size);
+
+    // Volta para a tela alternativa e reconstrói o quadro do zero: o shell escreveu por
+    // toda a tela, e o `ratatui` só redesenha o que ele acha que mudou.
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    terminal.clear()?;
+    if let Err(error) = outcome {
+        app.report_shell_failure(error);
+    }
+    Ok(())
+}
+
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let mut app = App::new();
     app.tick();
     let mut last_tick = Instant::now();
     let mut drawn_activity = tools::activity();
+    let mut drawn_containers = app.container_revision();
     let mut dirty = true;
 
     loop {
@@ -132,6 +161,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::ZERO)
             .min(REDRAW_SLICE);
+
+        // Um shell pedido no menu da aba Containers. Aqui, entre um quadro e o próximo,
+        // e não dentro do tratamento da tecla: enquanto ele está aberto o terminal é
+        // dele, e o laço não pode desenhar por cima.
+        if let Some(container) = app.take_pending_shell() {
+            open_shell(terminal, &mut app, &container)?;
+            last_tick = Instant::now();
+            dirty = true;
+            continue;
+        }
 
         // The tab was just switched and drawn with what it had; now fill it in. Doing
         // this after the draw rather than before is the whole difference between a
@@ -174,6 +213,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     // Above the marks screen too: the box is opened from it, to edit the
                     // row the list has the cursor on.
                     code if app.mark_editor_open() => app.mark_key(code),
+                    // A caixa do endereço engole todas as letras: é um campo de texto,
+                    // e 'q' faz parte de um nome de host como qualquer outra.
+                    code if app.endpoint_editor_open() => app.endpoint_key(code),
                     // The marks screen sits over whatever it was opened from, table or
                     // dashboard, and takes every key including 'q' and the letters that
                     // would otherwise be search input or panel shortcuts.
@@ -184,6 +226,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     // Same reason: the hand-off picker sits over a log whose search box
                     // takes every letter, so it has to see the keys first.
                     code if app.handoff_open() => app.handoff_key(code),
+                    // O menu de operações e a tela de texto tomam todas as teclas
+                    // enquanto estão abertos, incluindo 'q' e as setas: são telas
+                    // inteiras, não caixas sobre a tabela.
+                    code if app.actions_open() => app.actions_key(code),
+                    code if app.text_open() => app.text_key(code),
                     // A fullscreened table's search box swallows every letter, including
                     // 'q' — so Esc is its only way out, and it first clears an active
                     // query rather than leaving fullscreen outright.
@@ -322,8 +369,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                         app.activate_shortcut(c);
                     }
                     // Enter opens whatever the selected row's monitor can say about it;
-                    // tables with no detail to give simply ignore it.
-                    KeyCode::Enter if matches!(app.focus, Focus::Table(_)) => app.open_detail(),
+                    // tables with no detail to give simply ignore it. Nas tabelas da aba
+                    // Containers abre o menu de operações — ver `App::open_row`.
+                    KeyCode::Enter if matches!(app.focus, Focus::Table(_)) => app.open_row(),
                     KeyCode::Up if matches!(app.focus, Focus::Detail(_)) => app.scroll_detail(-1),
                     KeyCode::Down if matches!(app.focus, Focus::Detail(_)) => app.scroll_detail(1),
                     KeyCode::PageUp if matches!(app.focus, Focus::Detail(_)) => {
@@ -377,6 +425,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         if activity != drawn_activity {
             drawn_activity = activity;
             dirty |= app.shows_tools();
+        }
+
+        // O mesmo, para o retrato dos containers: ele muda a cada segundo e uma ação
+        // termina quando termina, enquanto o tick só vem a cada dois. Redesenhar só onde
+        // isso apareceria — repintar um gráfico de CPU porque um container mudou de
+        // estado é gastar um núcleo para mostrar a mesma tela.
+        let containers = app.container_revision();
+        if containers != drawn_containers {
+            drawn_containers = containers;
+            dirty |= app.shows_containers();
         }
 
         if last_tick.elapsed() >= app.interval() {

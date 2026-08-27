@@ -11,14 +11,15 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, ChartPanel, DetailFocus, Focus, HandoffPicker, MATCH_CONTEXT, MarkEditor, MarkField,
-    MarksScreen, ParamField, RulesEditor, RulesMode, ShortcutTarget, Tab, TableFocus,
-    ToolMonitorFocus, ToolWizard, WizardStep,
+    ActionMenu, App, ChartPanel, DetailFocus, EndpointEditor, Focus, HandoffPicker, MATCH_CONTEXT,
+    MarkEditor, MarkField, MarksScreen, ParamField, Pending, RulesEditor, RulesMode,
+    ShortcutTarget, Tab, TableFocus, TextView, ToolMonitorFocus, ToolWizard, WizardStep,
 };
+use crate::container::Gravity;
 use crate::format;
 use crate::history::History;
 use crate::monitor::mark::MarkColor;
-use crate::monitor::{Danger, Detail, Monitor, TableRow};
+use crate::monitor::{Detail, Monitor, TableRow};
 use crate::tools::rewrite::{self, Rule};
 use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, Stage, State, lock_log};
 
@@ -111,9 +112,112 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let Some(editor) = &app.mark_editor {
         render_mark_editor(frame, area, app, editor);
     }
-    if let Some(pending) = &app.pending {
-        render_confirm(frame, area, &pending.danger);
+    if let Some(editor) = &app.endpoint_editor {
+        render_endpoint_editor(frame, area, editor);
     }
+    if let Some(pending) = &app.pending {
+        render_confirm(frame, area, pending);
+    }
+}
+
+/// O menu que o Enter abre sobre uma linha da aba Containers: o que dá para fazer com
+/// ela, na ordem em que a engine ofereceu.
+///
+/// Nada aqui é escrito na tela — as entradas vêm de `ContainerEngine::actions`. Uma que
+/// não dá para fazer agora fica na lista, apagada e com o motivo ao lado: um item que se
+/// explica ensina, um item ausente não ensina nada.
+fn render_action_menu(frame: &mut Frame, area: Rect, menu: &ActionMenu) {
+    let width = ACTION_MENU_WIDTH.min(area.width);
+    let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
+
+    let mut lines = vec![Line::raw("")];
+    if menu.actions.is_empty() {
+        lines.push(Line::styled(
+            "   Nenhuma operação disponível — nenhuma engine respondeu nesta máquina.",
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    for (i, action) in menu.actions.iter().enumerate() {
+        let selected = i == menu.selected;
+        let blocked = action.blocked.is_some();
+        let style = match (blocked, selected) {
+            // O que não dá para fazer nunca fica em destaque, mesmo sob o cursor.
+            (true, _) => Style::default().fg(palette::DIM),
+            (false, true) => Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD),
+            (false, false) => Style::default(),
+        };
+        // A cor diz o que a tecla custa antes de ela ser apertada: o que não se desfaz
+        // não parece com o que se desfaz.
+        let marker = match action.gravity {
+            _ if blocked => Span::styled("  ✗ ", Style::default().fg(palette::DIM)),
+            Gravity::Safe => Span::styled("  · ", Style::default().fg(palette::DIM)),
+            Gravity::Confirm => Span::styled("  ! ", Style::default().fg(palette::YELLOW)),
+            Gravity::Typed => Span::styled("  ‼ ", Style::default().fg(palette::RED)),
+        };
+        let mut spans = vec![
+            Span::styled(
+                if selected { " ▶" } else { "  " }.to_string(),
+                Style::default().fg(palette::CYAN),
+            ),
+            marker,
+            Span::styled(action.label.clone(), style),
+        ];
+        if let Some(reason) = &action.blocked {
+            spans.push(Span::styled(
+                format!(
+                    "  — {}",
+                    clip(reason, text_width.saturating_sub(action.label.len() + 8))
+                ),
+                Style::default().fg(palette::DIM),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::raw(""));
+
+    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let box_area = centered(area, width, height);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {} {} ", menu.subject.kind(), menu.subject.name()),
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::CYAN))
+        .title_bottom(hint_line("↑/↓ escolher · Enter fazer · Esc voltar"));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Uma tela de texto rolável — o que a engine responde quando se pede tudo que ela sabe.
+fn render_text_view(frame: &mut Frame, area: Rect, view: &TextView) {
+    let block = Block::default()
+        .title(format!(" {} ", view.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::CYAN))
+        .title_bottom(hint_line(
+            "↑/↓ rolar · PgUp/PgDn rolar rápido · Home/End extremos · Esc voltar",
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let max_scroll = (view.lines.len() as u16).saturating_sub(inner.height);
+    view.max_scroll.set(max_scroll);
+    let lines: Vec<Line> = view
+        .lines
+        .iter()
+        .map(|line| Line::styled(line.clone(), Style::default().fg(palette::DIM)))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).scroll((view.scroll.min(max_scroll), 0)),
+        inner,
+    );
 }
 
 fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
@@ -139,7 +243,7 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
                 monitor.title(),
                 monitor.headers(),
                 TableChrome {
-                    has_detail: monitor.has_detail(),
+                    enter: enter_verb(monitor),
                     marks: !monitor.mark_kinds().is_empty(),
                     note: monitor.note(),
                     // Asked of the rows rather than of the monitor: the two top-N
@@ -163,6 +267,31 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
             render_tool_monitor(frame, area, app, monitor);
             return;
         }
+        Focus::Actions(menu) => {
+            // A tabela continua desenhada atrás: o menu fala de uma linha dela, e perder
+            // a linha de vista ao perguntar o que fazer com ela seria perder o assunto.
+            let monitor = app.table_monitors[menu.parent.table_index].as_ref();
+            render_fullscreen_table(
+                frame,
+                area,
+                monitor.title(),
+                monitor.headers(),
+                TableChrome {
+                    enter: enter_verb(monitor),
+                    marks: !monitor.mark_kinds().is_empty(),
+                    note: monitor.note(),
+                    is_tree: menu.parent.rows.iter().any(|row| row.child_count > 0),
+                    danger: None,
+                },
+                &menu.parent,
+            );
+            render_action_menu(frame, area, menu);
+            return;
+        }
+        Focus::Text(view) => {
+            render_text_view(frame, area, view);
+            return;
+        }
         Focus::None => {}
     }
 
@@ -175,6 +304,7 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
     match app.tab {
         Tab::Overview => render_overview_tab(frame, sections[1], app),
         Tab::Processes => render_processes_tab(frame, sections[1], app),
+        Tab::Containers => render_containers_tab(frame, sections[1], app),
         Tab::Tools => render_tools_tab(frame, sections[1], app),
     }
 }
@@ -185,7 +315,8 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
 /// Red rather than the usual cyan, and it never picks a default: Enter is the only key
 /// that acts, Esc is the only key that cancels, and everything else is ignored so a
 /// keystroke aimed at the screen underneath can't answer a question it never saw.
-fn render_confirm(frame: &mut Frame, area: Rect, danger: &Danger) {
+fn render_confirm(frame: &mut Frame, area: Rect, pending: &Pending) {
+    let danger = &pending.danger;
     let width = CONFIRM_WIDTH.min(area.width);
     let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
 
@@ -199,10 +330,39 @@ fn render_confirm(frame: &mut Frame, area: Rect, danger: &Danger) {
         }
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "   Enter faz agora. Esc deixa como está.",
-        Style::default().fg(palette::YELLOW),
-    ));
+    // Onde a perda é irreversível, Enter sozinho não basta: digitar o nome é a distância
+    // entre ler a caixa e apagar um banco por engano.
+    match &pending.typed {
+        Some(typed) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "   Digite o nome para confirmar: ",
+                    Style::default().fg(palette::DIM),
+                ),
+                Span::styled(
+                    format!("{}▏", typed.input),
+                    Style::default().fg(palette::YELLOW),
+                ),
+            ]));
+            lines.push(Line::styled(
+                format!("   ({})", typed.expected),
+                Style::default().fg(palette::DIM),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                if typed.satisfied() {
+                    "   Enter faz agora. Esc deixa como está."
+                } else {
+                    "   Enter só funciona com o nome certo. Esc deixa como está."
+                },
+                Style::default().fg(palette::YELLOW),
+            ));
+        }
+        None => lines.push(Line::styled(
+            "   Enter faz agora. Esc deixa como está.",
+            Style::default().fg(palette::YELLOW),
+        )),
+    }
 
     let height = (lines.len() as u16).saturating_add(4).min(area.height);
     let box_area = centered(area, width, height);
@@ -311,6 +471,61 @@ fn render_mark_editor(frame: &mut Frame, area: Rect, app: &App, editor: &MarkEdi
         .borders(Borders::ALL)
         .border_style(Style::default().fg(mark_color(editor.color)))
         .title_bottom(hint_line(&hint));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A caixa que escolhe onde a engine atende.
+fn render_endpoint_editor(frame: &mut Frame, area: Rect, editor: &EndpointEditor) {
+    let width = MARK_BOX_WIDTH.min(area.width);
+    let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("   Endereço  ", Style::default().fg(palette::DIM)),
+            Span::styled(
+                format!("{}▏", editor.value),
+                Style::default().fg(palette::YELLOW),
+            ),
+        ]),
+        Line::raw(""),
+        Line::styled(
+            format!("   Agora: {}", clip(&editor.current, text_width - 10)),
+            Style::default().fg(palette::DIM),
+        ),
+    ];
+    for hint in [
+        "Vazio deixa a descoberta decidir: DOCKER_HOST, o contexto ativo,",
+        "e os sockets desta máquina — o que acerta em quase todo lugar.",
+        "Noutra máquina: tcp://host:2375, ou https://host:2376 com TLS.",
+    ] {
+        lines.push(Line::styled(
+            format!("   {hint}"),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    if let Some(error) = &editor.error {
+        lines.push(Line::raw(""));
+        for chunk in wrap(error, text_width) {
+            lines.push(Line::styled(
+                format!("   {chunk}"),
+                Style::default().fg(palette::RED),
+            ));
+        }
+    }
+
+    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let box_area = centered(area, width, height);
+    let block = Block::default()
+        .title(" Onde a engine atende ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::CYAN))
+        .title_bottom(hint_line(
+            "digite o endereço · Enter provar e usar · Esc cancelar",
+        ));
     let inner = block.inner(box_area);
     frame.render_widget(Clear, box_area);
     frame.render_widget(block, box_area);
@@ -448,7 +663,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let mut spans = vec![Span::raw(" ")];
-    for (i, tab) in Tab::ALL.iter().enumerate() {
+    for (i, tab) in app.tabs().iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("   "));
         }
@@ -502,7 +717,8 @@ fn render_overview_tab(frame: &mut Frame, area: Rect, app: &App) {
 /// connected next to what they're connected to) — matches
 /// `monitor::all_table_monitors()`'s order.
 fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
-    if app.table_monitors.len() < 7 {
+    let panels = app.tables_on(Tab::Processes);
+    if panels.len() < 7 {
         return;
     }
 
@@ -531,7 +747,7 @@ fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(rows[3]);
 
-    let panels = [
+    let areas = [
         top_row[0],
         top_row[1],
         rows[1],
@@ -540,16 +756,69 @@ fn render_processes_tab(frame: &mut Frame, area: Rect, app: &App) {
         bottom_row[1],
         bottom_row[2],
     ];
-    for (i, &panel_area) in panels.iter().enumerate() {
-        let monitor = app.table_monitors[i].as_ref();
+    render_table_grid(frame, app, &shortcuts, &panels, &areas);
+}
+
+/// Aba Containers: a tabela de containers ocupando a largura toda e metade da altura —
+/// é a que tem mais linhas e a que se lê primeiro —, e abaixo dela quatro painéis em
+/// duas colunas: o que os containers montam, de onde saíram, em que rede estão, e o
+/// resumo de tudo.
+fn render_containers_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let panels = app.tables_on(Tab::Containers);
+    if panels.len() < 5 {
+        return;
+    }
+
+    let shortcuts = ShortcutMap::build(app);
+    let halves = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(area);
+    let lower = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Fill(1), Constraint::Fill(1)])
+        .split(halves[1]);
+    let columns = |row: Rect| {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(row)
+    };
+    let upper_pair = columns(lower[0]);
+    let lower_pair = columns(lower[1]);
+
+    let areas = [
+        halves[0],
+        upper_pair[0],
+        upper_pair[1],
+        lower_pair[0],
+        lower_pair[1],
+    ];
+    render_table_grid(frame, app, &shortcuts, &panels, &areas);
+}
+
+/// Desenha uma grade de painéis de tabela: cada alvo no seu retângulo, com o crachá do
+/// atalho e a nota da borda que a tabela tiver.
+fn render_table_grid(
+    frame: &mut Frame,
+    app: &App,
+    shortcuts: &ShortcutMap,
+    panels: &[ShortcutTarget],
+    areas: &[Rect],
+) {
+    for (target, &panel_area) in panels.iter().zip(areas) {
+        let ShortcutTarget::Table(index) = *target else {
+            continue;
+        };
+        let monitor = app.table_monitors[index].as_ref();
         render_table_panel(
             frame,
             panel_area,
             monitor.title(),
             monitor.headers(),
-            &app.table_rows[i],
+            &app.table_rows[index],
             monitor.note(),
-            shortcuts.table.get(&i).copied(),
+            shortcuts.table.get(&index).copied(),
         );
     }
 }
@@ -763,6 +1032,43 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
             Constraint::Fill(1),
             Constraint::Length(21),
         ],
+        [
+            "Nome",
+            "Imagem",
+            "Estado",
+            "Portas",
+            "CPU%",
+            "Memória",
+            "Rede E/S",
+        ] => vec![
+            Constraint::Fill(2),
+            Constraint::Fill(2),
+            // Cabe «em execução (unhealthy)», que é o mais longo que a coluna produz.
+            Constraint::Length(24),
+            Constraint::Fill(1),
+            Constraint::Length(7),
+            Constraint::Length(19),
+            Constraint::Length(22),
+        ],
+        ["Volume", "Usado por", "Tamanho", "Criado"] => vec![
+            Constraint::Fill(2),
+            Constraint::Fill(2),
+            Constraint::Length(10),
+            Constraint::Length(8),
+        ],
+        ["Imagem", "Tamanho", "Criada", "Em uso"] => vec![
+            Constraint::Fill(1),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(15),
+        ],
+        ["Rede", "Driver", "Sub-rede", "Containers"] => vec![
+            Constraint::Fill(1),
+            Constraint::Length(18),
+            Constraint::Length(18),
+            Constraint::Fill(1),
+        ],
+        ["Item", "Situação"] => vec![Constraint::Length(16), Constraint::Fill(1)],
         ["User", "Host", "TTY", "Time", "Folder", "Command"] => vec![
             Constraint::Length(10),
             Constraint::Length(16),
@@ -874,7 +1180,11 @@ fn with_mark_column(mut widths: Vec<Constraint>) -> Vec<Constraint> {
 /// depends on the table underneath, and a hint for a key that does nothing there is
 /// worse than no hint at all.
 struct TableChrome {
-    has_detail: bool,
+    /// O que o Enter faz aqui, em uma palavra, ou nada onde não faz nada. Difere por
+    /// tabela: nas de container ele abre o menu de operações, nas outras o detalhe — e um
+    /// rodapé que promete «detalhar» sobre um menu de operações manda alguém procurar um
+    /// bug que não existe.
+    enter: Option<&'static str>,
     /// Whether this table takes marks — a list of facts about the machine has no row
     /// worth following, and offering the key there would be offering nothing.
     marks: bool,
@@ -886,6 +1196,22 @@ struct TableChrome {
     /// What `Del` does here, in a word, or `None` where it does nothing — a table of
     /// interfaces has no process to kill.
     danger: Option<&'static str>,
+}
+
+/// O que o Enter faz numa tabela, em uma palavra.
+fn enter_verb(monitor: &dyn crate::monitor::TableMonitor) -> Option<&'static str> {
+    if monitor.actions_on_enter() {
+        return Some("opções");
+    }
+    if monitor.has_detail() {
+        return Some("detalhar");
+    }
+    // O resumo tem uma linha só que responde ao Enter, e é onde se escolhe o endereço da
+    // engine — dizer isso no rodapé é a única forma de alguém descobrir.
+    if monitor.id() == "resumo-containers" {
+        return Some("escolher o endereço da engine");
+    }
+    None
 }
 
 /// Fullscreen view of a frozen table: same columns as the overview panel, plus a
@@ -909,8 +1235,8 @@ fn render_fullscreen_table(
         .border_style(Style::default().fg(palette::CYAN));
 
     let mut parts: Vec<String> = Vec::new();
-    if chrome.has_detail {
-        parts.push("Enter detalhar".to_string());
+    if let Some(verb) = chrome.enter {
+        parts.push(format!("Enter {verb}"));
     }
     if chrome.marks {
         // Named for what it does rather than for the key: "marcar" is the verb, and the
@@ -1726,6 +2052,9 @@ const PARAM_LABEL_WIDTH: usize = 20;
 const CONFIRM_WIDTH: u16 = 76;
 /// The mark box: four short fields and two lines of explanation.
 const MARK_BOX_WIDTH: u16 = 72;
+/// Largura do menu de operações. Cabe o rótulo mais longo com o motivo do bloqueio ao
+/// lado, que é a linha que precisa caber inteira.
+const ACTION_MENU_WIDTH: u16 = 86;
 /// Wider than the box that writes one mark: a list is read across, and a mark's value is
 /// a command line often enough that a narrow column would wrap most of them.
 const MARKS_SCREEN_WIDTH: u16 = 96;

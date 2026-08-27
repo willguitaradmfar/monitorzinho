@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 use crossterm::event::KeyCode;
 use sysinfo::{Pid, Signal};
 
+use crate::container::{Action, ActionKey, Container, Gravity, LogSource, Subject};
 use crate::format;
 use crate::history::{self, CAPACITY, History};
+use crate::monitor::containers::subject_of;
 use crate::monitor::mark::{self, Mark};
 use crate::monitor::{
     self as monitors, Danger, Detail, Monitor, SystemState, TableMonitor, TableRow,
@@ -23,6 +25,15 @@ use crate::tools::{self, Execution, Handoff, ParamKind, ParamSpec, State, Tool};
 pub enum Tab {
     Overview,
     Processes,
+    /// Containers, volumes, imagens e redes. Só existe onde há o que mostrar — ver
+    /// `App::tabs`.
+    ///
+    /// É aba própria e não mais um painel na de Processos por duas razões medidas. A
+    /// grade daquela aba é de sete painéis colocados à mão e está cheia. E a aba é a
+    /// unidade de custo: amostrar Processos custa 87,8 ms por tick aqui, enquanto ler os
+    /// containers custa praticamente nada, porque quem fala com a engine é uma thread de
+    /// fundo. Uma aba em que dá para *ficar* num nó ocupado é o ponto.
+    Containers,
     /// Unlike the other two this one doesn't watch anything: it lists the tool
     /// executions the user has started, which keep running regardless of which tab is
     /// on screen.
@@ -30,12 +41,15 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Overview, Tab::Processes, Tab::Tools];
+    /// Toda aba que existe no programa. Qual delas aparece é decidido no arranque — ver
+    /// `App::tabs`.
+    pub const ALL: [Tab; 4] = [Tab::Overview, Tab::Processes, Tab::Containers, Tab::Tools];
 
     pub fn title(&self) -> &'static str {
         match self {
             Tab::Overview => "Visão Geral",
             Tab::Processes => "Processos",
+            Tab::Containers => "Containers",
             Tab::Tools => "Ferramentas",
         }
     }
@@ -212,62 +226,91 @@ impl TableFocus {
     }
 }
 
-/// Times one full sample of the Processes tab and prints where the time went.
+/// Times one full sample of each sampled tab and prints where the time went.
 ///
 /// That sample is exactly what a keypress on Tab pays for, so this is the measurement
 /// that matters for how the app *feels*, as opposed to the steady-state CPU a `top`
 /// would show. Run on the machine that feels slow: the answer differs by an order of
 /// magnitude between a laptop and a node running hundreds of containers.
+///
+/// Por aba, e não numa lista só, porque a aba é a unidade de custo: o que uma aba fora
+/// de foco cobra é zero, e um total que somasse todas as tabelas responderia uma
+/// pergunta que ninguém faz.
 pub fn bench() {
     let mut state = SystemState::new();
     let mut monitors = monitors::all_table_monitors();
 
-    println!(
-        "monitorzinho {} — amostragem da aba Processos",
-        env!("CARGO_PKG_VERSION")
-    );
-    println!();
-    // Twice: the first pass fills every cache in the process and in the kernel, and the
-    // second is what a running app actually pays each time.
-    for pass in 1..=2 {
-        let started = Instant::now();
-        state.refresh_processes();
-        let refreshed = started.elapsed();
-        println!(
-            "passagem {pass}{}",
-            if pass == 1 {
-                " (fria)"
-            } else {
-                " (quente — é esta que conta)"
-            }
-        );
-        println!(
-            "  {:<28}{:>8.1} ms",
-            "refresh do /proc (sysinfo)",
-            refreshed.as_secs_f64() * 1000.0
-        );
+    println!("monitorzinho {}", env!("CARGO_PKG_VERSION"));
 
-        let mut total = refreshed;
-        for monitor in monitors.iter_mut() {
-            let at = Instant::now();
-            let rows = monitor.sample(&state, Some(OVERVIEW_TABLE_ROWS));
-            let elapsed = at.elapsed();
-            total += elapsed;
+    for tab in [Tab::Processes, Tab::Containers] {
+        let indices: Vec<usize> = (0..monitors.len())
+            .filter(|&i| monitors[i].tab() == tab)
+            .collect();
+        // A aba Containers não existe numa máquina sem engine e sem cgroups de
+        // container; medi-la ali seria imprimir uma tabela de zeros.
+        if indices.is_empty() || (tab == Tab::Containers && state.containers.is_none()) {
+            continue;
+        }
+        println!();
+        println!("aba {}", tab.title());
+        println!();
+        // Twice: the first pass fills every cache in the process and in the kernel, and
+        // the second is what a running app actually pays each time.
+        for pass in 1..=2 {
+            let started = Instant::now();
+            match tab {
+                Tab::Containers => state.refresh_containers(),
+                _ => state.refresh_processes(),
+            }
+            let refreshed = started.elapsed();
             println!(
-                "  {:<28}{:>8.1} ms   ({} linha(s))",
-                monitor.title(),
-                elapsed.as_secs_f64() * 1000.0,
-                rows.len()
+                "  passagem {pass}{}",
+                if pass == 1 {
+                    " (fria)"
+                } else {
+                    " (quente — é esta que conta)"
+                }
+            );
+            if refreshed.as_micros() > 0 {
+                println!(
+                    "    {:<28}{:>8.1} ms",
+                    "refresh do /proc (sysinfo)",
+                    refreshed.as_secs_f64() * 1000.0
+                );
+            }
+
+            let mut total = refreshed;
+            for &index in &indices {
+                let at = Instant::now();
+                let rows = monitors[index].sample(&state, Some(OVERVIEW_TABLE_ROWS));
+                let elapsed = at.elapsed();
+                total += elapsed;
+                println!(
+                    "    {:<28}{:>8.1} ms   ({} linha(s))",
+                    monitors[index].title(),
+                    elapsed.as_secs_f64() * 1000.0,
+                    rows.len()
+                );
+            }
+            println!(
+                "    {:<28}{:>8.1} ms",
+                "TOTAL",
+                total.as_secs_f64() * 1000.0
+            );
+            // What the loop does with a sample this expensive.
+            println!(
+                "    {:<28}{:>8.1} s    (intervalo escolhido para este custo)",
+                "TICK",
+                interval_for(total).as_secs_f64()
             );
         }
-        println!("  {:<28}{:>8.1} ms", "TOTAL", total.as_secs_f64() * 1000.0);
-        // What the loop does with a sample this expensive.
-        println!(
-            "  {:<28}{:>8.1} s    (intervalo escolhido para este custo)",
-            "TICK",
-            interval_for(total).as_secs_f64()
-        );
+    }
+
+    if state.containers.is_some() {
         println!();
+        println!("A aba Containers custa quase nada porque quem fala com a engine são");
+        println!("threads de fundo, e elas desaceleram quando nenhum painel de container");
+        println!("está na tela. O que o número acima mede é só copiar o retrato delas.");
     }
 }
 
@@ -362,6 +405,24 @@ impl MarkEditor {
             self.field = index;
         }
     }
+}
+
+/// A caixa que escolhe onde a engine atende.
+///
+/// A descoberta acerta sozinha na esmagadora maioria das máquinas — socket do usuário,
+/// socket do sistema, `DOCKER_HOST`, o contexto ativo. Isto existe para o caso que a
+/// descoberta não tem como adivinhar: um daemon noutra máquina.
+///
+/// O endereço é *provado* antes de ser salvo. Guardar um endereço que não responde e só
+/// descobrir isso no próximo início seria transformar um erro de digitação numa aba que
+/// sumiu sem explicação.
+pub struct EndpointEditor {
+    pub value: String,
+    /// Onde a engine atende agora, para a caixa dizer o que está trocando.
+    pub current: String,
+    /// Por que a última tentativa não deu. Fica na caixa, não numa tela que já passou.
+    pub error: Option<String>,
+    pub probing: bool,
 }
 
 /// The list of every mark on this machine, with the cursor on one of them.
@@ -1047,6 +1108,54 @@ pub enum Focus {
     Detail(Box<DetailFocus>),
     Wizard(ToolWizard),
     ToolMonitor(ToolMonitorFocus),
+    /// O menu de operações de uma linha da aba Containers. Boxed pela mesma razão do
+    /// detalhe: carrega a tabela inteira de onde veio.
+    Actions(Box<ActionMenu>),
+    /// Um texto longo e só de leitura — o que a engine responde quando se pede tudo que
+    /// ela sabe sobre alguma coisa.
+    Text(Box<TextView>),
+}
+
+/// O menu que o Enter abre sobre uma linha da aba Containers.
+///
+/// Não é uma extensão do detalhe: o detalhe responde «o que é isto», o menu responde «o
+/// que posso fazer com isto» — e «ver detalhes completos» é uma das entradas dele.
+///
+/// As opções não estão escritas aqui nem na tela: vêm de `ContainerEngine::actions`,
+/// então uma engine que não saiba pausar simplesmente não oferece pausar, e nada nesta
+/// parte do programa muda por causa disso.
+pub struct ActionMenu {
+    pub subject: Subject,
+    pub actions: Vec<Action>,
+    pub selected: usize,
+    /// A tabela de onde veio, devolvida intacta no Esc: mesma seleção, mesma busca,
+    /// mesmos nós abertos.
+    pub parent: TableFocus,
+}
+
+impl ActionMenu {
+    fn move_selection(&mut self, delta: i32) {
+        if self.actions.is_empty() {
+            return;
+        }
+        let len = self.actions.len() as i32;
+        self.selected = (self.selected as i32 + delta).rem_euclid(len) as usize;
+    }
+
+    pub fn chosen(&self) -> Option<&Action> {
+        self.actions.get(self.selected)
+    }
+}
+
+/// Uma tela de texto rolável. Existe para uma coisa só: mostrar o que a engine responde
+/// quando se pergunta tudo que ela sabe sobre um sujeito, do jeito que ela escreve.
+pub struct TextView {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub scroll: u16,
+    pub max_scroll: Cell<u16>,
+    /// Para onde o Esc volta.
+    pub parent: Option<Box<ActionMenu>>,
 }
 
 /// One chart on the Overview tab: what it measures, and everything the panel knows
@@ -1094,6 +1203,8 @@ pub struct App {
     pub mark_editor: Option<MarkEditor>,
     /// The list of every mark, while it's up.
     pub marks_screen: Option<MarksScreen>,
+    /// A caixa do endereço da engine, enquanto está aberta.
+    pub endpoint_editor: Option<EndpointEditor>,
     pub tools_available: Vec<Box<dyn Tool>>,
     pub tools: ToolsState,
     pub focus: Focus,
@@ -1107,6 +1218,12 @@ pub struct App {
     pending_sample: bool,
     /// How long the last sample took. What the interval is chosen from — see `interval`.
     last_sample: Duration,
+    /// Um shell pedido e ainda não aberto.
+    ///
+    /// Não é aberto aqui: enquanto ele existe o terminal é dele, e sair da tela
+    /// alternativa no meio do tratamento de uma tecla deixaria o laço desenhando por
+    /// cima do shell. Quem o abre é o laço principal, entre um quadro e o próximo.
+    pub pending_shell: Option<Box<Container>>,
     /// A destructive key waiting to be confirmed. Sits above every screen and takes
     /// every key while it's open, so nothing underneath can act on the keypress that
     /// dismisses it.
@@ -1119,6 +1236,22 @@ pub struct App {
 pub struct Pending {
     pub danger: Danger,
     pub action: PendingAction,
+    /// Quando a perda é irreversível, Enter sozinho não basta: é preciso digitar o nome.
+    /// Apagar um volume apaga os dados dentro dele para sempre, e uma tecla errada não
+    /// pode ser a distância inteira entre ler a caixa e perder o banco.
+    pub typed: Option<TypedConfirm>,
+}
+
+/// A exigência de digitar o nome antes de fazer o que não se desfaz.
+pub struct TypedConfirm {
+    pub expected: String,
+    pub input: String,
+}
+
+impl TypedConfirm {
+    pub fn satisfied(&self) -> bool {
+        self.input.trim() == self.expected.trim()
+    }
 }
 
 /// What to carry out once the confirmation is accepted. Each variant re-reads what it
@@ -1131,6 +1264,34 @@ pub enum PendingAction {
     RemoveExecution,
     /// Drop one rule from the shared rewrite history, which lives on disk.
     ForgetRule(Rule),
+    /// Uma operação da engine, já descrita e agora confirmada.
+    Engine {
+        action: ActionKey,
+        subject: Box<Subject>,
+        /// O gerúndio que a linha do sujeito mostra enquanto a operação acontece.
+        verb: String,
+    },
+}
+
+/// O gerúndio de uma operação, para a linha do sujeito dizer o que está acontecendo
+/// enquanto acontece.
+fn gerund(action: ActionKey) -> String {
+    match action {
+        ActionKey::Start => "iniciando",
+        ActionKey::Stop => "parando",
+        ActionKey::Restart => "reiniciando",
+        ActionKey::Pause => "pausando",
+        ActionKey::Unpause => "retomando",
+        ActionKey::Kill => "matando",
+        ActionKey::RemoveContainer
+        | ActionKey::RemoveVolume
+        | ActionKey::RemoveImage
+        | ActionKey::ForceRemoveImage
+        | ActionKey::RemoveNetwork => "removendo",
+        ActionKey::PruneVolumes | ActionKey::PruneImages | ActionKey::PruneNetworks => "limpando",
+        ActionKey::Logs | ActionKey::Details | ActionKey::Inspect | ActionKey::Shell => "abrindo",
+    }
+    .to_string()
 }
 
 /// The saved line for `key`, or a blank one. A chart that has been running before picks
@@ -1182,12 +1343,14 @@ impl App {
             marks,
             mark_editor: None,
             marks_screen: None,
+            endpoint_editor: None,
             tools_available,
             tools,
             focus: Focus::None,
             tab: Tab::Overview,
             quit_armed: false,
             pending_sample: false,
+            pending_shell: None,
             last_sample: Duration::ZERO,
             pending: None,
             state: SystemState::new(),
@@ -1248,6 +1411,36 @@ impl App {
         }
     }
 
+    /// Quantas vezes o retrato dos containers já mudou.
+    ///
+    /// Serve para a mesma coisa que o contador das ferramentas: as threads do `Store`
+    /// publicam a cada segundo e uma ação termina quando termina, enquanto o tick só vem
+    /// a cada dois. Sem isto, apertar «parar» e ver a linha mudar seriam coisas separadas
+    /// por até dois segundos de tela parada.
+    pub fn container_revision(&self) -> u64 {
+        self.state
+            .containers
+            .as_ref()
+            .map(|store| store.revision())
+            .unwrap_or(0)
+    }
+
+    /// Se o que está na tela é alimentado pelas threads dos containers.
+    pub fn shows_containers(&self) -> bool {
+        if self.tab == Tab::Containers {
+            return true;
+        }
+        // Uma tabela de container em tela cheia, seu detalhe, ou o menu sobre ela: todos
+        // continuam mostrando números que aquelas threads atualizam.
+        let table = match &self.focus {
+            Focus::Table(tf) => Some(tf.table_index),
+            Focus::Detail(df) => Some(df.table_index),
+            Focus::Actions(menu) => Some(menu.parent.table_index),
+            _ => None,
+        };
+        table.is_some_and(|index| self.table_monitors[index].tab() == Tab::Containers)
+    }
+
     /// Whether what's on screen is fed by the tools' own threads. Decides whether their
     /// writing something is worth a redraw between samples — anywhere else the next
     /// tick is soon enough, because nothing on screen changed.
@@ -1291,25 +1484,57 @@ impl App {
         std::mem::take(&mut self.pending_sample)
     }
 
+    /// As abas que esta máquina tem, na ordem da barra.
+    ///
+    /// A de Containers só entra onde há o que mostrar: uma engine que responde, ou
+    /// cgroups de container legíveis. Uma quarta aba permanentemente vazia num laptop
+    /// sem containers é ruído, e a barra é a primeira coisa que alguém lê.
+    pub fn tabs(&self) -> Vec<Tab> {
+        Tab::ALL
+            .into_iter()
+            .filter(|tab| *tab != Tab::Containers || self.state.containers.is_some())
+            .collect()
+    }
+
+    /// Os índices das tabelas que moram numa aba, na ordem em que foram registradas.
+    pub fn tables_on(&self, tab: Tab) -> Vec<ShortcutTarget> {
+        self.table_monitors
+            .iter()
+            .enumerate()
+            .filter(|(_, monitor)| monitor.tab() == tab)
+            .map(|(index, _)| ShortcutTarget::Table(index))
+            .collect()
+    }
+
     /// Cycles to the next/previous tab, wrapping around.
     pub fn next_tab(&mut self) {
-        let i = Tab::ALL.iter().position(|&t| t == self.tab).unwrap_or(0);
-        self.switch_tab(Tab::ALL[(i + 1) % Tab::ALL.len()]);
+        let tabs = self.tabs();
+        let i = tabs.iter().position(|&t| t == self.tab).unwrap_or(0);
+        self.switch_tab(tabs[(i + 1) % tabs.len()]);
     }
 
     pub fn prev_tab(&mut self) {
-        let i = Tab::ALL.iter().position(|&t| t == self.tab).unwrap_or(0);
-        self.switch_tab(Tab::ALL[(i + Tab::ALL.len() - 1) % Tab::ALL.len()]);
+        let tabs = self.tabs();
+        let i = tabs.iter().position(|&t| t == self.tab).unwrap_or(0);
+        self.switch_tab(tabs[(i + tabs.len() - 1) % tabs.len()]);
     }
 
     pub fn tick(&mut self) {
         let started = Instant::now();
+        // A cadência da engine segue o que está na tela, como toda amostragem aqui: uma
+        // aba fora de foco não custa. Dito a cada tick em vez de a cada troca de aba
+        // porque uma tabela de container em tela cheia também conta, e há mais de um
+        // caminho para entrar e sair dela.
+        if let Some(store) = &self.state.containers {
+            store.set_watched(self.shows_containers());
+        }
         // Executions come and go between ticks — from the wizard, from a hand-off, from
         // being removed — and the panels follow whatever exists now.
         self.sync_tool_charts();
         match self.tab {
             Tab::Overview => self.state.refresh_overview(),
             Tab::Processes => self.state.refresh_processes(),
+            Tab::Containers => self.state.refresh_containers(),
             // Nothing to refresh: an execution's counters are atomics the UI reads
             // directly, and its log is appended to by the tool's own threads.
             Tab::Tools => {}
@@ -1349,7 +1574,7 @@ impl App {
                     panel.capacity = panel.monitor.capacity(&self.state);
                 }
             }
-            Tab::Processes => {
+            Tab::Processes | Tab::Containers => {
                 // The fullscreened table (if any) keeps its row order/shape frozen —
                 // re-sampling would re-rank and reshape it out from under whatever the
                 // user is reading, searching, or has expanded — but its live values
@@ -1399,13 +1624,17 @@ impl App {
                         _ => {}
                     }
                 }
+                // Só as tabelas desta aba: a aba é a unidade de custo, e amostrar as da
+                // outra seria pagar por painéis que ninguém está olhando — que é o
+                // motivo de haver abas.
+                let tab = self.tab;
                 for (i, (monitor, rows)) in self
                     .table_monitors
                     .iter_mut()
                     .zip(self.table_rows.iter_mut())
                     .enumerate()
                 {
-                    if Some(i) != frozen_idx {
+                    if Some(i) != frozen_idx && monitor.tab() == tab {
                         *rows = monitor.sample(&self.state, Some(OVERVIEW_TABLE_ROWS));
                         self.marks.apply(monitor.id(), monitor.mark_kinds(), rows);
                     }
@@ -1444,9 +1673,9 @@ impl App {
                 .into_iter()
                 .map(ShortcutTarget::Chart)
                 .collect(),
-            Tab::Processes => (0..self.table_monitors.len())
-                .map(ShortcutTarget::Table)
-                .collect(),
+            // Cada aba numera do 1: os atalhos sempre foram por aba, então a nova ganha
+            // a própria sequência sem que a de Processos mude de tecla.
+            Tab::Processes | Tab::Containers => self.tables_on(self.tab),
             // No shortcut-able panels here, which is also what frees the letter keys
             // on this tab for its own bindings ('a' to add an execution).
             Tab::Tools => Vec::new(),
@@ -1538,11 +1767,451 @@ impl App {
         }));
     }
 
+    // --- aba Containers: o menu de operações ----------------------------------------
+
+    /// O que o Enter faz numa tabela em tela cheia.
+    ///
+    /// Nas tabelas da aba Containers ele abre o menu de operações, porque ali a pergunta
+    /// é «o que posso fazer com isto» e ver os detalhes é uma das respostas. Em todas as
+    /// outras abre o detalhe direto, como sempre fez.
+    pub fn open_row(&mut self) {
+        // A linha da engine, no resumo, abre a caixa que escolhe onde ela atende. É a
+        // única configuração desta aba, e fica onde a resposta que ela muda está escrita.
+        if let Focus::Table(tf) = &self.focus
+            && self.table_monitors[tf.table_index].id() == "resumo-containers"
+            && tf
+                .visible_indices()
+                .get(tf.selected)
+                .and_then(|&i| tf.rows.get(i))
+                .is_some_and(|row| row.key == "engine")
+        {
+            self.open_endpoint_editor();
+            return;
+        }
+        let opens_actions = match &self.focus {
+            Focus::Table(tf) => self.table_monitors[tf.table_index].actions_on_enter(),
+            _ => false,
+        };
+        if opens_actions {
+            self.open_actions();
+        } else {
+            self.open_detail();
+        }
+    }
+
+    /// Abre o menu sobre a linha selecionada. Silencioso quando não há sujeito — uma
+    /// linha de projeto do compose agrupa containers mas não é um.
+    pub fn open_actions(&mut self) {
+        let Focus::Table(tf) = &self.focus else {
+            return;
+        };
+        let Some(&row_idx) = tf.visible_indices().get(tf.selected) else {
+            return;
+        };
+        let table = self.table_monitors[tf.table_index].id();
+        let key = tf.rows[row_idx].key.clone();
+        if key.is_empty() {
+            return;
+        }
+        let Some(store) = self.state.containers.clone() else {
+            return;
+        };
+        let Some(subject) = subject_of(&store, table, &key) else {
+            return;
+        };
+        // Perguntadas à engine, não escritas aqui: no modo leitura a lista volta vazia e
+        // o menu diz por quê, em vez de oferecer teclas que só descobrem que não podem
+        // depois de apertadas.
+        let actions = store.actions(&subject);
+        let Focus::Table(parent) = std::mem::replace(&mut self.focus, Focus::None) else {
+            return;
+        };
+        self.focus = Focus::Actions(Box::new(ActionMenu {
+            subject,
+            actions,
+            selected: 0,
+            parent,
+        }));
+    }
+
+    /// Abre a caixa do endereço, já preenchida com o que estiver configurado à mão —
+    /// vazia quando a descoberta é quem está decidindo, que é o padrão.
+    pub fn open_endpoint_editor(&mut self) {
+        let current = match &self.state.containers {
+            Some(store) => store.engine_label(),
+            None => "nenhuma".to_string(),
+        };
+        self.endpoint_editor = Some(EndpointEditor {
+            value: crate::container::engine::load_settings().endpoint,
+            current,
+            error: None,
+            probing: false,
+        });
+    }
+
+    pub fn endpoint_editor_open(&self) -> bool {
+        self.endpoint_editor.is_some()
+    }
+
+    /// Teclas da caixa do endereço: digitar, provar e salvar, ou desistir.
+    pub fn endpoint_key(&mut self, code: KeyCode) {
+        let Some(editor) = &mut self.endpoint_editor else {
+            return;
+        };
+        match code {
+            KeyCode::Char(c) => {
+                editor.value.push(c);
+                editor.error = None;
+            }
+            KeyCode::Backspace => {
+                editor.value.pop();
+                editor.error = None;
+            }
+            KeyCode::Enter => self.apply_endpoint(),
+            KeyCode::Esc => self.endpoint_editor = None,
+            _ => {}
+        }
+    }
+
+    /// Prova o endereço e, se alguém responder, passa a falar com ele — agora, não no
+    /// próximo início. Um endereço vazio devolve a decisão à descoberta.
+    fn apply_endpoint(&mut self) {
+        let Some(editor) = &mut self.endpoint_editor else {
+            return;
+        };
+        let typed = editor.value.trim().to_string();
+        if !typed.is_empty() {
+            // Provado antes de salvo: um endereço que não responde tem que falhar aqui,
+            // enquanto quem digitou ainda está na frente da caixa e pode corrigir. É a
+            // mesma regra do `Tool::start`, pelo mesmo motivo.
+            let endpoint = match crate::container::http::Endpoint::parse(&typed) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    editor.error = Some(error);
+                    return;
+                }
+            };
+            editor.probing = true;
+            if crate::container::docker::DockerEngine::probe(endpoint).is_none() {
+                editor.probing = false;
+                editor.error = Some(format!("ninguém respondeu em {typed}"));
+                return;
+            }
+        }
+        crate::container::engine::save_settings(&crate::container::engine::Settings {
+            endpoint: typed,
+        });
+        // As threads do retrato antigo param quando o `Store` é descartado; as do novo
+        // sobem já apontadas para o endereço recém-provado.
+        self.state.containers = crate::container::Store::start().map(std::sync::Arc::new);
+        self.endpoint_editor = None;
+        // A aba pode ter deixado de existir (um endereço remoto tirado e nenhum container
+        // local), e ficar parado numa aba que saiu da barra é ficar numa tela sem saída.
+        if !self.tabs().contains(&self.tab) {
+            self.switch_tab(Tab::Overview);
+        }
+        self.focus = Focus::None;
+    }
+
+    pub fn actions_open(&self) -> bool {
+        matches!(self.focus, Focus::Actions(_))
+    }
+
+    /// Volta do menu para a tabela, exatamente como estava.
+    pub fn close_actions(&mut self) {
+        if let Focus::Actions(menu) = std::mem::replace(&mut self.focus, Focus::None) {
+            self.focus = Focus::Table(menu.parent);
+        }
+    }
+
+    /// Teclas do menu: mover, escolher, sair.
+    pub fn actions_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Up => {
+                if let Focus::Actions(menu) = &mut self.focus {
+                    menu.move_selection(-1);
+                }
+            }
+            KeyCode::Down => {
+                if let Focus::Actions(menu) = &mut self.focus {
+                    menu.move_selection(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Focus::Actions(menu) = &mut self.focus {
+                    menu.move_selection(-PAGE_ROWS);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Focus::Actions(menu) = &mut self.focus {
+                    menu.move_selection(PAGE_ROWS);
+                }
+            }
+            KeyCode::Enter => self.run_chosen_action(),
+            KeyCode::Esc | KeyCode::Char('q') => self.close_actions(),
+            _ => {}
+        }
+    }
+
+    /// Executa o que está sob o cursor, pelo atrito que a operação exige.
+    fn run_chosen_action(&mut self) {
+        let Focus::Actions(menu) = &self.focus else {
+            return;
+        };
+        let Some(action) = menu.chosen() else {
+            return;
+        };
+        // Uma entrada bloqueada continua na lista, explicada, e não faz nada: um item que
+        // se explica ensina, um item ausente não ensina nada.
+        if action.blocked.is_some() {
+            return;
+        }
+        let (key, gravity, label) = (action.key, action.gravity, action.label.clone());
+        let consequences = action.consequences.clone();
+        let subject = menu.subject.clone();
+
+        match key {
+            ActionKey::Details => {
+                self.close_actions();
+                self.open_detail();
+                return;
+            }
+            ActionKey::Inspect => {
+                self.open_inspect();
+                return;
+            }
+            ActionKey::Logs => {
+                self.follow_logs();
+                return;
+            }
+            ActionKey::Shell => {
+                if let Subject::Container(container) = &subject {
+                    self.pending_shell = Some(container.clone());
+                }
+                self.close_actions();
+                return;
+            }
+            _ => {}
+        }
+
+        // O gerúndio que a linha mostra enquanto a operação acontece. Parar espera o
+        // processo sair sozinho, o que leva segundos, e uma linha parada no estado antigo
+        // durante esse tempo parece que a tecla não funcionou.
+        let verb = gerund(key);
+        match gravity {
+            Gravity::Safe => {
+                self.close_actions();
+                self.perform(key, subject, verb);
+            }
+            Gravity::Confirm | Gravity::Typed => {
+                let name = subject.name();
+                let danger = Danger {
+                    action: "confirmar",
+                    title: format!("{label} «{name}»?"),
+                    lines: consequences,
+                };
+                let typed = (gravity == Gravity::Typed).then(|| TypedConfirm {
+                    expected: name,
+                    input: String::new(),
+                });
+                self.pending = Some(Pending {
+                    danger,
+                    action: PendingAction::Engine {
+                        action: key,
+                        subject: Box::new(subject),
+                        verb,
+                    },
+                    typed,
+                });
+            }
+        }
+    }
+
+    /// Uma execução criada a partir de uma oferta, com os padrões do tool preenchidos
+    /// antes do que a oferta nomeou — assim um tool que ganhe um parâmetro depois não
+    /// deixa o campo vazio aqui.
+    ///
+    /// Extraído de `create_from_handoff`, que faz a mesma coisa para cada item do
+    /// seletor: uma oferta é uma oferta, venha ela de um achado ou de um menu.
+    fn launch_handoff(&mut self, handoff: Handoff) {
+        let Some(index) = self
+            .tools_available
+            .iter()
+            .position(|tool| tool.id() == handoff.tool)
+        else {
+            return;
+        };
+        let tool = &self.tools_available[index];
+        let mut values: HashMap<&'static str, String> = tool
+            .params()
+            .into_iter()
+            .map(|spec| (spec.key, spec.default.to_string()))
+            .collect();
+        for (key, value) in &handoff.params {
+            values.insert(key, value.clone());
+        }
+        let execution = self.tools.launch(tool.as_ref(), values);
+        self.tools.executions.push(execution);
+        self.tools.selected = self.tools.executions.len().saturating_sub(1);
+        self.tools.persist();
+        // Cair no que acabou de ser criado, e não na tela de onde veio: chegar à execução
+        // nova é o ponto do gesto.
+        self.focus = Focus::None;
+        self.switch_tab(Tab::Tools);
+    }
+
+    /// Diz por que o shell não abriu, na tela que o pediu.
+    ///
+    /// Uma imagem sem `bash` e sem `sh` é o caso comum, e o erro que a engine devolve
+    /// nomeia exatamente isso. Vai para a mesma linha em que o resultado de qualquer
+    /// outra operação aparece.
+    pub fn report_shell_failure(&mut self, error: String) {
+        if let Some(store) = &self.state.containers {
+            store.report(error, false);
+        }
+    }
+
+    /// O shell que está esperando para ser aberto, se houver. Pegar é o que limpa.
+    pub fn take_pending_shell(&mut self) -> Option<Box<Container>> {
+        self.pending_shell.take()
+    }
+
+    /// Abre o shell e fica nele até acabar. Chamado pelo laço principal, com a tela
+    /// alternativa já abandonada — daqui até a volta o terminal é do container.
+    pub fn run_shell(&mut self, container: &Container, size: (u16, u16)) -> Result<String, String> {
+        let store = self
+            .state
+            .containers
+            .clone()
+            .ok_or("nenhuma engine respondeu")?;
+        let mut session = store.open_shell(container, size)?;
+        let shell = session.shell.clone();
+        match crate::container::exec::relay(&mut session) {
+            crate::container::exec::Ended::Closed => Ok(shell),
+            crate::container::exec::Ended::Broken(error) => Err(error),
+        }
+    }
+
+    fn perform(&mut self, action: ActionKey, subject: Subject, verb: String) {
+        if let Some(store) = &self.state.containers {
+            store.perform(action, subject, &verb);
+        }
+    }
+
+    /// Abre tudo que a engine sabe sobre o sujeito, como ela mesma escreve.
+    fn open_inspect(&mut self) {
+        let Focus::Actions(menu) = &self.focus else {
+            return;
+        };
+        let subject = menu.subject.clone();
+        let Some(store) = self.state.containers.clone() else {
+            return;
+        };
+        let title = format!("{} {}", subject.kind(), subject.name());
+        let lines = match store.inspect(&subject) {
+            Ok(text) => text.lines().map(str::to_string).collect(),
+            // O erro da engine na tela, e não uma tela em branco: quem sabe por que não
+            // deu é ela.
+            Err(error) => vec![error],
+        };
+        let Focus::Actions(parent) = std::mem::replace(&mut self.focus, Focus::None) else {
+            return;
+        };
+        self.focus = Focus::Text(Box::new(TextView {
+            title,
+            lines,
+            scroll: 0,
+            max_scroll: Cell::new(0),
+            parent: Some(parent),
+        }));
+    }
+
+    /// Cria uma execução do seguidor de arquivo apontada para o log do container.
+    ///
+    /// Seguir o arquivo em vez do fluxo da API é o que dá busca, filtro, hex, rolagem de
+    /// horas e sobrevivência a rotação — tudo já escrito, e nenhuma linha nova para isto.
+    fn follow_logs(&mut self) {
+        let Focus::Actions(menu) = &self.focus else {
+            return;
+        };
+        let Subject::Container(container) = &menu.subject else {
+            return;
+        };
+        let Some(store) = &self.state.containers else {
+            return;
+        };
+        let path = match store.log_source(container) {
+            LogSource::File(path) => path,
+            // O motivo na tela, e não uma tecla que não faz nada: quem apertou merece
+            // saber por que o log não está aqui.
+            LogSource::Unavailable(reason) => {
+                let title = container.display_name();
+                let Focus::Actions(parent) = std::mem::replace(&mut self.focus, Focus::None) else {
+                    return;
+                };
+                self.focus = Focus::Text(Box::new(TextView {
+                    title: format!("logs de {title}"),
+                    lines: vec![reason],
+                    scroll: 0,
+                    max_scroll: Cell::new(0),
+                    parent: Some(parent),
+                }));
+                return;
+            }
+        };
+        let name = container.display_name();
+        self.launch_handoff(Handoff {
+            label: format!("seguir os logs de {name}"),
+            tool: "tail",
+            params: vec![
+                ("caminho", path),
+                ("inicio", "fim do arquivo".to_string()),
+                // O arquivo que a engine escreve é um documento JSON por linha; sem isto
+                // a tela mostra o envelope em vez da mensagem.
+                ("formato", "JSON por linha".to_string()),
+            ],
+        });
+    }
+
     /// Returns from a detail view to the table it was opened from, exactly as it was
     /// left (Esc/q). No-op outside `Focus::Detail`.
     pub fn close_detail(&mut self) {
         if let Focus::Detail(df) = std::mem::replace(&mut self.focus, Focus::None) {
             self.focus = Focus::Table(df.parent);
+        }
+    }
+
+    pub fn text_open(&self) -> bool {
+        matches!(self.focus, Focus::Text(_))
+    }
+
+    /// Teclas da tela de texto: rolar e sair. Sai para o menu de onde veio, que é a tela
+    /// que estava por baixo.
+    pub fn text_key(&mut self, code: KeyCode) {
+        let Focus::Text(view) = &mut self.focus else {
+            return;
+        };
+        let scroll = |view: &mut TextView, delta: i32| {
+            let limit = view.max_scroll.get() as i32;
+            view.scroll = (view.scroll as i32 + delta).clamp(0, limit) as u16;
+        };
+        match code {
+            KeyCode::Up => scroll(view, -1),
+            KeyCode::Down => scroll(view, 1),
+            KeyCode::PageUp => scroll(view, -PAGE_ROWS),
+            KeyCode::PageDown => scroll(view, PAGE_ROWS),
+            KeyCode::Home => view.scroll = 0,
+            KeyCode::End => view.scroll = view.max_scroll.get(),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let Focus::Text(view) = std::mem::replace(&mut self.focus, Focus::None) else {
+                    return;
+                };
+                self.focus = match view.parent {
+                    Some(menu) => Focus::Actions(menu),
+                    None => Focus::None,
+                };
+            }
+            _ => {}
         }
     }
 
@@ -1871,6 +2540,7 @@ impl App {
             self.pending = Some(Pending {
                 danger,
                 action: PendingAction::KillRow,
+                typed: None,
             });
         }
     }
@@ -2138,6 +2808,7 @@ impl App {
                                 ],
                             },
                             action: PendingAction::ForgetRule(rule),
+                            typed: None,
                         });
                     }
                 }
@@ -2527,6 +3198,7 @@ impl App {
                 lines,
             },
             action: PendingAction::RemoveExecution,
+            typed: None,
         });
     }
 
@@ -2649,6 +3321,31 @@ impl App {
     /// rather than taken as an answer — a confirmation that any keypress can satisfy is
     /// not a confirmation.
     pub fn confirm_key(&mut self, code: KeyCode) {
+        // Com nome a digitar, as letras são o que se digita — inclusive 'q' e Esc, que em
+        // qualquer outra tela sairiam. Esc só sai com o campo vazio, uma camada por vez,
+        // como em toda outra caixa daqui.
+        if let Some(pending) = &mut self.pending
+            && let Some(typed) = &mut pending.typed
+        {
+            match code {
+                KeyCode::Char(c) => {
+                    typed.input.push(c);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    typed.input.pop();
+                    return;
+                }
+                KeyCode::Esc if !typed.input.is_empty() => {
+                    typed.input.clear();
+                    return;
+                }
+                // Enter com o nome ainda errado não faz nada — é exatamente para isso que
+                // a exigência existe.
+                KeyCode::Enter if !typed.satisfied() => return,
+                _ => {}
+            }
+        }
         match code {
             KeyCode::Enter => {
                 let Some(pending) = self.pending.take() else {
@@ -2657,6 +3354,16 @@ impl App {
                 match pending.action {
                     PendingAction::KillRow => self.kill_selected(),
                     PendingAction::RemoveExecution => self.remove_selected_execution(),
+                    PendingAction::Engine {
+                        action,
+                        subject,
+                        verb,
+                    } => {
+                        // Volta para a tabela antes de agir: o menu falava de um estado
+                        // que a operação está prestes a mudar.
+                        self.close_actions();
+                        self.perform(action, *subject, verb);
+                    }
                     PendingAction::ForgetRule(rule) => {
                         rewrite::forget(&rule);
                         if let Focus::Wizard(wizard) = &mut self.focus

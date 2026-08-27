@@ -36,6 +36,18 @@ const MAX_LINE: usize = 8 * 1024;
 
 const FROM: &[&str] = &["fim do arquivo", "começo do arquivo"];
 
+/// Como cada linha do arquivo deve ser lida.
+///
+/// «Como está» é o padrão e é o que um arquivo de log costuma ser. A outra opção existe
+/// porque uma família inteira de programas escreve um documento JSON por linha — os
+/// runtimes de container entre eles — e aí a mensagem que interessa está enterrada num
+/// envelope. Mostrar o envelope é mostrar a verdade do arquivo, e é ilegível.
+const SHAPE: &[&str] = &["como está", "JSON por linha"];
+
+/// Os campos que carregam a mensagem num JSON por linha, na ordem em que são procurados.
+/// Cobrem o que os runtimes de container e as bibliotecas de log mais usadas escrevem.
+const MESSAGE_FIELDS: [&str; 4] = ["log", "message", "msg", "text"];
+
 pub struct TailTool;
 
 impl Tool for TailTool {
@@ -64,6 +76,12 @@ impl Tool for TailTool {
                 "Começar do",
                 FROM,
                 "«fim» mostra as últimas linhas e segue daí; «começo» lê o arquivo inteiro antes de seguir",
+            ),
+            ParamSpec::choice(
+                "formato",
+                "Formato das linhas",
+                SHAPE,
+                "«JSON por linha» mostra só a mensagem de dentro do envelope — é o formato que os runtimes de container escrevem",
             ),
             ParamSpec::text(
                 "contendo",
@@ -118,6 +136,7 @@ impl Tool for TailTool {
             path,
             from_start: get("inicio") == FROM[1],
             filter: get("contendo").to_string(),
+            json: get("formato") == SHAPE[1],
         };
         let (execution, recorder) = Execution::new(id, self.name(), self.summarize(params));
         let finished = execution.finish_flag();
@@ -133,6 +152,8 @@ struct Plan {
     path: PathBuf,
     from_start: bool,
     filter: String,
+    /// Se cada linha é um documento JSON do qual só a mensagem interessa.
+    json: bool,
 }
 
 /// Device and inode: what makes a file *that* file, whatever it is called at the
@@ -245,6 +266,75 @@ fn seek_to_tail(reader: &mut BufReader<File>) -> std::io::Result<()> {
 /// Reads every complete line available right now, returning how many bytes were taken.
 /// A trailing partial line is left in the file for the next round: half a line in the
 /// log would be a line the reader has to mentally repair.
+/// A mensagem de dentro de uma linha JSON, ou a linha inteira quando ela não é JSON.
+///
+/// Cair de volta na linha crua é deliberado: um arquivo que mistura formatos, ou uma
+/// linha truncada no meio de uma escrita, continua legível em vez de virar um buraco. E
+/// o carimbo de tempo vem junto quando existe, porque num log de container ele é a
+/// única coisa que diz quando a linha aconteceu.
+fn unwrap_json(line: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return line.to_string();
+    };
+    let Some(message) = MESSAGE_FIELDS
+        .iter()
+        .find_map(|field| value.get(field)?.as_str())
+    else {
+        return line.to_string();
+    };
+    let message = message.trim_end();
+    // Só a hora do carimbo, e não o instante inteiro em nanossegundos: trinta caracteres
+    // de precisão que ninguém lê empurrariam a mensagem para fora da tela. Vale a pena
+    // manter porque um programa que não carimba as próprias linhas não tem outra fonte
+    // de «quando» — o relógio do visualizador conta desde que a execução começou, o que
+    // não diz nada sobre uma linha escrita ontem.
+    match value
+        .get("time")
+        .or_else(|| value.get("timestamp"))
+        .and_then(|time| time.as_str())
+        .and_then(clock_of)
+    {
+        Some(clock) => format!("{clock} {message}"),
+        None => message.to_string(),
+    }
+}
+
+/// `2026-08-22T14:46:02.498335304Z` → `14:46:02`.
+fn clock_of(stamp: &str) -> Option<&str> {
+    let time = stamp.split('T').nth(1)?;
+    (time.len() >= 8).then(|| &time[..8])
+}
+
+/// Tira as sequências de escape ANSI de uma linha.
+///
+/// O visualizador não pinta cor: são células de um `ratatui`, não um terminal cru. Deixar
+/// os bytes passar não colore nada — só deixa o esqueleto da sequência (`[38;5;160m`) no
+/// meio da frase, que é pior que não ter cor nenhuma. Um log de container vem colorido
+/// com muito mais frequência que um arquivo de texto qualquer, e foi ali que apareceu.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI: ESC [ …parâmetros… letra-final. Qualquer outra sequência de escape é de
+        // dois caracteres, e o segundo vai embora com ela.
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() || c == '~' {
+                        break;
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+    out
+}
+
 fn drain(reader: &mut BufReader<File>, plan: &Plan, rec: &Recorder) -> usize {
     let mut taken = 0usize;
     loop {
@@ -262,6 +352,14 @@ fn drain(reader: &mut BufReader<File>, plan: &Plan, rec: &Recorder) -> usize {
                 }
                 taken += read;
                 let text = String::from_utf8_lossy(&line);
+                // Desembrulhado antes do filtro: quem digitou «erro» quer procurar na
+                // mensagem, não no envelope que a carrega.
+                let text = if plan.json {
+                    unwrap_json(&text)
+                } else {
+                    text.into_owned()
+                };
+                let text = strip_ansi(&text);
                 if plan.filter.is_empty() || crate::format::contains_ci(&text, &plan.filter) {
                     rec.stats.connections.fetch_add(1, Ordering::Relaxed);
                     rec.stats
@@ -281,5 +379,42 @@ fn drain(reader: &mut BufReader<File>, plan: &Plan, rec: &Recorder) -> usize {
                 return taken;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unwraps_a_container_log_line() {
+        let line =
+            r#"{"log":"iniciando\n","stream":"stdout","time":"2026-08-22T14:46:02.498335304Z"}"#;
+        assert_eq!(unwrap_json(line), "14:46:02 iniciando");
+    }
+
+    #[test]
+    fn a_line_that_is_not_json_survives_whole() {
+        // Um arquivo que mistura formatos, ou uma linha truncada no meio de uma escrita,
+        // continua legível em vez de virar um buraco.
+        assert_eq!(unwrap_json("apenas texto"), "apenas texto");
+        assert_eq!(
+            unwrap_json(r#"{"sem":"mensagem"}"#),
+            r#"{"sem":"mensagem"}"#
+        );
+    }
+
+    #[test]
+    fn other_message_fields_are_understood() {
+        assert_eq!(unwrap_json(r#"{"msg":"oi"}"#), "oi");
+        assert_eq!(unwrap_json(r#"{"message":"oi"}"#), "oi");
+    }
+
+    #[test]
+    fn ansi_sequences_leave_no_skeleton_behind() {
+        assert_eq!(strip_ansi("\u{1b}[38;5;160merro\u{1b}[0m"), "erro");
+        assert_eq!(strip_ansi("sem cor"), "sem cor");
+        // Uma sequência cortada no fim do buffer não pode levar a linha junto.
+        assert_eq!(strip_ansi("fim\u{1b}["), "fim");
     }
 }

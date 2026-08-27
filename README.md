@@ -8,6 +8,12 @@ A lightweight terminal system monitor, written in Rust.
 - **Tables** for processes (as a tree), listening ports, live connections, SSH
   sessions, and system info — any of them fullscreenable, searchable as you
   type, with a per-connection detail view.
+- **Containers** — a tab of its own for containers, volumes, images and
+  networks, that doesn't just watch them: `Enter` on a row opens what can be
+  *done* with it — logs, a shell inside the container, start/stop/restart,
+  removal, prune — with the irreversible ones asking you to type the name
+  first. Engine-agnostic by construction: Docker is the first implementation of
+  a trait, not the thing the panels are written against.
 - **Tools** that don't just watch but *run*: a recording TCP/UDP tunnel that
   shows you the payload of a connection, speaks TLS to the target, and can
   rewrite bytes on the way through; a port scanner that asks each open port
@@ -68,8 +74,10 @@ description; everything else is chosen from inside the program.
 
 ## Tabs
 
-`Tab` / `Shift+Tab` cycle between three tabs. Everything samples every 2
-seconds; spacebar forces an immediate refresh, like `top`'s.
+`Tab` / `Shift+Tab` cycle between the tabs. Everything samples every 2 seconds;
+spacebar forces an immediate refresh, like `top`'s. The Containers tab only
+appears on a machine that has containers to show — see
+[Containers](#containers--the-containers).
 
 ### Visão Geral — the charts
 
@@ -199,6 +207,62 @@ end up with forty executions you never saw. The cursor moves to the match and
 marks it in place, `↑`/`↓` step between hits, `Esc` drops the search before it
 drops the picker — and where a narrowed "all" is genuinely what you want, the
 bulk row says so in as many words: "the 4 matching «5432»".
+
+### Containers — the containers
+
+Only there when there is something to show: an engine that answers, or container
+cgroups this user can read. A permanently empty fourth tab on a laptop is noise,
+and the tab bar is the first thing anyone reads.
+
+The layout is one wide table of containers over half the height, and four panels
+below it in two columns:
+
+- **Containers** — name, image, state (with health), published port binds, CPU%,
+  memory (against its limit, where there is one) and network throughput.
+  Fullscreened, it becomes a tree grouped by compose project.
+- **Volumes** — who mounts each one, how much disk it holds, how old it is. The
+  border says the total, how many are orphaned, and **how long ago the sizes were
+  measured** — that measurement costs the engine most of a second, so it happens
+  on its own thread and the panel says how stale it is rather than presenting a
+  minute-old number as current.
+- **Imagens** — size, age, and which containers use it. Cross-referenced by image
+  id, not by name: an engine writes the container's image as it was created
+  (`docker.io/chromedp/headless-shell:latest`) and the image as its own tag
+  (`chromedp/headless-shell:latest`), and matching those strings would mean
+  knowing the naming rules of every registry there is.
+- **Redes** — driver, subnet, and which containers are on it.
+- **Resumo** — counts, not bytes: what exists on this machine, and which engine
+  answered. `Enter` on the engine row is where you point it somewhere else.
+
+`Enter` on a row opens a menu of what can be *done* with it, rather than a detail
+view — the detail is one of the entries. Nothing in that menu is written in the
+UI: it comes from the engine, so an engine that can't pause simply doesn't offer
+it, and an entry that can't run right now stays in the list, greyed, with the
+reason beside it (`remover — está em execução, pare antes`). An item that
+explains itself teaches; a missing item teaches nothing.
+
+Three levels of friction, by what the operation costs:
+
+| | |
+| --- | --- |
+| `·` | runs straight away — start, stop, restart, pause |
+| `!` | a box saying what is lost, confirmed with `Enter` — kill, remove a container/image/network |
+| `‼` | you must type the name — removing a volume, any prune |
+
+**Logs** open in the file follower, which means search, filter, hex, hours of
+scrollback and surviving rotation — all of it already written. The container's
+log file is one JSON document per line, so the follower learned to unwrap that
+(and to strip the ANSI colours it can't paint), which any JSON-per-line log now
+gets for free.
+
+**A shell** inside a running container takes over the terminal: it leaves the
+alternate screen, so what you typed is still in your scrollback afterwards, and
+gives it back on `exit`. It speaks the engine's exec protocol directly — no
+`docker` binary needed — trying `bash` first and falling back to `sh`.
+
+What's deliberately **not** offered: force-removing a running container. The
+engine can, but "stop it first" is more honest than a key that takes down what's
+serving traffic without having said that was what it did.
 
 ### Ferramentas — the tools
 
@@ -640,8 +704,9 @@ at it properly.
 | --- | --- | --- |
 | `Tab` / `Shift+Tab` | anywhere | next/previous tab |
 | space | a tab | refresh now, without waiting for the tick |
-| `1`–`9`, letters | Visão Geral, Processos | fullscreen that panel |
-| `Enter` | a fullscreened table | open the row's detail view |
+| `1`–`9`, letters | Visão Geral, Processos, Containers | fullscreen that panel |
+| `Enter` | a fullscreened table | open the row's detail view — or, on the Containers tab, the menu of what can be done with it |
+| `↑`/`↓`, `Enter`, `Esc` | that menu | choose, do, back — a greyed entry does nothing and says why |
 | `PgUp` / `PgDn` | any list or log | move ten rows / scroll fast, stopping at the ends |
 | `←` / `→` | process tree | collapse/expand |
 | `Ctrl+E` | a fullscreened table | mark the row so it stays findable while the list reorders; again to unmark |
@@ -658,6 +723,7 @@ at it properly.
 | any letter | the `Ctrl+P` picker | search the offers; the cursor moves to the match, nothing is hidden |
 | `Esc` | anywhere | back one level (clears a search first) |
 | `Enter` / `Esc` | a confirmation | go through with it / leave it alone — no other key answers |
+| type the name | a confirmation that asks for it | `Enter` does nothing until it matches; `Esc` clears the field before it closes the box |
 | `q` | a fullscreened chart or detail | close it and go back (in a table, `q` is search input like any other letter) |
 | `Ctrl+C` twice | anywhere | quit — one press only arms it, so a stray `Ctrl+C` can't kill a session carrying live executions |
 
@@ -692,6 +758,22 @@ Three small traits drive everything:
   two columns of its execution's row. Say `on_demand()` and it starts nothing
   until the user opens it. Implement it in `src/tools/<name>.rs` and add it to
   `all_tools()`.
+- `ContainerEngine` — an engine that has containers, volumes, images and
+  networks, and knows what can be done with each. Implement it in
+  `src/container/<name>.rs`. Docker is the first one; nothing above
+  `src/container/` mentions it, and the panels are written against `Container`,
+  `Volume`, `Image` and `Network` alone.
+
+A table says which tab it lives on with `TableMonitor::tab()`, defaulting to
+Processos — where every table lived when there was only one place for them. So
+an existing table says nothing and a new one says it only when it isn't there.
+
+`ContainerEngine::actions` is the same idea as `Tool::params`: the engine
+declares what it can do with a subject, and the UI builds the menu from whatever
+comes back. No screen knows an operation by name, so a second engine that lacks
+one of them changes nothing above itself — and Podman, which serves a
+Docker-compatible API on a different socket, is a matter of the endpoint the
+discovery finds rather than of another client.
 
 Findings are typed, and what a finding is *worth doing* is decided by its type in
 one place (`tools::offers_for`), not by the tool that found it. An address is an
@@ -700,6 +782,27 @@ up, and it is always worth scanning and always worth reading a certificate off.
 So a tool records what it found — `found("ip", …)`, `found("dominio", …)`,
 `found("porta-tls", …)` — and is wired into every other tool for free; a new tool
 that consumes addresses becomes reachable from every existing one at once.
+
+The half of the container work that *measures* was already engine-agnostic before
+that trait existed: cgroups, PSI and `/proc/<pid>/net/dev` belong to the kernel,
+and `monitor::netns` already recognised `docker-<id>.scope`, `libpod-<id>` and
+`crio-<id>`. Only the inventory and the actions needed abstracting. Reading the
+cgroup of every container on the machine costs about a millisecond and works
+without root even for root-owned containers, since cgroup files are
+world-readable — which is *more* than the connections panel can see. Asking the
+engine for the same numbers costs 12 ms, and — with the obvious call — **a full
+second per container**, because the daemon collects two samples to work out the
+CPU% on your behalf. So the numbers come from the kernel and the delta is ours,
+exactly as the connections panel already does for throughput.
+
+No panel of that tab does I/O of its own: background threads keep a snapshot and
+sampling the tab is copying it (0.1 ms in `--bench`). Those threads slow to a
+crawl when no container panel is on screen and are woken on the way in, so the
+tab costs what a tab costs — nothing while you aren't looking at it. Containers
+are re-read on the app's own 2-second tick; volumes, images and networks every
+tenth of those, because they change when somebody deploys rather than every
+second. Measured on a laptop with eight containers: **0.12% of one core above
+what the machine was already paying**.
 
 Work that several panels need is done once per tick, not once per panel. Mapping
 socket inodes to the processes holding them means reading every `/proc/<pid>/fd`
@@ -743,6 +846,7 @@ directory):
 | `tools.json` | the executions to bring back on launch, and their parameters |
 | `rewrites.json` | every rewrite rule ever written, offered as suggestions |
 | `marks.json` | the rows you asked to keep an eye on, per table |
+| `engine.json` | where to reach the container engine, when you pointed it somewhere by hand |
 
 ## License
 
