@@ -217,9 +217,15 @@ and the tab bar is the first thing anyone reads.
 The layout is one wide table of containers over half the height, and four panels
 below it in two columns:
 
-- **Containers** — name, image, state (with health), published port binds, CPU%,
-  memory (against its limit, where there is one) and network throughput.
-  Fullscreened, it becomes a tree grouped by compose project.
+- **Containers** — name, image, state (with health), restarts, uptime, CPU% and
+  memory (against its limit, where there is one); fullscreening it adds published
+  port binds and network throughput, which are what you look at *after* picking a
+  row, and gives the width back to the names in the meantime. Restarts and uptime
+  sit together because that pair is what gives away a container in a crash loop,
+  and the uptime is *since it last started*: one created thirty days ago that
+  restarted five minutes ago is in trouble, and "30d" would hide exactly that.
+  Fullscreened it also becomes a tree grouped by compose project, and the project
+  row totals its children's restarts.
 - **Volumes** — who mounts each one, how much disk it holds, how old it is. The
   border says the total, how many are orphaned, and **how long ago the sizes were
   measured** — that measurement costs the engine most of a second, so it happens

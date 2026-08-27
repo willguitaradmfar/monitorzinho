@@ -815,7 +815,9 @@ fn render_table_grid(
             frame,
             panel_area,
             monitor.title(),
-            monitor.headers(),
+            // O painel compacto pode mostrar menos colunas que a tela cheia — ver
+            // `TableMonitor::compact_headers`.
+            monitor.compact_headers(),
             &app.table_rows[index],
             monitor.note(),
             shortcuts.table.get(&index).copied(),
@@ -1036,19 +1038,43 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
             "Nome",
             "Imagem",
             "Estado",
-            "Portas",
+            "Reinícios",
+            "No ar",
             "CPU%",
             "Memória",
+            "Portas",
             "Rede E/S",
         ] => vec![
             Constraint::Fill(2),
             Constraint::Fill(2),
             // Cabe «em execução (unhealthy)», que é o mais longo que a coluna produz.
             Constraint::Length(24),
-            Constraint::Fill(1),
+            Constraint::Length(9),
+            Constraint::Length(7),
             Constraint::Length(7),
             Constraint::Length(19),
+            Constraint::Fill(1),
             Constraint::Length(22),
+        ],
+        // O mesmo painel, compacto: sem portas e sem rede, que só existem ampliado. O
+        // que elas ocupavam volta para o nome e a imagem, que é o que estava sendo
+        // cortado.
+        [
+            "Nome",
+            "Imagem",
+            "Estado",
+            "Reinícios",
+            "No ar",
+            "CPU%",
+            "Memória",
+        ] => vec![
+            Constraint::Fill(3),
+            Constraint::Fill(2),
+            Constraint::Length(24),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(19),
         ],
         ["Volume", "Usado por", "Tamanho", "Criado"] => vec![
             Constraint::Fill(2),

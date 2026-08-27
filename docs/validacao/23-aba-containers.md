@@ -61,9 +61,25 @@ A metade que **mede** já era agnóstica antes disto existir: cgroup, PSI e
 └───────────────────────────┴───────────────────────────┘
 ```
 
-**Containers**: nome, imagem, estado (com saúde), binds de portas publicadas,
-CPU%, memória contra o teto quando há um, e rede. Todos os estados. Em tela cheia
-vira árvore por projeto do compose.
+**Containers**: nome, imagem, estado (com saúde), **reinícios**, **tempo no ar**,
+CPU% e memória contra o teto quando há um. Todos os estados. Ampliar acrescenta as
+**portas publicadas** e a **rede** — as duas são coisas que se olha depois de já
+ter escolhido a linha, e no compacto custavam a largura que o nome e a imagem
+precisavam para caber inteiros.
+
+O compacto é um **prefixo exato** do ampliado, e não um subconjunto salteado: as
+marcas guardam o índice da coluna que seguem, e suprimir uma do meio faria a marca
+de porta passar a comparar contra reinícios.
+
+Vinte linhas no painel compacto, contra dez das outras tabelas: ele tem a largura
+toda e metade da altura, e o padrão deixava metade dele vazia. Em tela cheia vira
+árvore por projeto do compose, e a linha do projeto soma os reinícios dos filhos —
+«alguma coisa aqui dentro está caindo», sem abrir o grupo.
+
+Reinícios e tempo no ar andam juntos porque é o par que denuncia um container em
+laço. O tempo é **desde que subiu**, não desde que foi criado: um container criado
+há trinta dias que reiniciou há cinco minutos está com problema, e «30d» esconderia
+exatamente isso. Quando foi criado continua no detalhe, onde a pergunta é outra.
 
 **Volumes**: quem monta, quanto ocupa, de quando é. A borda diz o total, quantos
 estão órfãos e **há quanto tempo os tamanhos foram medidos** — a medição custa
@@ -209,3 +225,5 @@ shell. `EINTR` quer dizer «tente de novo», que é como o `poll.rs` daqui já o
   o teste é abrir um shell numa imagem sem `bash` (uma Alpine qualquer)
 - A aba Visão Geral ficando mais cara depois desta entrega (as threads deixaram de
   desacelerar fora de foco)
+- Uma marca de porta acendendo numa linha por causa do número de reinícios (o
+  compacto deixou de ser prefixo do ampliado)

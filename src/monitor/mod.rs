@@ -362,6 +362,23 @@ pub trait TableMonitor: Send {
     }
     /// Column headers; each `TableRow::cells` must have the same length as this.
     fn headers(&self) -> &'static [&'static str];
+    /// Os cabeçalhos do painel compacto, quando ele mostra menos colunas que a tela
+    /// cheia. O padrão é mostrar as mesmas, que é o caso de quase toda tabela.
+    fn compact_headers(&self) -> &'static [&'static str] {
+        self.headers()
+    }
+
+    /// Quantas linhas o painel compacto desta tabela pede.
+    ///
+    /// Por tabela e não uma para todas, porque os painéis não têm o mesmo tamanho: o de
+    /// containers ocupa metade da tela e comporta o dobro, enquanto os quatro que
+    /// dividem a outra metade cabem no padrão. Pedir mais do que cabe não custa nada —
+    /// o que sobra é recortado na hora de desenhar —, mas pedir menos do que cabe deixa
+    /// espaço em branco embaixo de uma lista cortada.
+    fn compact_rows(&self) -> usize {
+        crate::app::OVERVIEW_TABLE_ROWS
+    }
+
     /// Ranked rows, capped to `limit` entries — or every ranked entry when `None`
     /// (used for the fullscreen view, where there's room, and reason, to see it all).
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow>;

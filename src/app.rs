@@ -97,7 +97,7 @@ fn shortcut_index(key: char) -> Option<usize> {
 
 /// Row cap for a table panel's compact, in-grid rendering. Fullscreening it takes a
 /// fresh, uncapped sample instead — see `App::activate_shortcut`.
-const OVERVIEW_TABLE_ROWS: usize = 10;
+pub const OVERVIEW_TABLE_ROWS: usize = 10;
 
 /// What a shortcut key points at: chart panels on the Overview tab, table panels on
 /// the Processes tab — see `App::shortcut_targets`.
@@ -282,7 +282,8 @@ pub fn bench() {
             let mut total = refreshed;
             for &index in &indices {
                 let at = Instant::now();
-                let rows = monitors[index].sample(&state, Some(OVERVIEW_TABLE_ROWS));
+                let cap = monitors[index].compact_rows();
+                let rows = monitors[index].sample(&state, Some(cap));
                 let elapsed = at.elapsed();
                 total += elapsed;
                 println!(
@@ -1644,7 +1645,8 @@ impl App {
                     .enumerate()
                 {
                     if Some(i) != frozen_idx && monitor.tab() == tab {
-                        *rows = monitor.sample(&self.state, Some(OVERVIEW_TABLE_ROWS));
+                        let cap = monitor.compact_rows();
+                        *rows = monitor.sample(&self.state, Some(cap));
                         self.marks.apply(monitor.id(), monitor.mark_kinds(), rows);
                     }
                 }

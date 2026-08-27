@@ -343,6 +343,7 @@ impl DockerEngine {
         container.exit_code = entry.exit_code;
         container.oom_killed = entry.oom_killed;
         container.started_at = entry.started_at.clone();
+        container.started = parse_time(&entry.started_at).unwrap_or(0);
         container.finished_at = entry.finished_at.clone();
         container.log_path = entry.log_path.clone();
     }

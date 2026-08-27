@@ -150,6 +150,9 @@ pub struct Container {
     /// Criação, em segundos desde a época.
     pub created: i64,
     pub started_at: String,
+    /// Quando subiu, em segundos desde a época — `started_at` já resolvido, para o painel
+    /// não ter que reparsear uma data por linha a cada volta. `0` quando nunca subiu.
+    pub started: i64,
     pub finished_at: String,
     pub restart_count: u64,
     pub exit_code: i64,

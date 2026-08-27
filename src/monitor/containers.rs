@@ -96,16 +96,54 @@ fn ports_cell(container: &Container) -> String {
     published.join(" ")
 }
 
-fn container_cells(container: &Container, snapshot: &container::store::Snapshot) -> Vec<String> {
-    vec![
+/// Há quanto tempo o container está de pé — desde que subiu, não desde que foi criado.
+///
+/// Desde que subiu é a resposta útil: um container criado há trinta dias que reiniciou há
+/// cinco minutos está com problema, e «30d» esconderia exatamente isso. Quando foi criado
+/// continua no detalhe, onde a pergunta é outra.
+fn uptime_cell(container: &Container) -> String {
+    if !container.state.is_live() || container.started <= 0 {
+        return "-".to_string();
+    }
+    age(container.started)
+}
+
+/// Quantas vezes a engine o levantou de novo. O zero é escrito, e não escondido: é contra
+/// uma coluna de zeros que um «7» salta aos olhos.
+fn restarts_cell(container: &Container) -> String {
+    container.restart_count.to_string()
+}
+
+/// As células de uma linha, em ordem — e o painel compacto fica com as primeiras
+/// `COMPACT_COLUMNS`.
+///
+/// A ordem foi escolhida para que o compacto seja um **prefixo exato** do de tela cheia,
+/// e não um subconjunto salteado. Duas coisas dependem disso: as marcas guardam o índice
+/// da coluna que seguem, e uma coluna suprimida no meio faria a marca de porta passar a
+/// comparar contra reinícios; e a tabela de larguras casa pelo cabeçalho, que assim tem
+/// só duas formas em vez de uma por combinação.
+fn container_cells(
+    container: &Container,
+    snapshot: &container::store::Snapshot,
+    full: bool,
+) -> Vec<String> {
+    let mut cells = vec![
         container.display_name(),
         container.image.clone(),
         state_cell(container, snapshot),
-        ports_cell(container),
+        restarts_cell(container),
+        uptime_cell(container),
         cpu_cell(container),
         memory_cell(container),
-        net_cell(container),
-    ]
+    ];
+    // Portas e rede só em tela cheia: no painel compacto elas custam a largura que o
+    // nome e a imagem precisam para caber inteiros, e as duas são coisas que se vai
+    // olhar depois de já ter escolhido a linha.
+    if full {
+        cells.push(ports_cell(container));
+        cells.push(net_cell(container));
+    }
+    cells
 }
 
 /// Quanto tempo faz, a partir de um carimbo em segundos desde a época.
@@ -125,9 +163,21 @@ fn age(created: i64) -> String {
 
 // --- containers ----------------------------------------------------------------------
 
-const CONTAINER_HEADERS: [&str; 7] = [
-    "Nome", "Imagem", "Estado", "Portas", "CPU%", "Memória", "Rede E/S",
+static CONTAINER_HEADERS: [&str; 9] = [
+    "Nome",
+    "Imagem",
+    "Estado",
+    "Reinícios",
+    "No ar",
+    "CPU%",
+    "Memória",
+    // As duas últimas só existem em tela cheia — ver `container_cells`.
+    "Portas",
+    "Rede E/S",
 ];
+
+/// Quantas das colunas acima cabem no painel compacto.
+const COMPACT_COLUMNS: usize = 7;
 
 const CONTAINER_MARKS: [MarkKind; 4] = [
     MarkKind {
@@ -150,7 +200,9 @@ const CONTAINER_MARKS: [MarkKind; 4] = [
     },
     MarkKind {
         name: "porta",
-        column: 3,
+        // Sétima coluna: só existe em tela cheia, e no painel compacto simplesmente não
+        // há o que comparar — que é o certo, e não comparar contra a coluna vizinha.
+        column: 7,
         numeric: true,
         help: "Segue quem publica uma porta — acende se outro container passar a expô-la.",
     },
@@ -184,12 +236,22 @@ impl TableMonitor for ContainersMonitor {
         &CONTAINER_HEADERS
     }
 
+    fn compact_headers(&self) -> &'static [&'static str] {
+        &CONTAINER_HEADERS[..COMPACT_COLUMNS]
+    }
+
     fn mark_kinds(&self) -> &'static [MarkKind] {
         &CONTAINER_MARKS
     }
 
     fn tree(&self) -> bool {
         true
+    }
+
+    /// O dobro do padrão: este painel tem a largura toda e metade da altura, e dez linhas
+    /// deixavam metade dele vazia numa máquina com containers de sobra.
+    fn compact_rows(&self) -> usize {
+        20
     }
 
     fn has_detail(&self) -> bool {
@@ -213,7 +275,7 @@ impl TableMonitor for ContainersMonitor {
                 .take(limit)
                 .map(|container| {
                     let mut row =
-                        TableRow::leaf(container_cells(container, snapshot), container.pid);
+                        TableRow::leaf(container_cells(container, snapshot, false), container.pid);
                     row.key = container.id.clone();
                     row
                 })
@@ -251,7 +313,9 @@ impl TableMonitor for ContainersMonitor {
                 let Some(container) = snapshot.containers.iter().find(|c| c.id == row.key) else {
                     continue;
                 };
-                row.cells = container_cells(container, snapshot);
+                // Sempre a forma cheia: `refresh_values` só roda sobre a tabela
+                // ampliada, que é a única que fica congelada.
+                row.cells = container_cells(container, snapshot, true);
             }
         });
     }
@@ -296,6 +360,13 @@ fn grouped_rows(snapshot: &container::store::Snapshot) -> Vec<TableRow> {
                 (*project).to_string(),
                 format!("{} serviço(s)", members.len()),
                 format!("{running}/{} no ar", members.len()),
+                // Reinícios do projeto inteiro: um número que diz «alguma coisa aqui
+                // dentro está caindo» sem precisar abrir o grupo.
+                match members.iter().map(|c| c.restart_count).sum::<u64>() {
+                    0 => String::new(),
+                    total => total.to_string(),
+                },
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),
@@ -318,7 +389,7 @@ fn grouped_rows(snapshot: &container::store::Snapshot) -> Vec<TableRow> {
                 .service
                 .clone()
                 .unwrap_or_else(|| container.display_name());
-            let mut cells = container_cells(container, snapshot);
+            let mut cells = container_cells(container, snapshot, true);
             cells[0] = name;
             rows.push(TableRow {
                 cells,
@@ -334,7 +405,7 @@ fn grouped_rows(snapshot: &container::store::Snapshot) -> Vec<TableRow> {
         }
     }
     for container in snapshot.containers.iter().filter(|c| c.project.is_none()) {
-        let mut row = TableRow::leaf(container_cells(container, snapshot), container.pid);
+        let mut row = TableRow::leaf(container_cells(container, snapshot, true), container.pid);
         row.key = container.id.clone();
         rows.push(row);
     }
@@ -1176,5 +1247,21 @@ mod tests {
             ..limited
         };
         assert_eq!(memory_cell(&unlimited), "1.0 MB");
+    }
+
+    #[test]
+    fn the_compact_row_is_a_prefix_of_the_full_one() {
+        // Não um subconjunto salteado: as marcas guardam o índice da coluna que seguem, e
+        // suprimir uma do meio faria a marca de porta comparar contra reinícios.
+        let snapshot = container::store::Snapshot::default();
+        let container = Container::default();
+        let full = container_cells(&container, &snapshot, true);
+        let compact = container_cells(&container, &snapshot, false);
+        assert_eq!(compact.len(), COMPACT_COLUMNS);
+        assert_eq!(full.len(), CONTAINER_HEADERS.len());
+        assert_eq!(compact, full[..COMPACT_COLUMNS]);
+        // E a coluna que a marca de porta segue tem que ser mesmo a das portas.
+        let porta = CONTAINER_MARKS.iter().find(|k| k.name == "porta").unwrap();
+        assert_eq!(CONTAINER_HEADERS[porta.column], "Portas");
     }
 }
