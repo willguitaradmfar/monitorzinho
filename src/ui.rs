@@ -1045,8 +1045,12 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
             "Portas",
             "Rede E/S",
         ] => vec![
+            // A imagem ganha mais que o nome: um nome de container é escolhido por
+            // alguém e fica curto, enquanto uma imagem carrega registro, caminho e tag
+            // — «ghcr.io/huggingface/text-embeddings-inference:cpu-1.7» contra
+            // «lexminer-embeddings», o dobro.
             Constraint::Fill(2),
-            Constraint::Fill(2),
+            Constraint::Fill(3),
             // Cabe «em execução (unhealthy)», que é o mais longo que a coluna produz.
             Constraint::Length(24),
             Constraint::Length(9),
@@ -1068,8 +1072,8 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
             "CPU%",
             "Memória",
         ] => vec![
-            Constraint::Fill(3),
             Constraint::Fill(2),
+            Constraint::Fill(3),
             Constraint::Length(24),
             Constraint::Length(9),
             Constraint::Length(7),
@@ -1082,11 +1086,16 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
             Constraint::Length(10),
             Constraint::Length(8),
         ],
+        // «Em uso» divide a sobra com o nome em vez de ficar preso a uma largura fixa:
+        // ele carrega uma lista de nomes de container, que passa de quinze caracteres com
+        // um só. O nome da imagem é longo, mas é longo no fim — a tag —, e ler
+        // «ghcr.io/huggingface/text-embeddings-…» já identifica a imagem, enquanto meio
+        // nome de container não identifica container nenhum.
         ["Imagem", "Tamanho", "Criada", "Em uso"] => vec![
-            Constraint::Fill(1),
+            Constraint::Fill(2),
             Constraint::Length(10),
             Constraint::Length(8),
-            Constraint::Length(15),
+            Constraint::Fill(1),
         ],
         ["Rede", "Driver", "Sub-rede", "Containers"] => vec![
             Constraint::Fill(1),
