@@ -1155,7 +1155,16 @@ pub struct TextView {
     pub scroll: u16,
     pub max_scroll: Cell<u16>,
     /// Para onde o Esc volta.
-    pub parent: Option<Box<ActionMenu>>,
+    pub parent: TextParent,
+}
+
+/// A tela que estava aberta quando o texto entrou na frente dela.
+///
+/// Duas, porque duas coisas abrem um texto: inspecionar, que vem do menu, e um shell que
+/// não abriu, que vem da tabela — o menu já se fechou quando o terminal foi entregue.
+pub enum TextParent {
+    Menu(Box<ActionMenu>),
+    Table(Box<TableFocus>),
 }
 
 /// One chart on the Overview tab: what it measures, and everything the panel knows
@@ -2060,15 +2069,26 @@ impl App {
         self.switch_tab(Tab::Tools);
     }
 
-    /// Diz por que o shell não abriu, na tela que o pediu.
+    /// Diz por que o shell não abriu, numa tela que para e explica.
     ///
-    /// Uma imagem sem `bash` e sem `sh` é o caso comum, e o erro que a engine devolve
-    /// nomeia exatamente isso. Vai para a mesma linha em que o resultado de qualquer
-    /// outra operação aparece.
+    /// Não numa linha de resultado num painel qualquer: quando um shell não abre, o que
+    /// se está olhando é a tabela em tela cheia, e uma tela que volta sozinha sem dizer
+    /// nada é indistinguível de uma tecla que não funcionou. Foi assim que a falha mais
+    /// comum — uma imagem sem `bash` — passou por invisível.
     pub fn report_shell_failure(&mut self, error: String) {
         if let Some(store) = &self.state.containers {
-            store.report(error, false);
+            store.report(error.clone(), false);
         }
+        let Focus::Table(table) = std::mem::replace(&mut self.focus, Focus::None) else {
+            return;
+        };
+        self.focus = Focus::Text(Box::new(TextView {
+            title: "o shell não abriu".to_string(),
+            lines: error.lines().map(str::to_string).collect(),
+            scroll: 0,
+            max_scroll: Cell::new(0),
+            parent: TextParent::Table(Box::new(table)),
+        }));
     }
 
     /// O shell que está esperando para ser aberto, se houver. Pegar é o que limpa.
@@ -2122,7 +2142,7 @@ impl App {
             lines,
             scroll: 0,
             max_scroll: Cell::new(0),
-            parent: Some(parent),
+            parent: TextParent::Menu(parent),
         }));
     }
 
@@ -2154,7 +2174,7 @@ impl App {
                     lines: vec![reason],
                     scroll: 0,
                     max_scroll: Cell::new(0),
-                    parent: Some(parent),
+                    parent: TextParent::Menu(parent),
                 }));
                 return;
             }
@@ -2207,8 +2227,8 @@ impl App {
                     return;
                 };
                 self.focus = match view.parent {
-                    Some(menu) => Focus::Actions(menu),
-                    None => Focus::None,
+                    TextParent::Menu(menu) => Focus::Actions(menu),
+                    TextParent::Table(table) => Focus::Table(*table),
                 };
             }
             _ => {}

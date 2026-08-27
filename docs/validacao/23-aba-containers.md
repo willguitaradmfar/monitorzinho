@@ -1,6 +1,6 @@
 # 23 — Aba Containers: ver, e também fazer
 
-**Entregue em:** v0.31.0 · **Tipo:** recurso novo, aba própria
+**Entregue em:** v0.31.0 (correção do shell em v0.31.1) · **Tipo:** recurso novo, aba própria
 (`src/container/` novo, `src/monitor/containers.rs` novo, `app.rs`, `ui.rs`,
 `monitor/mod.rs`, `tools/tail.rs`)
 
@@ -112,7 +112,9 @@ linha ganha de graça.
 **Um shell** dentro de um container em execução toma o terminal: sai da tela
 alternativa — o que você digitou continua no histórico depois do `exit` — e o
 devolve ao sair. Fala o protocolo de exec da engine direto, sem binário externo,
-tentando `bash` e caindo para `sh`.
+tentando `bash`, depois `sh`, depois `/bin/sh` — pelo caminho absoluto no fim, para
+a imagem cujo `PATH` está vazio. Quando nenhum abre, uma tela diz o que a engine
+respondeu para cada tentativa, em vez de voltar sozinha.
 
 ## O que custa, medido
 
@@ -161,6 +163,19 @@ dizer «não contei», não zero. E o nome da imagem no container
 (`chromedp/headless-shell:latest`). Casar essas strings exigiria conhecer as regras
 de nome de todo registro que existe; o id é o mesmo dos dois lados.
 
+**`101 UPGRADED` não quer dizer que o shell subiu.** Um comando que não existe no
+container é aceito na criação — a engine não confere — e o *upgrade* também dá
+certo: ela responde `101`, escreve «executable file not found in $PATH» no fluxo e
+fecha. Quem olhar só o código de status entrega um fluxo já morto, a tela volta no
+instante seguinte e a mensagem se perde na limpeza. Foi assim numa imagem sem
+`bash` — a maioria das imagens enxutas, que é o que mais roda em produção.
+
+E perguntar à inspeção **logo depois** do `101` também não resolve: o runtime
+ainda não decidiu, ela responde «rodando», e a falha passa. A corrida se fecha
+esperando a primeira palavra do fluxo — medido, chega em ~60 ms nos dois casos, e
+nesse ponto o veredito já existe. O que o fluxo disse é a explicação boa, e é ela
+que vai para a tela; o prompt lido junto é guardado para a sessão não abrir sem ele.
+
 **Redimensionar antes de iniciar um exec trava.** A chamada só vale numa execução
 já iniciada; pedida antes, a engine não responde nada e segura a conexão. O
 tamanho inicial vai no `ConsoleSize` do próprio `create`.
@@ -190,5 +205,7 @@ shell. `EINTR` quer dizer «tente de novo», que é como o `poll.rs` daqui já o
   digitado para algo reversível
 - A tela congelando ao abrir um shell (é uma chamada esperando resposta que não vem)
 - O shell fechando ao redimensionar a janela
+- O shell «voltando rápido» sem dizer nada — é um fluxo morto entregue como bom, e
+  o teste é abrir um shell numa imagem sem `bash` (uma Alpine qualquer)
 - A aba Visão Geral ficando mais cara depois desta entrega (as threads deixaram de
   desacelerar fora de foco)

@@ -44,6 +44,20 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// da engine, não nossa — mas o prazo da requisição tem que caber nela.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(40);
 
+/// Quanto se espera pela primeira palavra do fluxo de um shell recém-iniciado.
+///
+/// Medido, ela chega em ~60 ms — o prompt de um shell que subiu, ou a mensagem de erro de
+/// um que não subiu. Um segundo é folga para uma máquina carregada, e só é gasto por
+/// inteiro por um shell que sobe calado, que é raro num terminal.
+const FIRST_WORD: Duration = Duration::from_secs(1);
+
+/// Os shells tentados, na ordem em que se prefere um.
+///
+/// `bash` é o mais confortável e falta na maioria das imagens enxutas, que é o que mais
+/// roda em produção; `sh` existe em quase tudo; `/bin/sh` pelo caminho absoluto cobre a
+/// imagem cujo `PATH` está vazio, onde procurar pelo nome não acha nada.
+const SHELLS: [&str; 3] = ["bash", "sh", "/bin/sh"];
+
 /// De quanto em quanto tempo os campos que só a inspeção responde são relidos.
 ///
 /// A listagem já traz estado, saúde, portas, montagens e redes de uma vez e custa quase
@@ -242,17 +256,77 @@ impl DockerEngine {
             .map_err(|e| format!("resposta não é JSON válido: {e}"))?;
         let id = text(&value, "Id").ok_or("a engine não devolveu o id da execução")?;
 
-        let stream = http::upgrade(
+        let mut stream = http::upgrade(
             &self.info.endpoint,
             &format!("{API}/exec/{id}/start"),
             r#"{"Detach":false,"Tty":true}"#,
             TIMEOUT,
         )?;
+
+        // O `101` não quer dizer que o shell subiu.
+        //
+        // Um comando que não existe no container é aceito na criação — a engine não
+        // confere — e o *upgrade* também dá certo: ela responde `101 UPGRADED`, escreve
+        // «executable file not found in $PATH» no fluxo e fecha. Quem só olha o código de
+        // status vê sucesso, entrega um fluxo já morto, e a tela volta no mesmo instante
+        // sem dizer por quê. Era exatamente esse o sintoma numa imagem sem `bash`.
+        //
+        // A inspeção da execução responde na hora e sem corrida: `Running: false` com
+        // código 127 é «não achei o programa».
+        // A primeira palavra do fluxo é o que separa um shell que subiu de um que não
+        // subiu, e é preciso esperar por ela — ver `exec_failed`.
+        let mut greeting = Vec::new();
+        let _ = stream.set_read_timeout(FIRST_WORD);
+        let mut chunk = [0u8; 4096];
+        let closed = match std::io::Read::read(&mut stream, &mut chunk) {
+            // Fechou sem dizer nada: não subiu.
+            Ok(0) => true,
+            Ok(n) => {
+                greeting.extend_from_slice(&chunk[..n]);
+                false
+            }
+            // Calado até aqui. Não é veredito: quem decide é a inspeção, logo abaixo.
+            Err(_) => false,
+        };
+        if let Some(failure) = self.exec_failed(&id, closed, &greeting) {
+            return Err(failure);
+        }
+
         Ok(super::exec::Session {
             stream,
             endpoint: self.info.endpoint.clone(),
             id,
             shell: shell.to_string(),
+            greeting,
+        })
+    }
+
+    /// Por que a execução não está de pé, ou `None` se estiver.
+    ///
+    /// Perguntar isto **logo depois** do `101` não funciona: o runtime ainda não decidiu,
+    /// a inspeção responde «rodando», e um shell que não existe passa por bom. A corrida
+    /// se fecha sozinha esperando a primeira palavra do fluxo — medido, ela chega em
+    /// ~60 ms nos dois casos, e nesse ponto o runtime já reportou o que aconteceu.
+    ///
+    /// Um fluxo que fechou sem dizer nada já é resposta suficiente. Quando disse algo, o
+    /// que ele disse é a explicação boa — «executable file not found in $PATH» vale muito
+    /// mais que um número — e é ela que volta.
+    fn exec_failed(&self, id: &str, closed: bool, greeting: &[u8]) -> Option<String> {
+        if !closed {
+            // Uma inspeção que não responde não pode passar por «está tudo bem»: se não
+            // dá para saber, o shell segue, e o relay descobre — em vez de o programa
+            // decidir sozinho que falhou.
+            let state = self.get(&format!("/exec/{id}/json")).ok()?;
+            if state.get("Running").and_then(|r| r.as_bool()) != Some(false) {
+                return None;
+            }
+        }
+        let said = String::from_utf8_lossy(greeting);
+        let said = said.trim();
+        Some(if said.is_empty() {
+            "o processo saiu sem dizer nada".to_string()
+        } else {
+            said.to_string()
         })
     }
 
@@ -526,23 +600,24 @@ impl ContainerEngine for DockerEngine {
 
     /// Abre um shell, tentando o mais confortável primeiro.
     ///
-    /// A criação da execução sempre dá certo — a engine não confere se o programa existe
-    /// —, e a falha só aparece ao iniciar, como «executable file not found». Por isso a
-    /// tentativa é em cascata: `bash` onde houver, `sh` no resto, que é o que uma imagem
-    /// enxuta tem. Se nem `sh` existir, o erro que volta é o da engine, dizendo isso.
+    /// Em cascata porque nem toda imagem tem `bash` — as enxutas, que é o que mais roda
+    /// em produção, têm só `sh`. `/bin/sh` no fim cobre a imagem cujo `PATH` está vazio.
     fn open_shell(
         &self,
         container: &Container,
         size: (u16, u16),
     ) -> Result<super::exec::Session, String> {
-        let mut last = String::new();
-        for shell in ["bash", "sh"] {
+        let mut reasons: Vec<String> = Vec::new();
+        for shell in SHELLS {
             match self.start_shell(container, shell, size) {
                 Ok(session) => return Ok(session),
-                Err(error) => last = error,
+                Err(error) => reasons.push(format!("{shell}: {error}")),
             }
         }
-        Err(last)
+        Err(format!(
+            "nenhum shell abriu neste container.\n\n{}",
+            reasons.join("\n")
+        ))
     }
 
     fn inspect(&self, subject: &Subject) -> Result<String, String> {
@@ -1050,6 +1125,36 @@ mod tests {
             ..port
         };
         assert_eq!(closed.label(), "5432/tcp");
+    }
+
+    #[test]
+    fn a_dead_exec_is_recognised_by_what_it_said() {
+        // A engine responde `101 UPGRADED` mesmo para um comando que não existe: o
+        // upgrade dá certo, ela escreve o erro no fluxo e fecha. Quem olhar só o código
+        // de status entrega um fluxo já morto — e a tela volta sem dizer por quê, que era
+        // exatamente o sintoma numa imagem sem `bash`.
+        let engine = DockerEngine {
+            info: EngineInfo {
+                product: "Teste".to_string(),
+                version: String::new(),
+                api_version: String::new(),
+                endpoint: Endpoint::Unix(std::path::PathBuf::from("/nao/existe")),
+                rootless: false,
+            },
+            inspected: Mutex::new(HashMap::new()),
+        };
+        let oci = b"OCI runtime exec failed: exec: \"bash\": executable file not found";
+        // Fluxo fechado: veredito na hora, sem precisar perguntar nada à engine — que
+        // aqui nem existe, e é justamente por isso que este caso tem que se bastar.
+        assert_eq!(
+            engine.exec_failed("qualquer", true, oci).as_deref(),
+            Some("OCI runtime exec failed: exec: \"bash\": executable file not found")
+        );
+        // Fechado e calado ainda é falha, e a frase diz isso em vez de ficar vazia.
+        assert_eq!(
+            engine.exec_failed("qualquer", true, b"").as_deref(),
+            Some("o processo saiu sem dizer nada")
+        );
     }
 
     #[test]

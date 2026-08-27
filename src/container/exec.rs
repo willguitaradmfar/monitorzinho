@@ -39,6 +39,12 @@ pub struct Session {
     pub id: String,
     /// O shell que de fato abriu, para a linha que anuncia a sessão dizer qual foi.
     pub shell: String,
+    /// O que o shell já disse antes de a sessão começar — o prompt, tipicamente.
+    ///
+    /// Foi preciso lê-lo para saber se o shell subiu (ver `DockerEngine::start_shell`), e
+    /// o que foi lido não volta para o fluxo. Sem guardá-lo, toda sessão abriria sem o
+    /// primeiro prompt.
+    pub greeting: Vec<u8>,
 }
 
 /// Como a sessão terminou. Nenhuma delas é erro do programa: um shell fecha porque
@@ -61,6 +67,11 @@ pub fn relay(session: &mut Session) -> Ended {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    // O prompt que já tinha sido lido para decidir se o shell subiu.
+    if !session.greeting.is_empty() {
+        let _ = out.write_all(&session.greeting);
+        let _ = out.flush();
+    }
     let mut buffer = [0u8; BUFFER];
     let mut size = crossterm::terminal::size().unwrap_or((80, 24));
     let mut checked = Instant::now();
