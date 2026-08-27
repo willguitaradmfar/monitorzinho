@@ -173,6 +173,21 @@ pub trait Monitor: Send {
     fn limit(&self) -> Option<f64> {
         None
     }
+
+    /// A altura do gráfico, quando ela não é o mesmo número que acende a cor.
+    ///
+    /// Na esmagadora maioria das métricas as duas coisas coincidem: memória cheia é
+    /// 100%, e 100% é também onde o painel fica vermelho. Mas nem sempre — uma métrica
+    /// pode ser preocupante muito antes do seu máximo, e aí usar o limiar como teto do
+    /// desenho apaga justamente o que interessa: tudo acima dele vira uma barra cheia, o
+    /// gráfico vira um bloco sólido, e a forma da crista — quando subiu, quanto oscila —
+    /// deixa de existir. Foi o que aconteceu com o steal numa máquina que passa o dia
+    /// entre 15% e 45%: com o teto no limiar de 10%, o painel inteiro saturava.
+    ///
+    /// O padrão é ser o próprio `limit()`, então nada que já existia muda.
+    fn scale(&self) -> Option<f64> {
+        self.limit()
+    }
     /// Category used to visually group related panels together (e.g. "Disk" keeps
     /// usage%/read/write next to each other instead of scattered across the grid).
     fn group(&self) -> &'static str {

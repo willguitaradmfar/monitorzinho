@@ -977,12 +977,15 @@ fn render_panel(frame: &mut Frame, area: Rect, panel: &ChartPanel, chrome: Panel
     // Scale bars against the metric's real ceiling (e.g. 100%) rather than the max of
     // the current window — otherwise a value that's merely the local max renders as a
     // full bar even when it's nowhere near the actual limit.
+    //
+    // A altura vem de `scale()` e a cor de `limit()`, que na maioria das métricas são o
+    // mesmo número — mas não em todas. Ver `Monitor::scale`.
     let mut sparkline = Sparkline::default()
         .data(&data)
         .direction(RenderDirection::RightToLeft)
         .style(Style::default().fg(color));
-    if let Some(limit) = monitor.limit() {
-        sparkline = sparkline.max(limit.round().max(0.0) as u64);
+    if let Some(scale) = monitor.scale() {
+        sparkline = sparkline.max(scale.round().max(0.0) as u64);
     }
     frame.render_widget(sparkline, inner);
 }

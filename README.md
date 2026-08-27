@@ -91,10 +91,14 @@ appears on a machine that has containers to show — see
   isn't really mine right now": high CPU usage is your code working, and yours
   to fix; high steal is your server standing in line, and nothing in your code
   changes it. Under 1% is noise, 2–5% is felt as occasional sluggishness, and
-  sustained double digits means the host is oversubscribed. The chart is scaled
-  against 10% rather than 100 — scaled against 100, a catastrophic 30% would
-  draw a small bar, while against 10 it saturates, and "off the scale" is
-  exactly what 30% means. It only appears on a virtualised machine, detected by
+  sustained double digits means the host is oversubscribed. The chart is drawn to
+  100% and coloured against 10%: a bad reading is red, but you can still see how
+  high it went and what shape it has. Capping the drawing at the threshold seemed
+  reasonable — "off the scale is the answer" — and is wrong on the machine that
+  needs it, where a day spent between 15% and 45% saturates every bar into one
+  solid block, losing exactly the crest that says whether the steal follows your
+  own work or keeps its own hours. It only appears on a virtualised machine,
+  detected by
   the CPUID `hypervisor` flag: on dedicated hardware there is nobody to wait
   for, the number is structurally zero, and a permanently flat panel is noise.
   On a VM a flat zero is not — it says nobody is taking your turn right now.

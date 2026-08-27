@@ -23,11 +23,12 @@ use super::{Monitor, SystemState};
 /// esporádica. Acima de 10%, sustentado, o hospedeiro está superlotado — é o número que
 /// se leva ao suporte, ou o motivo para mudar de plano.
 ///
-/// Serve de teto do gráfico, e é de propósito que ele seja o limiar e não os 100% que a
-/// métrica poderia chegar: escalado contra 100, um steal de 30% — que é catastrófico —
-/// desenharia uma barra baixinha. Contra 10, ele satura, e «fora da escala» é exatamente
-/// o que 30% quer dizer. Um valor saudável, por sua vez, fica quase invisível, que é como
-/// uma máquina saudável tem que aparecer.
+/// É o que acende a cor, e **não** o teto do desenho — ver `Monitor::scale`. Usar o
+/// limiar como teto parecia boa ideia («fora da escala já é a resposta») e não é: numa
+/// máquina que passa o dia entre 15% e 45% de steal, toda barra satura, o painel vira um
+/// bloco sólido, e some justamente a forma da crista — que é o que denuncia se o steal
+/// acompanha o seu trabalho ou tem horário próprio. E é essa forma que distingue uma
+/// instância sem crédito de um hospedeiro superlotado.
 const CONCERNING: f64 = 10.0;
 
 pub struct StealMonitor {
@@ -101,6 +102,13 @@ impl Monitor for StealMonitor {
 
     fn limit(&self) -> Option<f64> {
         Some(CONCERNING)
+    }
+
+    /// O gráfico vai até 100%, que é onde a métrica de fato pode chegar. A cor continua
+    /// vindo do limiar, então um steal ruim segue vermelho — só que agora dá para ver a
+    /// altura dele, em vez de uma parede.
+    fn scale(&self) -> Option<f64> {
+        Some(100.0)
     }
 
     /// Ao lado do uso de CPU, que é o número com que ele é confundido — e do qual ele é o
@@ -183,6 +191,27 @@ mod tests {
         rate(&mut monitor, 200, 20_000);
         let held = monitor.last;
         assert_eq!(rate(&mut monitor, 300, 20_000), held);
+    }
+
+    #[test]
+    fn the_chart_is_taller_than_the_threshold_that_colours_it() {
+        // As duas coisas são separadas de propósito. Com o teto no limiar, uma máquina
+        // que passa o dia entre 15% e 45% desenha só barras cheias — um bloco sólido, sem
+        // crista, sem forma, sem a informação de quando subiu.
+        let monitor = with_previous(0, 0);
+        assert_eq!(monitor.scale(), Some(100.0));
+        assert_eq!(monitor.limit(), Some(CONCERNING));
+        assert!(monitor.scale() > monitor.limit());
+    }
+
+    #[test]
+    fn a_bad_reading_is_still_far_past_the_colour_threshold() {
+        // A altura mudou, a cor não: o sinal acende em 0,7 e 0,9 do limiar, e 30% de
+        // steal é três vezes o limiar inteiro — vermelho com folga.
+        let limit = CONCERNING;
+        assert!(30.0 / limit >= 0.9);
+        // E o que é ruído continua sem acender.
+        assert!(0.8 / limit < 0.7);
     }
 
     #[test]
