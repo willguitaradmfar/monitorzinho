@@ -576,6 +576,10 @@ impl ToolsState {
 /// that only works when asked stops answering even when asked — and which of the three
 /// it is decides what the user has to know before pressing space again.
 fn off_note(tool: &dyn Tool, values: &HashMap<&'static str, String>) -> String {
+    // The tool's own answer wins, for the ones whose cost isn't any of the three below.
+    if let Some(note) = tool.off_note(values) {
+        return note;
+    }
     if tool.on_demand(values) {
         return "desligada — não roda nem quando aberta. Espaço liga de novo".to_string();
     }

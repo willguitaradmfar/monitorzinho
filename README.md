@@ -395,6 +395,54 @@ Four things it does beyond relaying:
   there to pick again.
 - **UDP.** Same idea, one flow per source address.
 
+#### Port forward SSH
+
+A port on one side of an SSH connection, answering on the other. Both
+directions: `-L` opens the port **here** and whoever connects to it comes out of
+the server — the way to reach the database that only listens on the far side's
+loopback; `-R` opens the port **on the server** and whoever connects there comes
+out of this machine — the way to show somebody what is running on your laptop.
+The row says which of the two it is in so many words, because that is the only
+thing the two configurations differ by.
+
+What it runs is `ssh -N -L`, the command you already know, plus the three things
+that command doesn't have:
+
+- **It is remembered.** The tunnel comes back with the app, and `espaço`
+  switches it off without losing the configuration, the log or the row — and it
+  stays off across restarts.
+- **It is watched.** The result column says whether the tunnel is actually up,
+  and counts the connections that crossed it. The log keeps every word the `ssh`
+  said, which is where the answer lives on the day it isn't up: the key that was
+  offered, the method that authenticated, the port the server refused to open.
+  The command line is logged too, on every attempt — the fastest way to find out
+  why a tunnel won't come up is to run the same line by hand.
+- **It comes back.** A laptop that slept, a link that dropped, a server that
+  rebooted. A terminal holding a tunnel is a terminal somebody has to notice has
+  died; this one reconnects on its own, backing off from two seconds to a minute
+  so a server that is genuinely gone isn't hammered — and a connection that
+  lasted resets the climb.
+
+The server is a name, an IP, or an alias out of your `~/.ssh/config` (the field
+suggests the ones you have, with the `HostName` beside each so two similar
+aliases can be told apart) — and with an alias you get everything written there,
+`ProxyJump` included. Leave the user and the SSH port blank to let the `ssh`
+answer both from that same config; fill them in to overrule it. The key field
+takes one identity file, offered from the keys in `~/.ssh`, and using it means
+using only it. Blank uses the agent and the default keys.
+
+Two things follow from this being the one tool here that runs another program,
+and both are dealt with rather than hoped about. It can never ask a question:
+`BatchMode` and a `/dev/null` stdin, because an `ssh` prompting for a passphrase
+behind a full-screen terminal is a hang with no visible cause — so an encrypted
+key works through the agent, or not at all. And it can never outlive the app:
+even `kill -9` on monitorzinho takes the tunnels with it, and the ports come
+back.
+
+The local port a `-L` opens is a finding like any other, so `Ctrl+P` offers to
+put the recording tunnel in front of it — which is how you read the traffic
+going through an SSH tunnel.
+
 #### Receptor de requisições
 
 A port that receives and writes down, and forwards nothing. The tunnel needs

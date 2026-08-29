@@ -26,6 +26,7 @@ pub mod rewrite;
 pub mod rota;
 pub mod scan;
 pub mod smtp;
+pub mod sshfwd;
 pub mod stun;
 pub mod tail;
 pub mod tls;
@@ -189,6 +190,15 @@ pub trait Tool: Send + Sync {
     /// running because the app happened to start.
     fn on_demand(&self, _params: &HashMap<&'static str, String>) -> bool {
         false
+    }
+
+    /// What switching this execution off costs, in this tool's own terms. `None` — the
+    /// usual answer — leaves it to the app, which can already tell a probe that stops
+    /// probing from a relay that gives its port back. Override it where neither sentence
+    /// is true: an SSH forward's port is on the other machine half the time, and that is
+    /// exactly the half nobody would guess.
+    fn off_note(&self, _params: &HashMap<&'static str, String>) -> Option<String> {
+        None
     }
 
     /// The user opened this execution's monitor. Where an on-demand tool does its work;
@@ -406,6 +416,7 @@ pub fn offers_from(execution: &Execution) -> Vec<Handoff> {
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(tunnel::TunnelTool),
+        Box::new(sshfwd::SshFwdTool),
         Box::new(listen::ListenTool),
         Box::new(tail::TailTool),
         Box::new(http::HttpTool),
