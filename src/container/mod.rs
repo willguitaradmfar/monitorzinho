@@ -20,6 +20,10 @@ pub mod store;
 
 pub use engine::{ContainerEngine, EngineInfo};
 pub use store::Store;
+// O vocabulário do menu mora em `action`, porque containers deixaram de ser a única
+// coisa que tem operações — ver o cabeçalho daquele arquivo. Reexportado daqui para que
+// a metade que fala com a engine continue lendo `container::Action` como sempre leu.
+pub use crate::action::{Action, ActionKey, Gravity};
 
 /// Em que ponto da vida um container está.
 ///
@@ -346,65 +350,6 @@ impl Subject {
             Subject::Network(_) => "rede",
         }
     }
-}
-
-/// Quanto atrito uma ação exige antes de acontecer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Gravity {
-    /// Executa direto. Reversível: iniciar, parar, reiniciar, pausar.
-    Safe,
-    /// Uma caixa dizendo o que se perde, confirmada com Enter.
-    Confirm,
-    /// Exige digitar o nome. Perda de dado irreversível: remover volume, limpar órfãos.
-    Typed,
-}
-
-/// O que uma engine sabe fazer com um sujeito.
-///
-/// A UI não conhece nenhuma ação por nome: monta o menu com o que `actions()` devolver.
-/// Uma engine que não saiba pausar simplesmente não devolve a entrada, e nada na tela
-/// precisa mudar por causa disso.
-#[derive(Clone, Debug)]
-pub struct Action {
-    /// Chave estável da operação, para o código decidir o que fazer sem ler rótulo.
-    pub key: ActionKey,
-    pub label: String,
-    pub gravity: Gravity,
-    /// O que a caixa de confirmação diz que vai acontecer, uma consequência por linha.
-    /// Vazio para as ações que não param para perguntar.
-    pub consequences: Vec<String>,
-    /// Por que não dá agora, quando não dá. Um item explicado vale mais que um item
-    /// ausente: «remover — 2 containers ainda usam» ensina, some não ensina nada.
-    pub blocked: Option<String>,
-}
-
-/// As operações que existem. Uma engine oferece as que souber; nenhuma precisa oferecer
-/// todas.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActionKey {
-    // Container
-    Logs,
-    Start,
-    Stop,
-    Restart,
-    Pause,
-    Unpause,
-    Kill,
-    RemoveContainer,
-    Details,
-    Inspect,
-    /// Abrir um shell dentro do container, no terminal que já está aqui.
-    Shell,
-    // Volume
-    RemoveVolume,
-    PruneVolumes,
-    // Imagem
-    RemoveImage,
-    ForceRemoveImage,
-    PruneImages,
-    // Rede
-    RemoveNetwork,
-    PruneNetworks,
 }
 
 /// De onde sai o log de um container.

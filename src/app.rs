@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::KeyCode;
 use sysinfo::{Pid, Signal};
 
+use crate::action::Target;
 use crate::container::{Action, ActionKey, Container, Gravity, LogSource, Subject};
 use crate::format;
 use crate::history::{self, CAPACITY, History};
@@ -15,6 +16,7 @@ use crate::monitor::mark::{self, Mark};
 use crate::monitor::{
     self as monitors, Danger, Detail, Monitor, SystemState, TableMonitor, TableRow,
 };
+use crate::tmux;
 use crate::tools::persist::ExecutionSpec;
 use crate::tools::rewrite::{self, Rule};
 use crate::tools::{self, Execution, Handoff, ParamKind, ParamSpec, State, Tool};
@@ -34,6 +36,15 @@ pub enum Tab {
     /// containers custa praticamente nada, porque quem fala com a engine é uma thread de
     /// fundo. Uma aba em que dá para *ficar* num nó ocupado é o ponto.
     Containers,
+    /// Sessões, janelas e painéis do tmux. Como a de Containers, só existe onde há o que
+    /// mostrar — aqui a condição é o binário estar instalado, porque sem ele não há
+    /// sessão, não há o que listar, e não há como criar uma.
+    ///
+    /// É a aba em que o programa **sai da frente**: entrar numa sessão entrega o terminal
+    /// ao tmux e só o retoma quando alguém desanexar. O shell de container já fazia isso;
+    /// a diferença é que aqui não há relay nenhum — o tmux é um processo filho que herda o
+    /// terminal de verdade.
+    Tmux,
     /// Unlike the other two this one doesn't watch anything: it lists the tool
     /// executions the user has started, which keep running regardless of which tab is
     /// on screen.
@@ -43,13 +54,20 @@ pub enum Tab {
 impl Tab {
     /// Toda aba que existe no programa. Qual delas aparece é decidido no arranque — ver
     /// `App::tabs`.
-    pub const ALL: [Tab; 4] = [Tab::Overview, Tab::Processes, Tab::Containers, Tab::Tools];
+    pub const ALL: [Tab; 5] = [
+        Tab::Overview,
+        Tab::Processes,
+        Tab::Containers,
+        Tab::Tmux,
+        Tab::Tools,
+    ];
 
     pub fn title(&self) -> &'static str {
         match self {
             Tab::Overview => "Visão Geral",
             Tab::Processes => "Processos",
             Tab::Containers => "Containers",
+            Tab::Tmux => "tmux",
             Tab::Tools => "Ferramentas",
         }
     }
@@ -93,6 +111,23 @@ fn shortcut_index(key: char) -> Option<usize> {
             .position(|&l| l == key)
             .map(|p| p + 9)
     }
+}
+
+/// Quais nós de uma árvore começam abertos.
+///
+/// Só os pais, que é a política de toda árvore daqui — abrir uma árvore de processos
+/// inteira entrega centenas de folhas que ninguém pediu —, ou tudo que tem filho, para a
+/// tabela que pede isso. Uma função só porque os dois lugares que semeiam isto (abrir a
+/// tela cheia, e reamostrar depois de uma operação que muda a forma da lista) têm que
+/// concordar: divergirem faria a árvore se fechar sozinha ao matar uma linha.
+fn expanded_seed(rows: &[TableRow], expand_all: bool) -> HashSet<u32> {
+    rows.iter()
+        .filter(|row| match expand_all {
+            true => row.child_count > 0,
+            false => row.depth == 0,
+        })
+        .map(|row| row.pid)
+        .collect()
 }
 
 /// Row cap for a table panel's compact, in-grid rendering. Fullscreening it takes a
@@ -242,13 +277,17 @@ pub fn bench() {
 
     println!("monitorzinho {}", env!("CARGO_PKG_VERSION"));
 
-    for tab in [Tab::Processes, Tab::Containers] {
+    for tab in [Tab::Processes, Tab::Containers, Tab::Tmux] {
         let indices: Vec<usize> = (0..monitors.len())
             .filter(|&i| monitors[i].tab() == tab)
             .collect();
-        // A aba Containers não existe numa máquina sem engine e sem cgroups de
-        // container; medi-la ali seria imprimir uma tabela de zeros.
-        if indices.is_empty() || (tab == Tab::Containers && state.containers.is_none()) {
+        // Uma aba que não existe nesta máquina não é medida: imprimir uma tabela de
+        // zeros para a de Containers sem engine, ou para a de tmux sem tmux, seria dar
+        // um número que não é o de ninguém.
+        if indices.is_empty()
+            || (tab == Tab::Containers && state.containers.is_none())
+            || (tab == Tab::Tmux && state.tmux.is_none())
+        {
             continue;
         }
         println!();
@@ -260,6 +299,9 @@ pub fn bench() {
             let started = Instant::now();
             match tab {
                 Tab::Containers => state.refresh_containers(),
+                // A única amostragem daqui que cria um processo — é justamente o número
+                // que se quer ver medido, e não afirmado.
+                Tab::Tmux => state.refresh_tmux(),
                 _ => state.refresh_processes(),
             }
             let refreshed = started.elapsed();
@@ -337,6 +379,133 @@ fn suggested_value(row: &TableRow, kind: &mark::MarkKind) -> String {
     match text.split_whitespace().next() {
         Some(first) if text.len() > 40 => first.to_string(),
         _ => text.to_string(),
+    }
+}
+
+/// A caixa que cria uma sessão de tmux: um nome e uma pasta base.
+///
+/// Duas coisas são conferidas aqui, na frente de quem digitou, e não depois:
+///
+/// * **A pasta existe.** O tmux aceita `-c /caminho/que/nao/existe`, cria a sessão em
+///   outro lugar e sai com zero — quem pediu nunca fica sabendo.
+/// * **O nome é o que o tmux vai aceitar.** Ele troca `.` e `:` por `_` calado, também
+///   saindo com zero. A criação usa `-P -F` para ler de volta o nome que ele deu, e a
+///   linha de resultado avisa quando os dois diferem.
+///
+/// É a mesma regra do `apply_endpoint`, pelo mesmo motivo: falhar enquanto a caixa ainda
+/// está aberta é a diferença entre corrigir e sair procurando.
+pub struct SessionEditor {
+    /// O que a caixa está fazendo: criando uma sessão, ou trocando o nome de uma que já
+    /// existe. Uma caixa só para as duas coisas porque é a mesma pergunta — «como isto se
+    /// chama» —, e um renomeio que abrisse um campo de pasta pediria uma resposta que ele
+    /// não usa.
+    pub mode: SessionEditorMode,
+    pub name: String,
+    pub path: String,
+    /// Qual campo as setas estão em cima, como índice em `SessionField::ALL`.
+    pub field: usize,
+    /// Caminhos que a máquina já sabe que são plausíveis, andados com ←/→. É o mesmo
+    /// gesto — e a mesma ideia — das sugestões do formulário das ferramentas: um atalho
+    /// para não ir procurar em outro lugar, sem nunca impedir de digitar.
+    pub suggestions: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Criar, ou renomear o que já existe.
+pub enum SessionEditorMode {
+    Create,
+    Rename(Box<tmux::Subject>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SessionField {
+    Name,
+    Path,
+}
+
+impl SessionField {
+    pub const ALL: [SessionField; 2] = [SessionField::Name, SessionField::Path];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SessionField::Name => "nome",
+            SessionField::Path => "pasta base",
+        }
+    }
+
+    pub fn help(&self) -> &'static str {
+        match self {
+            SessionField::Name => "Como a sessão se chama. O tmux troca «.» e «:» por «_».",
+            SessionField::Path => "Onde ela abre. ←/→ andam pelas pastas que já estão em uso.",
+        }
+    }
+}
+
+impl SessionEditor {
+    /// Os campos que esta caixa mostra. Renomear mostra um só: a pasta base de uma sessão
+    /// que já existe não é uma coisa que o tmux saiba trocar, e um campo que não faz nada
+    /// é pior que um campo ausente.
+    pub fn fields(&self) -> &'static [SessionField] {
+        match self.mode {
+            SessionEditorMode::Create => &SessionField::ALL,
+            SessionEditorMode::Rename(_) => &[SessionField::Name],
+        }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self.mode {
+            SessionEditorMode::Create => " Nova sessão de tmux ",
+            SessionEditorMode::Rename(_) => " Renomear ",
+        }
+    }
+
+    pub fn hint(&self) -> &'static str {
+        match self.mode {
+            SessionEditorMode::Create => {
+                "↑/↓ campo · ←/→ pastas em uso · Enter criar e entrar · Esc cancelar"
+            }
+            SessionEditorMode::Rename(_) => "Enter renomear · Esc cancelar",
+        }
+    }
+
+    pub fn current(&self) -> SessionField {
+        self.fields()[self.field.min(self.fields().len() - 1)]
+    }
+
+    fn value_mut(&mut self) -> &mut String {
+        match self.current() {
+            SessionField::Name => &mut self.name,
+            SessionField::Path => &mut self.path,
+        }
+    }
+
+    pub fn value(&self, field: SessionField) -> &str {
+        match field {
+            SessionField::Name => &self.name,
+            SessionField::Path => &self.path,
+        }
+    }
+
+    /// Anda pelas sugestões de pasta. Só no campo da pasta: um nome de sessão é sempre
+    /// novo, e não há de onde sugerir um.
+    fn cycle(&mut self, delta: i32) {
+        if self.current() != SessionField::Path || self.suggestions.is_empty() {
+            return;
+        }
+        let position = self
+            .suggestions
+            .iter()
+            .position(|candidate| *candidate == self.path);
+        let len = self.suggestions.len() as i32;
+        let next = match position {
+            Some(current) => (current as i32 + delta).rem_euclid(len),
+            // Fora da lista — alguém digitou algo próprio. A primeira seta entra nela
+            // pela ponta de onde veio, em vez de saltar para o meio.
+            None if delta >= 0 => 0,
+            None => len - 1,
+        };
+        self.path = self.suggestions[next as usize].clone();
+        self.error = None;
     }
 }
 
@@ -1130,7 +1299,7 @@ pub enum Focus {
 /// então uma engine que não saiba pausar simplesmente não oferece pausar, e nada nesta
 /// parte do programa muda por causa disso.
 pub struct ActionMenu {
-    pub subject: Subject,
+    pub subject: Target,
     pub actions: Vec<Action>,
     pub selected: usize,
     /// A tabela de onde veio, devolvida intacta no Esc: mesma seleção, mesma busca,
@@ -1238,6 +1407,12 @@ pub struct App {
     /// alternativa no meio do tratamento de uma tecla deixaria o laço desenhando por
     /// cima do shell. Quem o abre é o laço principal, entre um quadro e o próximo.
     pub pending_shell: Option<Box<Container>>,
+    /// A sessão de tmux esperando o terminal, se houver. Mesma mecânica do shell: o laço
+    /// principal a pega entre um quadro e o próximo, porque enquanto ela está aberta a
+    /// interface não pode desenhar por cima.
+    pub pending_attach: Option<tmux::Attach>,
+    /// A caixa que cria uma sessão, enquanto está aberta.
+    pub session_editor: Option<SessionEditor>,
     /// A destructive key waiting to be confirmed. Sits above every screen and takes
     /// every key while it's open, so nothing underneath can act on the keypress that
     /// dismisses it.
@@ -1278,6 +1453,11 @@ pub enum PendingAction {
     RemoveExecution,
     /// Drop one rule from the shared rewrite history, which lives on disk.
     ForgetRule(Rule),
+    /// Uma operação do tmux, já descrita e agora confirmada.
+    Tmux {
+        action: ActionKey,
+        subject: Box<tmux::Subject>,
+    },
     /// Uma operação da engine, já descrita e agora confirmada.
     Engine {
         action: ActionKey,
@@ -1304,6 +1484,9 @@ fn gerund(action: ActionKey) -> String {
         | ActionKey::RemoveNetwork => "removendo",
         ActionKey::PruneVolumes | ActionKey::PruneImages | ActionKey::PruneNetworks => "limpando",
         ActionKey::Logs | ActionKey::Details | ActionKey::Inspect | ActionKey::Shell => "abrindo",
+        ActionKey::Attach | ActionKey::SwitchTo => "entrando",
+        ActionKey::Rename => "renomeando",
+        ActionKey::KillSession | ActionKey::KillWindow | ActionKey::KillPane => "matando",
     }
     .to_string()
 }
@@ -1365,6 +1548,8 @@ impl App {
             quit_armed: false,
             pending_sample: false,
             pending_shell: None,
+            pending_attach: None,
+            session_editor: None,
             last_sample: Duration::ZERO,
             pending: None,
             state: SystemState::new(),
@@ -1455,6 +1640,19 @@ impl App {
         table.is_some_and(|index| self.table_monitors[index].tab() == Tab::Containers)
     }
 
+    /// Se o que está na tela é a aba tmux — ela mesma, ou uma tabela dela em tela cheia.
+    ///
+    /// Decide onde o Ctrl+N cria uma sessão. Nas duas telas e não só na aba porque é
+    /// justamente com a lista ampliada na frente que se descobre que a sessão procurada
+    /// não existe.
+    pub fn on_tmux_tab(&self) -> bool {
+        match &self.focus {
+            Focus::None => self.tab == Tab::Tmux,
+            Focus::Table(tf) => self.table_monitors[tf.table_index].tab() == Tab::Tmux,
+            _ => false,
+        }
+    }
+
     /// Whether what's on screen is fed by the tools' own threads. Decides whether their
     /// writing something is worth a redraw between samples — anywhere else the next
     /// tick is soon enough, because nothing on screen changed.
@@ -1507,6 +1705,10 @@ impl App {
         Tab::ALL
             .into_iter()
             .filter(|tab| *tab != Tab::Containers || self.state.containers.is_some())
+            // A mesma regra, pela mesma razão: sem tmux instalado não há sessão para
+            // listar nem como criar uma, e uma aba permanentemente vazia é ruído na
+            // primeira coisa que alguém lê.
+            .filter(|tab| *tab != Tab::Tmux || self.state.tmux.is_some())
             .collect()
     }
 
@@ -1549,6 +1751,7 @@ impl App {
             Tab::Overview => self.state.refresh_overview(),
             Tab::Processes => self.state.refresh_processes(),
             Tab::Containers => self.state.refresh_containers(),
+            Tab::Tmux => self.state.refresh_tmux(),
             // Nothing to refresh: an execution's counters are atomics the UI reads
             // directly, and its log is appended to by the tool's own threads.
             Tab::Tools => {}
@@ -1588,7 +1791,7 @@ impl App {
                     panel.capacity = panel.monitor.capacity(&self.state);
                 }
             }
-            Tab::Processes | Tab::Containers => {
+            Tab::Processes | Tab::Containers | Tab::Tmux => {
                 // The fullscreened table (if any) keeps its row order/shape frozen —
                 // re-sampling would re-rank and reshape it out from under whatever the
                 // user is reading, searching, or has expanded — but its live values
@@ -1690,7 +1893,7 @@ impl App {
                 .collect(),
             // Cada aba numera do 1: os atalhos sempre foram por aba, então a nova ganha
             // a própria sequência sem que a de Processos mude de tecla.
-            Tab::Processes | Tab::Containers => self.tables_on(self.tab),
+            Tab::Processes | Tab::Containers | Tab::Tmux => self.tables_on(self.tab),
             // No shortcut-able panels here, which is also what frees the letter keys
             // on this tab for its own bindings ('a' to add an execution).
             Tab::Tools => Vec::new(),
@@ -1711,6 +1914,15 @@ impl App {
         self.focus = match target {
             ShortcutTarget::Chart(idx) => Focus::Chart(idx),
             ShortcutTarget::Table(idx) => {
+                // A árvore do tmux é relida *agora*, e não no próximo tick. A tela cheia
+                // congela a forma da lista de propósito — ela não pode reordenar debaixo
+                // de quem está lendo —, e congelar um retrato de até dois segundos atrás
+                // significa carregar essa defasagem pelo tempo todo em que a tela ficar
+                // aberta: uma janela aberta por fora não apareceria até sair e voltar.
+                // Custa uma chamada ao tmux, 3,5 ms medidos, na tecla que abre a tela.
+                if self.table_monitors[idx].tab() == Tab::Tmux {
+                    self.state.refresh_tmux();
+                }
                 // Fullscreen shows every ranked row, not just the compact grid panel's
                 // top `OVERVIEW_TABLE_ROWS` — take a fresh, uncapped sample rather than
                 // reusing the already-truncated `table_rows` snapshot.
@@ -1719,12 +1931,10 @@ impl App {
                 self.marks
                     .apply(monitor.id(), monitor.mark_kinds(), &mut rows);
                 // Roots open by default (showing their direct children), everything
-                // deeper closed — same "2nd level" policy the compact panel uses.
-                let expanded = rows
-                    .iter()
-                    .filter(|r| r.depth == 0)
-                    .map(|r| r.pid)
-                    .collect();
+                // deeper closed — same "2nd level" policy the compact panel uses. A
+                // tabela que pede o contrário abre até a folha — ver
+                // `TableMonitor::expand_all`.
+                let expanded = expanded_seed(&rows, monitor.expand_all());
                 Focus::Table(TableFocus {
                     table_index: idx,
                     rows,
@@ -1817,29 +2027,42 @@ impl App {
     /// Abre o menu sobre a linha selecionada. Silencioso quando não há sujeito — uma
     /// linha de projeto do compose agrupa containers mas não é um.
     pub fn open_actions(&mut self) {
+        // O corpo devolve `Option` só para poder desistir com `?` em cada coisa que pode
+        // não existir — a linha, o sujeito, quem responde por ele. Nenhuma delas é erro:
+        // uma linha de painel não tem menu, e uma máquina sem engine também não.
+        let _ = self.try_open_actions();
+    }
+
+    fn try_open_actions(&mut self) -> Option<()> {
         let Focus::Table(tf) = &self.focus else {
-            return;
+            return None;
         };
-        let Some(&row_idx) = tf.visible_indices().get(tf.selected) else {
-            return;
-        };
+        let &row_idx = tf.visible_indices().get(tf.selected)?;
         let table = self.table_monitors[tf.table_index].id();
+        let tab = self.table_monitors[tf.table_index].tab();
         let key = tf.rows[row_idx].key.clone();
         if key.is_empty() {
-            return;
+            return None;
         }
-        let Some(store) = self.state.containers.clone() else {
-            return;
+        // Perguntadas a quem sabe fazer, não escritas aqui: no modo leitura a lista volta
+        // vazia e o menu diz por quê, em vez de oferecer teclas que só descobrem que não
+        // podem depois de apertadas.
+        let (subject, actions) = match tab {
+            Tab::Tmux => {
+                let tmux = self.state.tmux.as_ref()?;
+                let subject = monitors::tmux::subject_of(tmux, &key)?;
+                let actions = tmux.actions(&subject);
+                (Target::Tmux(subject), actions)
+            }
+            _ => {
+                let store = self.state.containers.clone()?;
+                let subject = subject_of(&store, table, &key)?;
+                let actions = store.actions(&subject);
+                (Target::Container(subject), actions)
+            }
         };
-        let Some(subject) = subject_of(&store, table, &key) else {
-            return;
-        };
-        // Perguntadas à engine, não escritas aqui: no modo leitura a lista volta vazia e
-        // o menu diz por quê, em vez de oferecer teclas que só descobrem que não podem
-        // depois de apertadas.
-        let actions = store.actions(&subject);
         let Focus::Table(parent) = std::mem::replace(&mut self.focus, Focus::None) else {
-            return;
+            return None;
         };
         self.focus = Focus::Actions(Box::new(ActionMenu {
             subject,
@@ -1847,6 +2070,7 @@ impl App {
             selected: 0,
             parent,
         }));
+        Some(())
     }
 
     /// Abre a caixa do endereço, já preenchida com o que estiver configurado à mão —
@@ -1985,6 +2209,16 @@ impl App {
         let consequences = action.consequences.clone();
         let subject = menu.subject.clone();
 
+        // As do tmux primeiro, porque duas delas não são operações e sim entregas do
+        // terminal: quem age é o laço principal, entre um quadro e o próximo.
+        if let Target::Tmux(subject) = &subject {
+            self.run_tmux_action(key, subject.clone(), gravity, label, consequences);
+            return;
+        }
+        let Target::Container(subject) = subject else {
+            return;
+        };
+
         match key {
             ActionKey::Details => {
                 self.close_actions();
@@ -2085,16 +2319,207 @@ impl App {
         if let Some(store) = &self.state.containers {
             store.report(error.clone(), false);
         }
+        self.report_handover_failure("o shell não abriu", error);
+    }
+
+    /// A tela que para e explica quando uma entrega do terminal não aconteceu.
+    ///
+    /// Uma só para o shell e para o tmux porque o problema é o mesmo nos dois: o que
+    /// está na tela é a tabela em tela cheia, e uma tela que volta sozinha sem dizer nada
+    /// é indistinguível de uma tecla que não funcionou. Foi assim que a falha mais comum
+    /// do shell — uma imagem sem `bash` — passou por invisível.
+    fn report_handover_failure(&mut self, title: &str, error: String) {
         let Focus::Table(table) = std::mem::replace(&mut self.focus, Focus::None) else {
             return;
         };
         self.focus = Focus::Text(Box::new(TextView {
-            title: "o shell não abriu".to_string(),
+            title: title.to_string(),
             lines: error.lines().map(str::to_string).collect(),
             scroll: 0,
             max_scroll: Cell::new(0),
             parent: TextParent::Table(Box::new(table)),
         }));
+    }
+
+    // --- aba tmux ---------------------------------------------------------------------
+
+    /// Abre a caixa que cria uma sessão, já com uma pasta plausível preenchida.
+    ///
+    /// A pasta oferecida é a de onde o monitorzinho foi aberto, porque é quase sempre a
+    /// resposta: quem pede uma sessão nova está olhando para o projeto em que vai
+    /// trabalhar. As outras sugestões são as pastas das sessões que já existem, que é o
+    /// resto da resposta na maioria das vezes.
+    pub fn open_session_editor(&mut self) {
+        if self.state.tmux.is_none() {
+            return;
+        }
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut suggestions: Vec<String> = Vec::new();
+        if !cwd.is_empty() {
+            suggestions.push(cwd.clone());
+        }
+        if let Some(home) = dirs::home_dir() {
+            let home = home.to_string_lossy().into_owned();
+            if !suggestions.contains(&home) {
+                suggestions.push(home);
+            }
+        }
+        if let Some(tmux) = &self.state.tmux {
+            for session in &tmux.snapshot.sessions {
+                if !session.path.is_empty() && !suggestions.contains(&session.path) {
+                    suggestions.push(session.path.clone());
+                }
+            }
+        }
+        let path = suggestions.first().cloned().unwrap_or_default();
+        self.session_editor = Some(SessionEditor {
+            mode: SessionEditorMode::Create,
+            name: String::new(),
+            path,
+            field: 0,
+            suggestions,
+            error: None,
+        });
+    }
+
+    /// Abre a caixa já com o nome atual dentro, para trocar uma letra sem redigitar tudo.
+    fn open_rename_editor(&mut self, subject: tmux::Subject) {
+        let name = match &subject {
+            tmux::Subject::Session(session) => session.name.clone(),
+            tmux::Subject::Window(window) => window.name.clone(),
+            // Não chega aqui — o menu de um painel não oferece renomear —, e mesmo assim
+            // o campo abre vazio em vez de com um nome emprestado de outro nível.
+            tmux::Subject::Pane(_) => String::new(),
+        };
+        self.session_editor = Some(SessionEditor {
+            mode: SessionEditorMode::Rename(Box::new(subject)),
+            name,
+            path: String::new(),
+            field: 0,
+            suggestions: Vec::new(),
+            error: None,
+        });
+    }
+
+    /// Aplica o renomeio. Como a criação, fica aberta com o motivo escrito quando não dá:
+    /// um nome já em uso se conserta digitando.
+    fn rename_target(&mut self) {
+        let Some(editor) = &self.session_editor else {
+            return;
+        };
+        let SessionEditorMode::Rename(subject) = &editor.mode else {
+            return;
+        };
+        let (subject, novo) = ((**subject).clone(), editor.name.clone());
+        let Some(tmux) = &mut self.state.tmux else {
+            return;
+        };
+        match tmux.rename(&subject, &novo) {
+            Ok(_) => {
+                self.session_editor = None;
+                self.resample_focused_table();
+            }
+            Err(error) => {
+                if let Some(editor) = &mut self.session_editor {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    pub fn session_editor_open(&self) -> bool {
+        self.session_editor.is_some()
+    }
+
+    /// Teclas da caixa: digitar, andar pelos campos e pelas sugestões, criar, desistir.
+    pub fn session_key(&mut self, code: KeyCode) {
+        let Some(editor) = &mut self.session_editor else {
+            return;
+        };
+        match code {
+            KeyCode::Char(c) => {
+                editor.value_mut().push(c);
+                editor.error = None;
+            }
+            KeyCode::Backspace => {
+                editor.value_mut().pop();
+                editor.error = None;
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                editor.field = editor.field.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                editor.field = (editor.field + 1).min(editor.fields().len() - 1);
+            }
+            KeyCode::Left => editor.cycle(-1),
+            KeyCode::Right => editor.cycle(1),
+            KeyCode::Enter => match &editor.mode {
+                SessionEditorMode::Create => self.create_session(),
+                SessionEditorMode::Rename(_) => self.rename_target(),
+            },
+            KeyCode::Esc => self.session_editor = None,
+            _ => {}
+        }
+    }
+
+    /// Cria a sessão e entra nela.
+    ///
+    /// Entrar é a metade que importa: quem acabou de digitar um nome e uma pasta quer
+    /// trabalhar ali, não olhar a linha nova numa lista. O contrato de volta já traz de
+    /// volta para cá quando alguém desanexar.
+    fn create_session(&mut self) {
+        let Some(editor) = &self.session_editor else {
+            return;
+        };
+        let (name, path) = (editor.name.clone(), editor.path.clone());
+        let Some(tmux) = &mut self.state.tmux else {
+            return;
+        };
+        match tmux.create(&name, &path) {
+            Ok(created) => {
+                let nested = tmux.nested();
+                self.session_editor = None;
+                self.resample_focused_table();
+                self.pending_attach = Some(tmux::Attach {
+                    session: created,
+                    nested,
+                });
+            }
+            // Fica aberta com o motivo escrito: um nome duplicado ou uma pasta que não
+            // existe se conserta digitando, e fechar a caixa seria mandar redigitar tudo.
+            Err(error) => {
+                if let Some(editor) = &mut self.session_editor {
+                    editor.error = Some(error);
+                }
+            }
+        }
+    }
+
+    /// A sessão que está esperando o terminal, se houver. Pegar é o que limpa.
+    pub fn take_pending_attach(&mut self) -> Option<tmux::Attach> {
+        self.pending_attach.take()
+    }
+
+    /// Entrega o terminal ao tmux e fica nele até alguém desanexar. Chamado pelo laço
+    /// principal, com a tela alternativa já abandonada.
+    pub fn run_attach(&mut self, request: &tmux::Attach) -> Result<String, String> {
+        let tmux = self
+            .state
+            .tmux
+            .as_mut()
+            .ok_or("o tmux não está instalado nesta máquina")?;
+        let result = tmux.attach(request);
+        // A árvore mudou enquanto estivemos fora — janelas abertas, painéis fechados,
+        // talvez a própria sessão encerrada de dentro. A tabela congelada não sabe disso.
+        self.resample_focused_table();
+        result
+    }
+
+    /// Diz por que não deu para entrar, na mesma tela que o shell usa para o mesmo fim.
+    pub fn report_attach_failure(&mut self, error: String) {
+        self.report_handover_failure("não deu para entrar na sessão", error);
     }
 
     /// O shell que está esperando para ser aberto, se houver. Pegar é o que limpa.
@@ -2124,12 +2549,122 @@ impl App {
         }
     }
 
+    /// O que o menu de uma linha da aba tmux faz com a escolha.
+    ///
+    /// Separado do caminho da engine por uma diferença real: duas das entradas daqui não
+    /// executam nada — elas **entregam o terminal**. Entrar numa sessão não é uma operação
+    /// que termina e devolve uma frase; é sair da frente até alguém desanexar.
+    fn run_tmux_action(
+        &mut self,
+        key: ActionKey,
+        subject: tmux::Subject,
+        gravity: Gravity,
+        label: String,
+        consequences: Vec<String>,
+    ) {
+        match key {
+            ActionKey::Details => {
+                self.close_actions();
+                self.open_detail();
+            }
+            ActionKey::Attach => {
+                if let tmux::Subject::Session(session) = &subject {
+                    self.pending_attach = Some(tmux::Attach {
+                        session: session.name.clone(),
+                        // De dentro do tmux o `attach` é recusado — o terminal do cliente
+                        // é o de um painel do próprio servidor. Aninhar de propósito é o
+                        // que a mensagem dele manda fazer, e é o que faz desanexar
+                        // devolver esta tela.
+                        nested: self.state.tmux.as_ref().is_some_and(|t| t.nested()),
+                    });
+                }
+                self.close_actions();
+            }
+            ActionKey::Rename => {
+                self.close_actions();
+                self.open_rename_editor(subject);
+            }
+            // Não entrega terminal nenhum: manda o tmux de fora trocar de sessão e
+            // responde na hora.
+            ActionKey::SwitchTo => {
+                self.close_actions();
+                self.perform_tmux(key, subject);
+            }
+            _ => match gravity {
+                Gravity::Safe => {
+                    self.close_actions();
+                    self.perform_tmux(key, subject);
+                }
+                Gravity::Confirm | Gravity::Typed => {
+                    let name = subject.name();
+                    let danger = Danger {
+                        action: "confirmar",
+                        title: format!("{label} «{name}»?"),
+                        lines: consequences,
+                    };
+                    let typed = (gravity == Gravity::Typed).then(|| TypedConfirm {
+                        expected: name,
+                        input: String::new(),
+                    });
+                    self.pending = Some(Pending {
+                        danger,
+                        action: PendingAction::Tmux {
+                            action: key,
+                            subject: Box::new(subject),
+                        },
+                        typed,
+                    });
+                }
+            },
+        }
+    }
+
+    fn perform_tmux(&mut self, action: ActionKey, subject: tmux::Subject) {
+        if let Some(tmux) = &mut self.state.tmux {
+            let _ = tmux.perform(action, &subject);
+        }
+        // A tabela em tela cheia guarda uma forma congelada, e uma sessão morta continuaria
+        // desenhada nela até a próxima entrada. Reamostrar aqui é o que faz a linha sumir
+        // no mesmo quadro em que a tecla foi apertada.
+        self.resample_focused_table();
+    }
+
+    /// Reamostra a tabela que está em tela cheia, mantendo onde o cursor estava.
+    ///
+    /// Existe para as operações que mudam a *forma* da lista em vez dos valores dela —
+    /// matar uma sessão, criar uma. `refresh_values` não serve: ela casa linha a linha
+    /// com o que já está lá, e o que mudou foi justamente quais linhas existem.
+    fn resample_focused_table(&mut self) {
+        let Focus::Table(tf) = &self.focus else {
+            return;
+        };
+        let index = tf.table_index;
+        let selected = tf.selected;
+        let rows = self.table_monitors[index].sample(&self.state, None);
+        let expand_all = self.table_monitors[index].expand_all();
+        let Focus::Table(tf) = &mut self.focus else {
+            return;
+        };
+        tf.rows = rows;
+        // Os nós abertos são guardados por pid, e as chaves sintéticas de sessão e janela
+        // são atribuídas por posição — depois de uma linha sumir elas apontariam para
+        // outra coisa. Reabrir do zero é o único estado honesto aqui, na mesma política
+        // com que a tabela foi aberta.
+        tf.expanded = expanded_seed(&tf.rows, expand_all);
+        let visible = tf.visible_indices().len();
+        tf.selected = selected.min(visible.saturating_sub(1));
+    }
+
     /// Abre tudo que a engine sabe sobre o sujeito, como ela mesma escreve.
     fn open_inspect(&mut self) {
         let Focus::Actions(menu) = &self.focus else {
             return;
         };
-        let subject = menu.subject.clone();
+        // Só o lado da engine tem um «tudo que se sabe» para mostrar: o tmux responde em
+        // campos que o detalhe já mostra inteiros, e não em um documento.
+        let Target::Container(subject) = menu.subject.clone() else {
+            return;
+        };
         let Some(store) = self.state.containers.clone() else {
             return;
         };
@@ -2160,7 +2695,7 @@ impl App {
         let Focus::Actions(menu) = &self.focus else {
             return;
         };
-        let Subject::Container(container) = &menu.subject else {
+        let Target::Container(Subject::Container(container)) = &menu.subject else {
             return;
         };
         let Some(store) = &self.state.containers else {
@@ -3380,6 +3915,12 @@ impl App {
                 match pending.action {
                     PendingAction::KillRow => self.kill_selected(),
                     PendingAction::RemoveExecution => self.remove_selected_execution(),
+                    PendingAction::Tmux { action, subject } => {
+                        // Volta para a tabela antes de agir, como o caminho da engine: o
+                        // menu falava de um estado que a operação está prestes a mudar.
+                        self.close_actions();
+                        self.perform_tmux(action, *subject);
+                    }
                     PendingAction::Engine {
                         action,
                         subject,

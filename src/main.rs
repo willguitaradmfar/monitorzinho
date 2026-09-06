@@ -9,11 +9,13 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+mod action;
 mod app;
 mod container;
 mod format;
 mod history;
 mod monitor;
+mod tmux;
 mod tools;
 mod ui;
 
@@ -60,9 +62,10 @@ fn handle_flags() -> bool {
             println!("Monitor de terminal: CPU, memória, disco, rede e GPU em gráficos;");
             println!("processos, portas, conexões, sessões SSH e interfaces em tabelas;");
             println!("containers, volumes, imagens e redes — com logs, shell e as");
-            println!("operações de cada um; e ferramentas que rodam — túnel, scanner de");
-            println!("portas, investigação DNS, scanner de rede, inspetor de certificado,");
-            println!("receptor de requisições e seguidor de arquivo.");
+            println!("operações de cada um; sessões, janelas e painéis do tmux — com");
+            println!("entrar, criar, renomear e matar; e ferramentas que rodam — túnel,");
+            println!("scanner de portas, investigação DNS, scanner de rede, inspetor de");
+            println!("certificado, receptor de requisições e seguidor de arquivo.");
             println!();
             println!("uso: monitorzinho [--version] [--help] [--bench]");
             println!();
@@ -72,7 +75,8 @@ fn handle_flags() -> bool {
             println!("Não há opções de configuração na linha de comando: tudo é escolhido");
             println!("de dentro, e as teclas de cada tela estão no rodapé dela. Tab troca");
             println!("de aba, Ctrl+C duas vezes sai. A aba Containers só aparece onde há");
-            println!("uma engine que responda ou containers rodando.");
+            println!("uma engine que responda ou containers rodando, e a aba tmux só onde");
+            println!("o tmux está instalado.");
         }
         other => {
             eprintln!("monitorzinho: opção desconhecida «{other}» — tente --help");
@@ -136,6 +140,37 @@ fn open_shell(
     Ok(())
 }
 
+/// Entrega o terminal a uma sessão de tmux e o toma de volta quando alguém desanexar.
+///
+/// Irmão do `open_shell`, e mais simples que ele por uma razão de fundo: o tmux é um
+/// processo filho que **herda o terminal de verdade**, enquanto o shell de um container
+/// está do outro lado de um socket e precisa de alguém copiando bytes nos dois sentidos.
+/// Aqui não há relay, não há thread, e o redimensionamento não é problema nosso — o
+/// `SIGWINCH` vai direto para quem está desenhando.
+///
+/// O modo bruto é desligado antes e religado depois. O tmux configura o terminal do jeito
+/// dele e restaura o que encontrou ao sair; entregá-lo já em modo bruto faria ele
+/// restaurar o modo bruto, e a interface voltaria para um terminal que ela acha que
+/// acabou de configurar mas não configurou.
+fn open_attach(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    request: &tmux::Attach,
+) -> io::Result<()> {
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+    let outcome = app.run_attach(request);
+    enable_raw_mode()?;
+    // Volta para a tela alternativa e reconstrói o quadro do zero: o tmux escreveu por
+    // toda a tela, e o `ratatui` só redesenha o que ele acha que mudou.
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    terminal.clear()?;
+    if let Err(error) = outcome {
+        app.report_attach_failure(error);
+    }
+    Ok(())
+}
+
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let mut app = App::new();
     app.tick();
@@ -167,6 +202,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         // dele, e o laço não pode desenhar por cima.
         if let Some(container) = app.take_pending_shell() {
             open_shell(terminal, &mut app, &container)?;
+            last_tick = Instant::now();
+            dirty = true;
+            continue;
+        }
+
+        // Uma sessão de tmux pedida no menu da aba tmux, ou recém-criada no formulário.
+        // Aqui pelo mesmo motivo que o shell: enquanto ela está aberta o terminal é dela.
+        if let Some(request) = app.take_pending_attach() {
+            open_attach(terminal, &mut app, &request)?;
             last_tick = Instant::now();
             dirty = true;
             continue;
@@ -216,6 +260,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     // A caixa do endereço engole todas as letras: é um campo de texto,
                     // e 'q' faz parte de um nome de host como qualquer outra.
                     code if app.endpoint_editor_open() => app.endpoint_key(code),
+                    // Mesma razão, e sobre uma tabela em tela cheia cujas letras seriam
+                    // busca: a caixa que cria uma sessão tem que ver as teclas primeiro.
+                    code if app.session_editor_open() => app.session_key(code),
                     // The marks screen sits over whatever it was opened from, table or
                     // dashboard, and takes every key including 'q' and the letters that
                     // would otherwise be search input or panel shortcuts.
@@ -258,6 +305,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                             Focus::Detail(_) => app.close_detail(),
                             _ => app.exit_focus(),
                         }
+                    }
+
+                    // Ctrl+N cria uma sessão de tmux. Com Ctrl e não com uma letra pela
+                    // mesma razão do Ctrl+E que marca: numa tabela em tela cheia toda
+                    // letra é entrada de busca, e criar tem que funcionar *enquanto* se
+                    // procura, que é geralmente como se descobre que a sessão não existe.
+                    KeyCode::Char('n')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && app.on_tmux_tab() =>
+                    {
+                        app.open_session_editor();
                     }
 
                     // Ctrl+G, next door to the key that makes a mark: the list of what

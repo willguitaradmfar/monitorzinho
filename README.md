@@ -14,6 +14,13 @@ A lightweight terminal system monitor, written in Rust.
   removal, prune — with the irreversible ones asking you to type the name
   first. Engine-agnostic by construction: Docker is the first implementation of
   a trait, not the thing the panels are written against.
+- **tmux** — a tab of its own for sessions, windows and panes, present only on a
+  machine that has tmux installed. `Enter` on a session gives you the same
+  do-something menu the Containers tab has, at every level of the tree: go into
+  a session, rename it, kill a session, a window, or a single pane. Going in
+  hands the terminal over and takes it back when you detach, so `prefix d` lands
+  you right back on the list. `Ctrl+N` creates a session from a name and a base
+  folder — and drops you straight into it.
 - **Tools** that don't just watch but *run*: a recording TCP/UDP tunnel that
   shows you the payload of a connection, speaks TLS to the target, and can
   rewrite bytes on the way through; a port scanner that asks each open port
@@ -75,9 +82,10 @@ description; everything else is chosen from inside the program.
 ## Tabs
 
 `Tab` / `Shift+Tab` cycle between the tabs. Everything samples every 2 seconds;
-spacebar forces an immediate refresh, like `top`'s. The Containers tab only
-appears on a machine that has containers to show — see
-[Containers](#containers--the-containers).
+spacebar forces an immediate refresh, like `top`'s. Two tabs are conditional:
+Containers only appears on a machine that has containers to show, and tmux only
+where the tmux binary is installed — see [Containers](#containers--the-containers)
+and [tmux](#tmux--the-sessions).
 
 ### Visão Geral — the charts
 
@@ -302,6 +310,98 @@ gives it back on `exit`. It speaks the engine's exec protocol directly — no
 What's deliberately **not** offered: force-removing a running container. The
 engine can, but "stop it first" is more honest than a key that takes down what's
 serving traffic without having said that was what it did.
+
+### tmux — the sessions
+
+Only there when tmux is installed. Same rule as Containers, same reason: without
+the binary there are no sessions to list and no way to make one, and a
+permanently empty tab is noise in the first thing anyone reads.
+
+One wide table of sessions over half the height, with windows and a summary
+below it:
+
+- **Sessões** — a tree, session → window → pane, open all the way down in both
+  the compact panel and fullscreen. Unlike the other big tables here the compact
+  one does *not* flatten it: they flatten because grouping costs rows a small
+  panel hasn't got, and this tree is three shallow levels whose bottom one is
+  where the process actually is. The compact panel caps at 30 sessions.
+
+  The seven columns mean the same thing at every level and go **empty** where a
+  level has no answer — a window has no windows inside it, a pane has no panes
+  inside it, and only a session is dated by tmux. Empty says "that question
+  isn't asked here"; a zero would say "the answer is none", which is a different
+  thing. The two text columns are measured against the content rather than given
+  a fixed share, because the name carries three levels of tree indent and the
+  path may be `/tmp` or eighty characters.
+- **Janelas** — every window of every session, flat. The tree above answers
+  "what is inside this session"; this answers the opposite question, the one you
+  ask when you can't remember where something was left running.
+- **Resumo** — version, socket, counts, and whether monitorzinho is itself
+  running inside tmux. That last line is not trivia: it is what decides what
+  "go in" does.
+
+`Enter` on a row opens the same do-something menu the Containers tab uses, built
+the same way — nothing in it is written in the UI, and an entry that can't run
+stays in the list with the reason beside it. All three levels answer, because at
+all three there is something to do: a session you go into and kill, a window you
+rename and kill, and a pane is where a process actually is. Stopping at the
+window would leave the only row that points at a process as the only one without
+a menu.
+
+What the guards refuse is exact rather than broad. The session monitorzinho lives
+in can't be killed; but the *other* windows of that session can, and only the one
+holding our pane is refused — worked out from `$TMUX_PANE`, not from the session
+name. Same for the pane it is drawing in.
+
+**Going in, from inside tmux.** tmux refuses to attach when the client's terminal
+is a pane of the same server (`sessions should be nested with care, unset $TMUX
+to force`), so from inside tmux "go in" has two honest answers and the menu
+offers both:
+
+| | |
+| --- | --- |
+| **entrar aqui (aninhada)** | forces the nesting, which is what tmux's own message tells you to do. `prefix prefix d` detaches and you are back on the list — the contract this tab is built around. |
+| **trocar o tmux de fora para ela** | `switch-client`: the outer client changes session and monitorzinho keeps running where it is. You come back by switching back, not by detaching. |
+
+Run from outside tmux there is nothing to nest, and the menu simply says
+**entrar**. Either way, the session monitorzinho is living in has both entries
+greyed with the reason, and so does *matar sessão* — killing it would kill
+monitorzinho.
+
+**Creating one.** `Ctrl+N` — with `Ctrl` rather than a bare letter because every
+letter in a fullscreened table is search input, and creating has to work *while*
+you search, which is usually how you discover the session isn't there. The box
+asks for a name and a base folder, offers the folders already in use with
+`←`/`→`, creates the session detached and then goes straight into it.
+
+Two things it checks that tmux does not:
+
+- **the folder exists.** `tmux new-session -c /does/not/exist` creates the
+  session somewhere else and exits zero. Nobody is told.
+- **the name you get is the name tmux gave.** It rewrites `.` and `:` to `_`
+  silently, also exiting zero, so `deploy.web` becomes `deploy_web` and
+  attaching by the name you typed would miss. The session is created with
+  `-P -F` to read the real name back, and the footer says when the two differ.
+
+Renaming reads the name back the same way, for the same reason.
+
+**One `Command`, and why.** This is the only place in the program that spawns a
+process — `container/exec.rs` turns down the `docker` binary out loud. The
+trade is different here: tmux has no library and no stable wire protocol, its
+control interface *is* the binary, and the binary being installed is the subject
+of the tab rather than an incidental dependency. What comes back is asked for in
+tmux's own documented format language (`-F '#{session_name}…'`), so the shape of
+the answer is ours, not a screen being scraped. One `list-panes -a` call rebuilds
+the whole tree — 3.5 ms, measured with `--bench` — which is why this tab needs
+none of the background threads the Containers tab has: a local socket does not
+hang the way HTTP to a daemon can.
+
+The field separator is a tab, and that is load-bearing: tmux escapes control
+characters that appear **in values** but not the ones in the format text, so a
+window named with a tab in it arrives as the four visible characters `\t` while
+our separator arrives as itself. (The first attempt used `\x1f` on the theory
+that nobody types it. tmux escaped that too, and every line came back as a single
+field.)
 
 ### Ferramentas — the tools
 
@@ -791,12 +891,14 @@ at it properly.
 | --- | --- | --- |
 | `Tab` / `Shift+Tab` | anywhere | next/previous tab |
 | space | a tab | refresh now, without waiting for the tick |
-| `1`–`9`, letters | Visão Geral, Processos, Containers | fullscreen that panel |
-| `Enter` | a fullscreened table | open the row's detail view — or, on the Containers tab, the menu of what can be done with it |
+| `1`–`9`, letters | Visão Geral, Processos, Containers, tmux | fullscreen that panel |
+| `Enter` | a fullscreened table | open the row's detail view — or, on the Containers and tmux tabs, the menu of what can be done with it |
 | `↑`/`↓`, `Enter`, `Esc` | that menu | choose, do, back — a greyed entry does nothing and says why |
 | `PgUp` / `PgDn` | any list or log | move ten rows / scroll fast, stopping at the ends |
 | `←` / `→` | process tree | collapse/expand |
 | `Ctrl+E` | a fullscreened table | mark the row so it stays findable while the list reorders; again to unmark |
+| `Ctrl+N` | tmux | create a session from a name and a base folder, and go into it |
+| `Enter` | a tmux session / window / pane | what can be done with it at that level — the pane is where `matar painel` lives |
 | `Ctrl+G` | a fullscreened table, Visão Geral, Processos | the list of every mark: `←`/`→` recolour, `Enter` edit, `Del` remove |
 | `Del` | a fullscreened table | what it kills depends on the table — the confirmation says so before anything happens |
 | any letter | a fullscreened table | search, live |

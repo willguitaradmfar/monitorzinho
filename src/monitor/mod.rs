@@ -5,6 +5,7 @@ use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, Up
 
 use crate::app::Tab;
 use crate::container::Store;
+use crate::tmux::Tmux;
 use crate::tools::Handoff;
 
 pub mod connections;
@@ -25,6 +26,7 @@ pub mod ssh;
 pub mod steal;
 pub mod summary;
 pub mod temperature;
+pub mod tmux;
 
 /// Shared, refreshed-once-per-tick system state passed to every monitor's `sample`.
 pub struct SystemState {
@@ -48,6 +50,14 @@ pub struct SystemState {
     /// `Store` já mantêm o retrato atual, e ler é pegar um mutex. É por isso que a aba
     /// Containers custa praticamente nada, contra os 87,8 ms por tick da aba Processos.
     pub containers: Option<Arc<Store>>,
+    /// O tmux desta máquina, quando há um instalado. `None` é a mesma condição que tira a
+    /// aba da barra.
+    ///
+    /// Ao contrário do retrato dos containers, este é relido no próprio tick da aba: uma
+    /// volta é um `list-panes` num socket local, que custa alguns milissegundos e não
+    /// trava. As threads de fundo do `Store` existem porque falar HTTP com um daemon pode
+    /// travar por segundos; aqui não há o que proteger.
+    pub tmux: Option<Tmux>,
 }
 
 /// Per-tick memoisation. Cleared at the start of every refresh, so nothing here is ever
@@ -67,6 +77,7 @@ impl SystemState {
             networks: Networks::new_with_refreshed_list(),
             scratch: Scratch::default(),
             containers: Store::start().map(Arc::new),
+            tmux: Tmux::start(),
         }
     }
 
@@ -124,6 +135,16 @@ impl SystemState {
     /// o retrato sozinhas, e o que o tick faz é começar um tick — nada mais.
     pub fn refresh_containers(&mut self) {
         self.start_tick();
+    }
+
+    /// Relê a árvore do tmux. Uma chamada ao binário, síncrona, e só enquanto a aba está
+    /// na frente — é a mesma regra de toda amostragem daqui: uma aba fora de foco não
+    /// custa nada.
+    pub fn refresh_tmux(&mut self) {
+        self.start_tick();
+        if let Some(tmux) = &mut self.tmux {
+            tmux.refresh();
+        }
     }
 
     /// Refreshes the process list (Processes tab: ports/top CPU/top memory), plus the
@@ -392,6 +413,17 @@ pub trait TableMonitor: Send {
     fn mark_kinds(&self) -> &'static [mark::MarkKind] {
         &[]
     }
+    /// Se a árvore desta tabela abre inteira, em vez de só o primeiro nível.
+    ///
+    /// O padrão é abrir só os pais, que é a política das outras árvores daqui: uma árvore
+    /// de processos tem centenas de folhas e abrir tudo entrega uma lista que ninguém
+    /// pediu. A do tmux é o caso contrário — três níveis rasos, e o painel é justamente o
+    /// nível em que existe um processo para se olhar e matar. Deixá-lo fechado seria
+    /// esconder a única linha que responde «o que está rodando aqui».
+    fn expand_all(&self) -> bool {
+        false
+    }
+
     /// Whether this table's rows form a tree, so a mark on it can be asked to reach the
     /// children. Answered by the monitor rather than read off the rows, because the two
     /// process tables are trees only once fullscreened — the marks screen has to know
@@ -493,5 +525,10 @@ pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {
         Box::new(containers::ImagesMonitor::default()),
         Box::new(containers::NetworksMonitor::default()),
         Box::new(containers::ContainerSummaryMonitor),
+        // A aba tmux, pela mesma razão e do mesmo jeito: um só vetor de tabelas, e o
+        // `tab()` de cada uma diz onde ela aparece.
+        Box::new(tmux::SessionsMonitor::default()),
+        Box::new(tmux::WindowsMonitor),
+        Box::new(tmux::SummaryMonitor),
     ]
 }

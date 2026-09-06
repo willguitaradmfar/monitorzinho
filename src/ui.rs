@@ -10,12 +10,13 @@ use ratatui::widgets::{
     TableState,
 };
 
+use crate::action::Gravity;
 use crate::app::{
     ActionMenu, App, ChartPanel, DetailFocus, EndpointEditor, Focus, HandoffPicker, MATCH_CONTEXT,
-    MarkEditor, MarkField, MarksScreen, ParamField, Pending, RulesEditor, RulesMode,
-    ShortcutTarget, Tab, TableFocus, TextView, ToolMonitorFocus, ToolWizard, WizardStep,
+    MarkEditor, MarkField, MarksScreen, ParamField, Pending, RulesEditor, RulesMode, SessionEditor,
+    SessionField, ShortcutTarget, Tab, TableFocus, TextView, ToolMonitorFocus, ToolWizard,
+    WizardStep,
 };
-use crate::container::Gravity;
 use crate::format;
 use crate::history::History;
 use crate::monitor::mark::MarkColor;
@@ -115,6 +116,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if let Some(editor) = &app.endpoint_editor {
         render_endpoint_editor(frame, area, editor);
     }
+    if let Some(editor) = &app.session_editor {
+        render_session_editor(frame, area, editor);
+    }
     if let Some(pending) = &app.pending {
         render_confirm(frame, area, pending);
     }
@@ -133,7 +137,7 @@ fn render_action_menu(frame: &mut Frame, area: Rect, menu: &ActionMenu) {
     let mut lines = vec![Line::raw("")];
     if menu.actions.is_empty() {
         lines.push(Line::styled(
-            "   Nenhuma operação disponível — nenhuma engine respondeu nesta máquina.",
+            format!("   {}", menu.subject.empty_reason()),
             Style::default().fg(palette::DIM),
         ));
     }
@@ -305,6 +309,7 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Overview => render_overview_tab(frame, sections[1], app),
         Tab::Processes => render_processes_tab(frame, sections[1], app),
         Tab::Containers => render_containers_tab(frame, sections[1], app),
+        Tab::Tmux => render_tmux_tab(frame, sections[1], app),
         Tab::Tools => render_tools_tab(frame, sections[1], app),
     }
 }
@@ -532,6 +537,65 @@ fn render_endpoint_editor(frame: &mut Frame, area: Rect, editor: &EndpointEditor
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// A caixa que cria uma sessão de tmux: um nome e uma pasta base.
+///
+/// Desenhada como a das marcas, com os mesmos `field_line`: são as duas caixas de
+/// formulário do programa, e uma pessoa que aprendeu a mexer numa não deve ter que
+/// aprender a outra.
+fn render_session_editor(frame: &mut Frame, area: Rect, editor: &SessionEditor) {
+    let width = MARK_BOX_WIDTH.min(area.width);
+    let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
+    let current = editor.current();
+
+    let mut lines = vec![Line::raw("")];
+    for field in editor.fields().iter().copied() {
+        let focused = field == current;
+        let value = editor.value(field);
+        let spans = match (field, focused) {
+            // A pasta anda pelas sugestões com ←/→, então usa a mesma forma que todo
+            // outro campo que anda: as setas aparecem só onde o cursor está.
+            (SessionField::Path, true) if !editor.suggestions.is_empty() => {
+                choice(&clip(value, text_width - 24), true)
+            }
+            _ => vec![Span::styled(
+                format!("{}▏", clip(value, text_width - 22)),
+                value_style(focused),
+            )],
+        };
+        lines.push(field_line(field.label(), spans, focused));
+    }
+    lines.push(Line::raw(""));
+    // A ajuda é a do campo em que o cursor está: uma caixa que explica os dois ao mesmo
+    // tempo é uma caixa que ninguém lê.
+    for chunk in wrap(current.help(), text_width) {
+        lines.push(Line::styled(
+            format!("   {chunk}"),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    if let Some(error) = &editor.error {
+        lines.push(Line::raw(""));
+        for chunk in wrap(error, text_width) {
+            lines.push(Line::styled(
+                format!("   {chunk}"),
+                Style::default().fg(palette::RED),
+            ));
+        }
+    }
+
+    let height = (lines.len() as u16).saturating_add(4).min(area.height);
+    let box_area = centered(area, width, height);
+    let block = Block::default()
+        .title(editor.title())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::CYAN))
+        .title_bottom(hint_line(editor.hint()));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 /// A one-of-several value, wearing the arrows that cycle it only while the cursor is on
 /// it — arrows on every line at once would say every line takes them.
 fn choice(value: &str, focused: bool) -> Vec<Span<'static>> {
@@ -693,6 +757,11 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
         // fullscreened is the sort of hint that sends someone hunting for a bug.
         let keys = match app.tab {
             Tab::Tools => "Tab/Shift+Tab alternar aba · Ctrl+C 2x sair",
+            // A tecla que cria uma sessão só é anunciada onde ela faz alguma coisa: um
+            // rodapé que promete um atalho inexistente manda procurar um bug.
+            Tab::Tmux => {
+                "1-9/letras ampliar painel · Ctrl+N nova sessão · Tab/Shift+Tab alternar aba · Ctrl+C 2x sair"
+            }
             _ => "1-9/letras ampliar painel · espaço atualizar · Tab/Shift+Tab alternar aba · Ctrl+C 2x sair",
         };
         Paragraph::new(Line::styled(
@@ -794,6 +863,35 @@ fn render_containers_tab(frame: &mut Frame, area: Rect, app: &App) {
         lower_pair[0],
         lower_pair[1],
     ];
+    render_table_grid(frame, app, &shortcuts, &panels, &areas);
+}
+
+/// A aba tmux: as sessões em cima, as janelas e o resumo embaixo.
+///
+/// A mesma proporção da aba Containers, pela mesma razão: a tabela de cima é a que se
+/// olha, e é a que vira árvore em tela cheia.
+fn render_tmux_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let panels = app.tables_on(Tab::Tmux);
+    if panels.len() < 3 {
+        return;
+    }
+
+    let shortcuts = ShortcutMap::build(app);
+    // Dois terços para a árvore, contra a metade que a aba Containers dá à tabela dela.
+    // A diferença é que aquela é uma lista plana e esta tem três níveis: cada sessão
+    // ocupa uma linha mais uma por janela mais uma por painel, então a mesma máquina cabe
+    // em muito menos altura ali do que aqui. Os dois painéis de baixo não perdem nada com
+    // isso — um é uma lista curta e o outro são sete fatos.
+    let halves = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
+        .split(area);
+    let lower = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(3, 5), Constraint::Ratio(2, 5)])
+        .split(halves[1]);
+
+    let areas = [halves[0], lower[0], lower[1]];
     render_table_grid(frame, app, &shortcuts, &panels, &areas);
 }
 
@@ -1012,7 +1110,34 @@ fn mark_cell(row: &TableRow) -> Cell<'static> {
     }
 }
 
-fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
+/// A largura que uma coluna de fato precisa: a maior célula dela, entre um piso e um teto.
+///
+/// A coluna 0 soma o recuo da árvore, que é o que `tree_row` desenha na frente do texto —
+/// três colunas por nível de ancestral, mais o conector e o marcador. Sem isso a coluna de
+/// uma árvore fica curta exatamente onde ela é mais funda.
+///
+/// Medida sobre **todas** as linhas e não só as visíveis: uma largura que mudasse ao abrir
+/// e fechar um nó faria a tabela inteira dançar debaixo de quem está lendo.
+fn fitted(rows: &[TableRow], column: usize, floor: u16, ceiling: u16) -> Constraint {
+    let widest = rows
+        .iter()
+        .filter_map(|row| {
+            let text = row.cells.get(column)?.chars().count();
+            let indent = match column {
+                0 => row.guides.len() * 3 + usize::from(row.depth > 0) * 2 + 2,
+                _ => 0,
+            };
+            Some((text + indent) as u16)
+        })
+        .max()
+        .unwrap_or(0);
+    // Uma coluna a mais que o conteúdo. O espaçamento que a tabela já põe entre colunas é
+    // de um caractere, e uma medida exata encosta o caminho mais longo no texto da coluna
+    // seguinte — que é justamente onde os dois viram uma palavra só ao ler.
+    Constraint::Length(widest.saturating_add(1).clamp(floor, ceiling))
+}
+
+fn table_col_widths(headers: &[&str], rows: &[TableRow]) -> Vec<Constraint> {
     match headers {
         ["Proto", "Port", "Process", "Age"] => vec![
             Constraint::Length(5),
@@ -1107,6 +1232,58 @@ fn table_col_widths(headers: &[&str]) -> Vec<Constraint> {
             Constraint::Fill(1),
         ],
         ["Item", "Situação"] => vec![Constraint::Length(16), Constraint::Fill(1)],
+        // A árvore do tmux é a única tabela daqui cujas colunas de texto variam de largura
+        // por ordens de grandeza entre uma máquina e outra: o nome soma o recuo de três
+        // níveis, e a pasta é um caminho absoluto que tanto pode ser `/tmp` quanto ter
+        // oitenta caracteres. Repartir a sobra em proporções fixas dava um nome com setenta
+        // colunas de vazio ao lado de um caminho cortado — então estas duas são medidas
+        // sobre o conteúdo, e a última coluna fica com o que sobrar.
+        [
+            "Sessão / janela / painel",
+            "Janelas",
+            "Painéis",
+            "Estado",
+            "Criada há",
+            "Pasta",
+            "Rodando",
+        ] => vec![
+            fitted(rows, 0, 48, 100),
+            // Largas o bastante para o cabeçalho respirar: são duas colunas de um dígito
+            // ou dois, e apertá-las contra o texto do título deixava «Janelas» e «Painéis»
+            // colados um no outro sem ganhar nada com isso.
+            Constraint::Length(10),
+            Constraint::Length(10),
+            // Cabe «anexada (2)», que é o mais longo que a coluna produz nos três níveis.
+            Constraint::Length(13),
+            Constraint::Length(10),
+            fitted(rows, 5, 10, 58),
+            Constraint::Min(12),
+        ],
+        // O mesmo painel, compacto: sem a coluna do comando, que era a que absorvia a
+        // sobra. Aqui esse papel é da pasta.
+        [
+            "Sessão / janela / painel",
+            "Janelas",
+            "Painéis",
+            "Estado",
+            "Criada há",
+            "Pasta",
+        ] => vec![
+            fitted(rows, 0, 48, 100),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(13),
+            Constraint::Length(10),
+            Constraint::Min(12),
+        ],
+        ["Sessão", "Janela", "Painéis", "Ativa", "Rodando", "Pasta"] => vec![
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Fill(1),
+            Constraint::Fill(2),
+        ],
         ["User", "Host", "TTY", "Time", "Folder", "Command"] => vec![
             Constraint::Length(10),
             Constraint::Length(16),
@@ -1204,7 +1381,7 @@ fn render_table_panel(
         .map(|(i, r)| tree_row(r, rows.get(i + 1)))
         .collect();
 
-    let table = Table::new(body, with_mark_column(table_col_widths(headers))).header(header);
+    let table = Table::new(body, with_mark_column(table_col_widths(headers, rows))).header(header);
     frame.render_widget(table, inner);
 }
 
@@ -1332,14 +1509,17 @@ fn render_fullscreen_table(
         })
         .collect();
 
-    let table = Table::new(body, with_mark_column(table_col_widths(headers)))
-        .header(header)
-        .row_highlight_style(
-            Style::default()
-                .fg(palette::CYAN)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        )
-        .highlight_symbol("▶ ");
+    let table = Table::new(
+        body,
+        with_mark_column(table_col_widths(headers, &table_focus.rows)),
+    )
+    .header(header)
+    .row_highlight_style(
+        Style::default()
+            .fg(palette::CYAN)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    )
+    .highlight_symbol("▶ ");
     let mut state = TableState::default().with_selected(Some(table_focus.selected));
     frame.render_stateful_widget(table, inner, &mut state);
 }
