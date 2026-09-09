@@ -289,7 +289,7 @@ impl ModuleView for Vista {
             rows,
             selected: Some(self.lista.selecionado),
             query: self.lista.busca.clone(),
-            note: Some(nota),
+            note: Some((nota, Tone::Aviso)),
         })
     }
 

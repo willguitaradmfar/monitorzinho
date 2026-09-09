@@ -271,10 +271,11 @@ impl ModuleView for Vista {
                     rows,
                     selected: Some(self.lista.selecionado),
                     query: self.lista.busca.clone(),
-                    note: Some(
+                    note: Some((
                         "P/L de empresa com prejuízo não é desenhado — é uma divisão sem significado"
                             .into(),
-                    ),
+                        Tone::Aviso,
+                    )),
                 }),
             ),
             (2, Layout::one(Pane::Facts { title: "Detalhe".into(), rows: fatos })),

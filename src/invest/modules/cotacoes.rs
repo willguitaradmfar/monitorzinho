@@ -3,6 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::invest::calc;
+use crate::invest::carteira;
 use crate::invest::model::AssetId;
 use crate::invest::module::{
     Ctx, Edit, Escape, Field, Group, InvestModule, Layout, ModuleView, Need, Outcome, Pane, Row,
@@ -91,7 +92,9 @@ impl InvestModule for Cotacoes {
                 .collect(),
             selected: None,
             query: String::new(),
-            note: None,
+            // O rodapé soma o que a lista mostra papel a papel: quanto a carteira andou
+            // hoje. Sem ele, dez linhas de variação não dizem se o dia foi bom.
+            note: variacao_do_dia(ctx),
         })
     }
 
@@ -121,6 +124,26 @@ fn ativos(ctx: &Ctx) -> Vec<AssetId> {
         }
     }
     v
+}
+
+/// Quanto a carteira andou hoje, em reais e em porcentagem.
+///
+/// Só isso: patrimônio e P&L são a resposta do cartão de Patrimônio, e repeti-los aqui
+/// fazia a linha estourar a largura e ser cortada no meio. O que falta a uma lista de
+/// cotações é o total do movimento que ela está mostrando papel a papel.
+fn variacao_do_dia(ctx: &Ctx) -> Option<(String, Tone)> {
+    let linhas = carteira::linhas(ctx.portfolio, ctx.market, ctx.agora);
+    let t = carteira::totais(&linhas);
+    if t.dia == 0.0 {
+        return None;
+    }
+    let texto = match t.dia_pct() {
+        Some(p) => format!("no dia R$ {} ({})", calc::moeda(t.dia), calc::pct(p)),
+        None => format!("no dia R$ {}", calc::moeda(t.dia)),
+    };
+    // Verde ou vermelho, pelo sinal. Numa tela de mercado a cor é a primeira coisa que o
+    // olho pega, e um número de queda em amarelo se lê como um de alta.
+    Some((texto, crate::invest::modules::heatmap::tom(Some(t.dia))))
 }
 
 /// Da maior alta para a maior queda, e quem ainda não tem preço no fim.

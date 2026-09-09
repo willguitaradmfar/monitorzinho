@@ -305,8 +305,13 @@ pub enum Pane {
         rows: Vec<Row>,
         selected: Option<usize>,
         query: String,
-        /// Nota no rodapé do painel: o estado das fontes, o que ficou de fora do total.
-        note: Option<String>,
+        /// Nota no rodapé do painel: o estado das fontes, o que ficou de fora do total,
+        /// quanto a carteira andou hoje.
+        ///
+        /// Com o tom junto, porque uma nota que carrega um número **precisa** dizer o
+        /// sinal dele: «no dia R$ -1.757» em amarelo se lê igual a «+R$ 1.757», e a cor é
+        /// a primeira coisa que o olho pega numa tela de mercado.
+        note: Option<(String, Tone)>,
     },
     Chart {
         title: String,

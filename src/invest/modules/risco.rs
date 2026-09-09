@@ -367,7 +367,10 @@ impl ModuleView for Vista {
                 rows,
                 selected: Some(self.lista.selecionado),
                 query: String::new(),
-                note: Some("cada ativo sobre a própria série — nada é somado aqui".into()),
+                note: Some((
+                    "cada ativo sobre a própria série — nada é somado aqui".into(),
+                    Tone::Aviso,
+                )),
             });
         }
 

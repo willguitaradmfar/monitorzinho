@@ -443,17 +443,18 @@ impl ModuleView for Vista {
 
 /// Só a fonte do Banco Central, para a nota deste módulo não falar de exchange nenhuma.
 mod mercado {
-    use super::Ctx;
-    pub fn nota_fontes_bcb(ctx: &Ctx) -> Option<String> {
+    use super::{Ctx, Tone};
+    pub fn nota_fontes_bcb(ctx: &Ctx) -> Option<(String, Tone)> {
         ctx.market
             .fontes
             .iter()
             .find(|f| f.id == "bcb")
             .map(|f| match &f.erro {
-                Some(e) => format!("Banco Central: {e}"),
-                None => {
-                    "Banco Central respondendo · séries diárias, publicadas com defasagem".into()
-                }
+                Some(e) => (format!("Banco Central: {e}"), Tone::Ruim),
+                None => (
+                    "Banco Central respondendo · séries diárias, publicadas com defasagem".into(),
+                    Tone::Dim,
+                ),
             })
     }
 }

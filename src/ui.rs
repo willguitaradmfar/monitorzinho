@@ -3431,7 +3431,7 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane
                 rows,
                 selected: *selected,
                 query,
-                note: note.as_deref(),
+                note: note.as_ref(),
             },
         ),
         Pane::Chart {
@@ -3513,7 +3513,7 @@ struct TabelaPane<'a> {
     rows: &'a [crate::invest::module::Row],
     selected: Option<usize>,
     query: &'a str,
-    note: Option<&'a str>,
+    note: Option<&'a (String, crate::invest::module::Tone)>,
 }
 
 fn render_pane_table(frame: &mut Frame, area: Rect, pane: &TabelaPane) {
@@ -3533,10 +3533,10 @@ fn render_pane_table(frame: &mut Frame, area: Rect, pane: &TabelaPane) {
         titulo.push_str(&format!(" · buscando «{query}»"));
     }
     let mut bloco = moldura(&titulo);
-    if let Some(note) = note.filter(|n| !n.is_empty()) {
+    if let Some((note, tom)) = note.filter(|(n, _)| !n.is_empty()) {
         bloco = bloco.title_bottom(Line::styled(
             format!(" {note} "),
-            Style::default().fg(palette::YELLOW),
+            Style::default().fg(tone_color(*tom)),
         ));
     }
     let dentro = bloco.inner(area);

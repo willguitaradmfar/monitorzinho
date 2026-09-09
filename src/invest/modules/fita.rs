@@ -152,10 +152,11 @@ impl ModuleView for Vista {
                     rows,
                     selected: Some(self.lista.selecionado),
                     query: self.lista.busca.clone(),
-                    note: Some(
+                    note: Some((
                         "a ordem é o que decide quem sobrevive ao corte num terminal estreito"
                             .into(),
-                    ),
+                        Tone::Aviso,
+                    )),
                 }),
             ),
             (

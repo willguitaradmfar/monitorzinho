@@ -109,20 +109,28 @@ impl InvestModule for Posicoes {
             // O P&L nunca sai sem dizer sobre o quê. Numa carteira em que só duas de
             // vinte e uma linhas informam preço médio, um «P&L» solto no rodapé é o
             // número mais enganoso da tela.
+            // Colorido pelo sinal, como o resto dos números desta aba: um P&L negativo em
+            // amarelo se lê como um positivo, e a cor é o que o olho pega primeiro.
             note: Some(match totais.sem_custo {
-                0 => format!(
-                    "R$ {} · P&L R$ {}{}",
-                    calc::moeda(totais.mercado),
-                    calc::moeda(totais.pnl),
-                    totais
-                        .pnl_pct()
-                        .map(|p| format!(" ({})", calc::pct(p)))
-                        .unwrap_or_default()
+                0 => (
+                    format!(
+                        "R$ {} · P&L R$ {}{}",
+                        calc::moeda(totais.mercado),
+                        calc::moeda(totais.pnl),
+                        totais
+                            .pnl_pct()
+                            .map(|p| format!(" ({})", calc::pct(p)))
+                            .unwrap_or_default()
+                    ),
+                    crate::invest::modules::heatmap::tom(totais.pnl_pct()),
                 ),
-                n => format!(
-                    "R$ {} · {} sem preço médio informado",
-                    calc::moeda(totais.mercado),
-                    n
+                n => (
+                    format!(
+                        "R$ {} · {} sem preço médio informado",
+                        calc::moeda(totais.mercado),
+                        n
+                    ),
+                    Tone::Aviso,
                 ),
             }),
         })
@@ -469,7 +477,7 @@ impl ModuleView for Vista {
         // **Todas** as fontes, e não só as que caíram. Uma tela que só fala quando dá
         // errado deixa quem olha sem saber se ela sequer tentou — que foi exatamente o
         // que aconteceu quando um preço não aparecia e não havia como descobrir por quê.
-        if let Some(estado) = crate::invest::modules::mercado::nota_fontes(ctx) {
+        if let Some((estado, _)) = crate::invest::modules::mercado::nota_fontes(ctx) {
             nota.push(estado);
         }
         if let Some(i) = self.confirmando_remocao
@@ -512,9 +520,12 @@ impl ModuleView for Vista {
             ),
             (
                 "no dia".to_string(),
-                match totais.dia == 0.0 {
-                    true => "—".to_string(),
-                    false => format!("R$ {}", calc::moeda(totais.dia)),
+                match (totais.dia == 0.0, totais.dia_pct()) {
+                    (true, _) => "—".to_string(),
+                    (false, Some(p)) => {
+                        format!("R$ {} ({})", calc::moeda(totais.dia), calc::pct(p))
+                    }
+                    (false, None) => format!("R$ {}", calc::moeda(totais.dia)),
                 },
                 match totais.dia {
                     v if v > 0.0 => Tone::Bom,
@@ -533,7 +544,7 @@ impl ModuleView for Vista {
                     rows,
                     selected: Some(self.lista.selecionado),
                     query: self.lista.busca.clone(),
-                    note: (!nota.is_empty()).then(|| nota.join(" · ")),
+                    note: (!nota.is_empty()).then(|| (nota.join(" · "), Tone::Aviso)),
                 }),
             ),
             (

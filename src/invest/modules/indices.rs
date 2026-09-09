@@ -267,10 +267,11 @@ impl ModuleView for Vista {
                     rows: vivos,
                     selected: Some(self.lista.selecionado),
                     query: String::new(),
-                    note: Some(
+                    note: Some((
                         "«~» marca janela de costume, e não data publicada — só o COPOM tem calendário fechado"
                             .into(),
-                    ),
+                        Tone::Aviso,
+                    )),
                 }),
             ),
             (

@@ -252,10 +252,11 @@ impl Vista {
             },
             query: String::new(),
             note: Some(match self.aba {
-                Aba::Anunciados => {
-                    "estimado com a quantidade de hoje · Enter abre o formulário preenchido".into()
-                }
-                Aba::Recebidos => "Tab para navegar aqui".to_string(),
+                Aba::Anunciados => (
+                    "estimado com a quantidade de hoje · Enter abre o formulário preenchido".into(),
+                    Tone::Aviso,
+                ),
+                Aba::Recebidos => ("Tab para navegar aqui".to_string(), Tone::Dim),
             }),
         }
     }
@@ -467,10 +468,11 @@ impl ModuleView for Vista {
                 rows,
                 selected: Some(self.lista.selecionado),
                 query: self.lista.busca.clone(),
-                note: Some(
+                note: Some((
                     "yield on cost é sobre o que você pagou; yield atual é sobre o preço de hoje"
                         .into(),
-                ),
+                    Tone::Aviso,
+                )),
             });
         }
 
@@ -520,7 +522,7 @@ impl ModuleView for Vista {
                     query: self.lista.busca.clone(),
                     note: match self.aba {
                         Aba::Recebidos => None,
-                        Aba::Anunciados => Some("Tab para navegar aqui".into()),
+                        Aba::Anunciados => Some(("Tab para navegar aqui".into(), Tone::Dim)),
                     },
                 }),
             ),

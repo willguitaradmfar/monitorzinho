@@ -455,10 +455,11 @@ impl ModuleView for Vista {
                     rows,
                     selected: Some(self.lista.selecionado),
                     query: self.lista.busca.clone(),
-                    note: self.erro.clone().or(Some(
+                    note: self.erro.clone().map(|e| (e, Tone::Aviso)).or(Some((
                         "CSV, TSV, TXT, OFX e o JSON de posição da B3 · Enter entra na pasta ou abre · Ctrl+R relista"
                             .into(),
-                    )),
+                        Tone::Dim,
+                    ))),
                 })
             }
             Etapa::Conferindo => {
@@ -607,7 +608,7 @@ impl ModuleView for Vista {
                             rows,
                             selected: Some(self.lista.selecionado),
                             query: self.lista.busca.clone(),
-                            note: Some(resumo),
+                            note: Some((resumo, Tone::Aviso)),
                         }),
                     ),
                     (

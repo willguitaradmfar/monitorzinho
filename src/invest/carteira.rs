@@ -72,6 +72,11 @@ pub struct Totais {
     pub mercado_com_custo: f64,
     pub pnl: f64,
     pub dia: f64,
+    /// O valor de mercado **só das linhas que sabem a variação do dia**. É contra ele que
+    /// a porcentagem do dia é medida: uma fonte que não deu o fechamento anterior não sabe
+    /// quanto aquela posição andou, e pôr o valor dela no denominador diluiria a variação
+    /// das que sabem.
+    pub mercado_com_dia: f64,
     /// Quantas linhas ficaram de fora, e por quê. É o que impede um total incompleto de
     /// parecer completo.
     pub fora_sem_preco: usize,
@@ -90,6 +95,16 @@ impl Totais {
     /// mostra tem que dizer isso ao lado: é para isso que `sem_custo` e `ressalva` existem.
     pub fn pnl_pct(&self) -> Option<f64> {
         (self.custo > 0.0).then(|| self.pnl / self.custo * 100.0)
+    }
+
+    /// A variação do dia em porcentagem, sobre as linhas que a conhecem.
+    ///
+    /// A base é o fechamento de ontem daquelas linhas — `mercado_com_dia - dia` —, e não
+    /// o patrimônio inteiro: dividir a variação de metade da carteira pelo total daria
+    /// sempre um número menor que o real, e ele pareceria um fato.
+    pub fn dia_pct(&self) -> Option<f64> {
+        let ontem = self.mercado_com_dia - self.dia;
+        (ontem > 0.0).then(|| self.dia / ontem * 100.0)
     }
 
     pub fn completo(&self) -> bool {
@@ -219,7 +234,10 @@ pub fn totais(linhas: &[Linha]) -> Totais {
                     // que ela custou não é.
                     None => t.sem_custo += 1,
                 }
-                t.dia += l.dia_brl.unwrap_or(0.0);
+                if let Some(d) = l.dia_brl {
+                    t.dia += d;
+                    t.mercado_com_dia += m;
+                }
                 t.linhas_contadas += 1;
             }
         }
@@ -504,6 +522,35 @@ mod sem_pm_tests {
         assert_eq!(t.sem_custo, 1);
         assert!(!t.completo());
         assert!(t.ressalva().contains("sem preço médio"));
+    }
+
+    #[test]
+    fn a_variacao_do_dia_e_medida_contra_quem_a_conhece() {
+        // Mesma disciplina do P&L: só uma das duas posições tem fechamento anterior, e a
+        // porcentagem do dia é a dela — não a variação diluída pelo patrimônio inteiro.
+        // Pôr no denominador uma posição que não sabe quanto andou dá sempre um número
+        // menor que o real, e ele apareceria como fato.
+        let mut p = Portfolio::default();
+        p.posicoes.push(pos("PETR4", 100.0, Some(30.0)));
+        p.posicoes.push(pos("VALE3", 100.0, Some(70.0)));
+        let mut market = com_preco(&p, &[("PETR4", 50.0), ("VALE3", 80.0)]);
+        // Só a PETR4 traz o fechamento anterior.
+        if let Some(q) = market.quotes.get_mut(&AssetId::parse("B3/PETR4").unwrap()) {
+            q.anterior = Some(40.0);
+        }
+        let t = totais(&linhas(&p, &market, 0));
+
+        assert!((t.dia - 1_000.0).abs() < 1e-6, "100 × (50 − 40)");
+        assert!(
+            (t.mercado_com_dia - 5_000.0).abs() < 1e-6,
+            "só a PETR4 entra na base"
+        );
+        let pct = t.dia_pct().expect("há base");
+        assert!(
+            (pct - 25.0).abs() < 1e-6,
+            "1000 sobre 4000, e não sobre 12000"
+        );
+        assert!(t.mercado > t.mercado_com_dia, "a VALE3 conta no patrimônio");
     }
 
     #[test]

@@ -114,11 +114,11 @@ pub fn linha(
 }
 
 /// O estado das fontes, para a linha que responde «por que este número não mexe».
-pub fn nota_fontes(ctx: &Ctx) -> Option<String> {
+pub fn nota_fontes(ctx: &Ctx) -> Option<(String, Tone)> {
     // Nenhuma fonte na lista é diferente de todas ok: significa que a busca ainda não
     // deu a primeira volta. Dizer isso evita a leitura de que não há o que buscar.
     if ctx.market.fontes.is_empty() {
-        return Some("buscando pela primeira vez…".to_string());
+        return Some(("buscando pela primeira vez…".to_string(), Tone::Aviso));
     }
     let mut partes: Vec<String> = ctx
         .market
@@ -175,7 +175,9 @@ pub fn nota_fontes(ctx: &Ctx) -> Option<String> {
     if sem_preco > 0 {
         partes.push(format!("{sem_preco} sem preço nenhum"));
     }
-    (!partes.is_empty()).then(|| partes.join(" · "))
+    // Amarela, como sempre foi: esta nota fala do estado das fontes, e o estado das
+    // fontes é ressalva, nunca resultado.
+    (!partes.is_empty()).then(|| (partes.join(" · "), Tone::Aviso))
 }
 
 /// Se um ativo está na carteira — o que ganha a marca `●`.

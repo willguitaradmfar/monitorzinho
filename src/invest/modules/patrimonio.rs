@@ -100,7 +100,12 @@ impl InvestModule for Patrimonio {
         if t.dia != 0.0 {
             rows.push((
                 "no dia".into(),
-                format!("R$ {}", calc::moeda(t.dia)),
+                // Reais **e** porcentagem: «R$ 10 mil» não diz se o dia foi bom sem se
+                // saber sobre quanto, e a porcentagem sozinha não diz o tamanho.
+                match t.dia_pct() {
+                    Some(p) => format!("R$ {} ({})", calc::moeda(t.dia), calc::pct(p)),
+                    None => format!("R$ {}", calc::moeda(t.dia)),
+                },
                 crate::invest::modules::heatmap::tom(Some(t.dia)),
             ));
         }
@@ -114,11 +119,15 @@ impl InvestModule for Patrimonio {
                 Tone::Dim,
             ));
         }
-        // O rumo, só pela série — o cartão não busca histórico de preço, porque a home não
-        // vai à rede. Enquanto a série for curta, ele diz que ainda não sabe; a tela cheia
-        // do módulo é que reconstrói do histórico das posições.
-        let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
-        for (nome, de, ate) in periodos(&hoje) {
+        // O rumo, pelas duas fontes — a mesma coisa que a tela cheia faz.
+        //
+        // Antes o cartão olhava só a série do patrimônio, e ela **nunca** vai ter pontos
+        // em agosto: ela começou a existir esta semana. O resultado era «sem série no
+        // período» para sempre, num painel que existe justamente para não precisar entrar
+        // no módulo. Agora ele reconstrói do histórico de preço, como a tela cheia — e o
+        // cache é o mesmo, então não custa uma busca a mais.
+        let hoje_ = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
+        for (nome, de, ate) in periodos(&hoje_) {
             let (texto, tom) = match serie::rumo(ctx.patrimonio, &de, &ate) {
                 Some(r) if r.completo() => (
                     format!(
@@ -128,11 +137,13 @@ impl InvestModule for Patrimonio {
                     ),
                     crate::invest::modules::heatmap::tom(r.pct()),
                 ),
-                Some(r) => (
-                    format!("a série cobre {} de {}", r.cobre, r.pedido),
-                    Tone::Dim,
-                ),
-                None => ("sem série no período".into(), Tone::Dim),
+                _ => match das_posicoes(ctx, &de, &ate) {
+                    Ok(r) => (
+                        format!("{} · {}", calc::pct(r.pct), reais(r.reais)),
+                        crate::invest::modules::heatmap::tom(Some(r.pct)),
+                    ),
+                    Err(e) => (e, Tone::Dim),
+                },
             };
             rows.push((rotulo(nome, &de, &ate), texto, tom));
         }
@@ -206,7 +217,7 @@ impl Reconstrucao {
     fn ressalva(&self) -> Option<String> {
         (self.parados > 0).then(|| {
             format!(
-                "ancorado no patrimônio de agora · {} com série · {} sem cotação, parados",
+                "hoje é o valor ao vivo · {} com série · {} sem cotação, parados",
                 self.com_serie, self.parados
             )
         })
@@ -220,6 +231,108 @@ struct Reconstruido {
     /// Quantos ativos entraram na conta. Uma carteira em que só metade tem série responde
     /// por metade, e a tela diz isso — o número sozinho pareceria falar da carteira toda.
     ativos: usize,
+}
+
+/// Quanto valiam **as posições de hoje** em cada uma das datas pedidas.
+///
+/// Duas regras que fazem a série significar alguma coisa:
+///
+/// * **O mesmo conjunto de ativos em todas as datas.** A primeira versão somava dia a
+///   dia o que estivesse pronto naquele instante, e um papel cuja série ainda não
+///   tinha chegado era pulado calado — o total daquele dia caía um milhão e o gráfico
+///   virava um degrau que não aconteceu.
+/// * **Quem não tem cotação histórica entra parado no valor de hoje.** CDB, Tesouro e
+///   crowdfunding não têm série que se busque, e descartá-los fazia o gráfico do
+///   patrimônio mostrar R$ 919 mil de uma carteira de R$ 1,99 milhão. Parado é a
+///   afirmação certa: não é que valessem zero, é que não se sabe o que mudou — e o
+///   rodapé diz quantos estão assim.
+fn reconstruir(ctx: &Ctx, datas: &[Data]) -> Result<Reconstrucao, String> {
+    use crate::invest::historico::Estado;
+    if datas.is_empty() {
+        return Err("sem período".into());
+    }
+    let alvos: Vec<u64> = datas
+        .iter()
+        .map(|d| d.epoch_inicio(tempo::BRT_OFFSET) + 86_399)
+        .collect();
+    // O valor de hoje de cada linha, já em BRL e já com câmbio e preço informado
+    // resolvidos — é ele que serve de piso para quem não tem série.
+    let linhas = carteira::linhas(ctx.portfolio, ctx.market, ctx.agora);
+
+    let mut buscando = 0usize;
+    let mut parados = 0usize;
+    let mut com_serie = 0usize;
+    let mut valores = vec![0.0f64; datas.len()];
+
+    for l in &linhas {
+        let hoje = l.mercado_brl.unwrap_or(0.0);
+        // Um ano de série cobre seis meses de gráfico e qualquer período passado sem
+        // uma segunda busca.
+        let velas = match ctx
+            .historico
+            .get(ctx.providers, &l.posicao.ativo, Span::Ano)
+        {
+            Estado::Pronta(v) if !v.is_empty() => Some(v),
+            Estado::Buscando => {
+                buscando += 1;
+                None
+            }
+            _ => None,
+        };
+        // Só serve a série que cobre **todas** as datas: uma que começa no meio faria
+        // o ativo aparecer do nada no gráfico.
+        let cobre = velas
+            .as_ref()
+            .is_some_and(|v| alvos.iter().all(|a| v.iter().any(|c| c.em <= *a)));
+        match (velas, cobre) {
+            (Some(velas), true) => {
+                com_serie += 1;
+                for (i, a) in alvos.iter().enumerate() {
+                    // O último pregão **até** a data, sem interpolar: um dia sem
+                    // negócio não vira um preço inventado.
+                    if let Some(c) = velas.iter().rfind(|c| c.em <= *a) {
+                        valores[i] += l.posicao.quantidade * c.fechamento;
+                    }
+                }
+            }
+            _ => {
+                parados += 1;
+                for v in valores.iter_mut() {
+                    *v += hoje;
+                }
+            }
+        }
+    }
+
+    if buscando > 0 {
+        return Err(format!("buscando o histórico de {buscando}…"));
+    }
+    if com_serie == 0 {
+        return Err("nenhuma posição tem histórico para reconstruir".into());
+    }
+    Ok(Reconstrucao {
+        valores,
+        com_serie,
+        parados,
+    })
+}
+
+/// Quanto as posições de hoje andaram na janela, pelo histórico de preço delas.
+///
+/// Não é a variação do patrimônio: um aporte feito no meio da janela aparece aqui como
+/// se o papel tivesse subido. Por isso a frase que sai daqui **se nomeia**.
+fn das_posicoes(ctx: &Ctx, de: &Data, ate: &Data) -> Result<Reconstruido, String> {
+    let r = reconstruir(ctx, &[*de, *ate])?;
+    let (antes, depois) = (r.valores[0], r.valores[1]);
+    let ativos = r.com_serie;
+    if antes <= 0.0 {
+        return Err("sem histórico para reconstruir".into());
+    }
+    Ok(Reconstruido {
+        reais: depois - antes,
+        pct: (depois / antes - 1.0) * 100.0,
+        ativos,
+    })
 }
 
 impl Vista {
@@ -253,7 +366,7 @@ impl Vista {
                 // hoje — outra pergunta, e por isso o rótulo muda junto.
                 _ => {
                     let rotulo = format!("{} · posições", rotulo(nome, &de, &ate));
-                    match self.das_posicoes(ctx, &de, &ate) {
+                    match das_posicoes(ctx, &de, &ate) {
                         Ok(r) => linhas.push((
                             rotulo,
                             format!(
@@ -270,108 +383,6 @@ impl Vista {
             }
         }
         linhas
-    }
-
-    /// Quanto as posições de hoje andaram na janela, pelo histórico de preço delas.
-    ///
-    /// Não é a variação do patrimônio: um aporte feito no meio da janela aparece aqui como
-    /// se o papel tivesse subido. Por isso a frase que sai daqui **se nomeia**.
-    fn das_posicoes(&self, ctx: &Ctx, de: &Data, ate: &Data) -> Result<Reconstruido, String> {
-        let r = self.reconstruir(ctx, &[*de, *ate])?;
-        let (antes, depois) = (r.valores[0], r.valores[1]);
-        let ativos = r.com_serie;
-        if antes <= 0.0 {
-            return Err("sem histórico para reconstruir".into());
-        }
-        Ok(Reconstruido {
-            reais: depois - antes,
-            pct: (depois / antes - 1.0) * 100.0,
-            ativos,
-        })
-    }
-
-    /// Quanto valiam **as posições de hoje** em cada uma das datas pedidas.
-    ///
-    /// Duas regras que fazem a série significar alguma coisa:
-    ///
-    /// * **O mesmo conjunto de ativos em todas as datas.** A primeira versão somava dia a
-    ///   dia o que estivesse pronto naquele instante, e um papel cuja série ainda não
-    ///   tinha chegado era pulado calado — o total daquele dia caía um milhão e o gráfico
-    ///   virava um degrau que não aconteceu.
-    /// * **Quem não tem cotação histórica entra parado no valor de hoje.** CDB, Tesouro e
-    ///   crowdfunding não têm série que se busque, e descartá-los fazia o gráfico do
-    ///   patrimônio mostrar R$ 919 mil de uma carteira de R$ 1,99 milhão. Parado é a
-    ///   afirmação certa: não é que valessem zero, é que não se sabe o que mudou — e o
-    ///   rodapé diz quantos estão assim.
-    fn reconstruir(&self, ctx: &Ctx, datas: &[Data]) -> Result<Reconstrucao, String> {
-        use crate::invest::historico::Estado;
-        if datas.is_empty() {
-            return Err("sem período".into());
-        }
-        let alvos: Vec<u64> = datas
-            .iter()
-            .map(|d| d.epoch_inicio(tempo::BRT_OFFSET) + 86_399)
-            .collect();
-        // O valor de hoje de cada linha, já em BRL e já com câmbio e preço informado
-        // resolvidos — é ele que serve de piso para quem não tem série.
-        let linhas = carteira::linhas(ctx.portfolio, ctx.market, ctx.agora);
-
-        let mut buscando = 0usize;
-        let mut parados = 0usize;
-        let mut com_serie = 0usize;
-        let mut valores = vec![0.0f64; datas.len()];
-
-        for l in &linhas {
-            let hoje = l.mercado_brl.unwrap_or(0.0);
-            // Um ano de série cobre seis meses de gráfico e qualquer período passado sem
-            // uma segunda busca.
-            let velas = match ctx
-                .historico
-                .get(ctx.providers, &l.posicao.ativo, Span::Ano)
-            {
-                Estado::Pronta(v) if !v.is_empty() => Some(v),
-                Estado::Buscando => {
-                    buscando += 1;
-                    None
-                }
-                _ => None,
-            };
-            // Só serve a série que cobre **todas** as datas: uma que começa no meio faria
-            // o ativo aparecer do nada no gráfico.
-            let cobre = velas
-                .as_ref()
-                .is_some_and(|v| alvos.iter().all(|a| v.iter().any(|c| c.em <= *a)));
-            match (velas, cobre) {
-                (Some(velas), true) => {
-                    com_serie += 1;
-                    for (i, a) in alvos.iter().enumerate() {
-                        // O último pregão **até** a data, sem interpolar: um dia sem
-                        // negócio não vira um preço inventado.
-                        if let Some(c) = velas.iter().rfind(|c| c.em <= *a) {
-                            valores[i] += l.posicao.quantidade * c.fechamento;
-                        }
-                    }
-                }
-                _ => {
-                    parados += 1;
-                    for v in valores.iter_mut() {
-                        *v += hoje;
-                    }
-                }
-            }
-        }
-
-        if buscando > 0 {
-            return Err(format!("buscando o histórico de {buscando}…"));
-        }
-        if com_serie == 0 {
-            return Err("nenhuma posição tem histórico para reconstruir".into());
-        }
-        Ok(Reconstrucao {
-            valores,
-            com_serie,
-            parados,
-        })
     }
 
     /// O total de patrimônio no fim de cada um dos últimos seis meses.
@@ -431,7 +442,7 @@ impl Vista {
 
         let (mut valores, nota) = match da_serie {
             Some(v) => (v, None),
-            None => match self.reconstruir(ctx, &datas) {
+            None => match reconstruir(ctx, &datas) {
                 Ok(r) => {
                     let nota = r.ressalva();
                     (r.valores, nota)
@@ -449,27 +460,24 @@ impl Vista {
             },
         };
 
-        // **A ponta direita é o patrimônio de agora.**
+        // **A ponta direita é o patrimônio de agora — e só ela.**
         //
-        // O histórico de preço termina no último pregão fechado — hoje ele acaba na
-        // sexta —, então o último ponto reconstruído era o fechamento de dias atrás
-        // enquanto o painel ao lado mostrava o valor ao vivo. Dois números diferentes
-        // para «hoje» na mesma tela é a definição de não refletir a realidade.
+        // O histórico de preço termina no último pregão fechado, então o último ponto
+        // reconstruído era o fechamento de dias atrás enquanto o painel ao lado mostrava o
+        // valor ao vivo. Dois números diferentes para «hoje» na mesma tela.
         //
-        // A curva inteira é reescalada pela mesma razão, e não só o último ponto: o que o
-        // histórico tem a dizer é a **forma**, e a âncora é o valor que se sabe de fato.
+        // A primeira correção reescalava a **curva inteira** pela razão entre os dois, e
+        // isso era pior: o valor de uma terça-feira passada mudava porque a PETR4 andou
+        // hoje. Medido, a forma ficava igual e o nível deslizava alguns milhares a cada
+        // abertura. O passado é fato e não se mexe; só o ponto de hoje é substituído.
         let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
         if datas.last() == Some(&hoje)
-            && let Some(ultimo) = valores.last().copied()
-            && ultimo > 0.0
+            && let Some(ultimo) = valores.last_mut()
         {
             let agora =
                 carteira::totais(&carteira::linhas(ctx.portfolio, ctx.market, ctx.agora)).mercado;
             if agora > 0.0 {
-                let fator = agora / ultimo;
-                for v in valores.iter_mut() {
-                    *v *= fator;
-                }
+                *ultimo = agora;
             }
         }
 
@@ -487,15 +495,13 @@ impl Vista {
     ///
     /// Não é um consolo: é a decomposição que o módulo passa a mostrar **junto** com a
     /// curva depois. O que falta no primeiro dia é a série, não o retrato.
-    fn hoje(&self, ctx: &Ctx, pontos: usize) -> Layout {
-        if ctx.portfolio.posicoes.is_empty() {
-            return Layout::one(Pane::Empty {
-                title: "Patrimônio".into(),
-                note: "Sem posições, não há patrimônio a somar.\n\n\
-                       Importe em Importação, ou adicione à mão em Posições."
-                    .into(),
-            });
-        }
+    /// O painel de cima: quanto se tem agora, e como isso está repartido.
+    ///
+    /// **Uma linha só, usada pelas duas telas.** Antes ela existia apenas no primeiro dia
+    /// de uso; quando a série ganhava o segundo ponto a tela trocava a resposta de «quanto
+    /// eu tenho» por uma curva, e o número que se vem ver saía do alto. A curva do período
+    /// não some — ela é o gráfico dia a dia logo abaixo, com eixo e escala.
+    fn painel_de_valores(&self, ctx: &Ctx) -> Layout {
         let linhas = carteira::linhas(ctx.portfolio, ctx.market, ctx.agora);
         let t = carteira::totais(&linhas);
 
@@ -535,7 +541,12 @@ impl Vista {
         if t.dia != 0.0 {
             fatos.push((
                 "no dia".into(),
-                format!("R$ {}", calc::moeda(t.dia)),
+                // Reais **e** porcentagem: «R$ 10 mil» não diz se o dia foi bom sem se
+                // saber sobre quanto, e a porcentagem sozinha não diz o tamanho.
+                match t.dia_pct() {
+                    Some(p) => format!("R$ {} ({})", calc::moeda(t.dia), calc::pct(p)),
+                    None => format!("R$ {}", calc::moeda(t.dia)),
+                },
                 crate::invest::modules::heatmap::tom(Some(t.dia)),
             ));
         }
@@ -560,35 +571,46 @@ impl Vista {
                 .collect()
         };
 
-        Layout::rows(vec![
+        Layout::cols(vec![
             (
-                2,
-                Layout::cols(vec![
-                    (
-                        1,
-                        Layout::one(Pane::Facts {
-                            title: "Hoje".into(),
-                            rows: fatos,
-                        }),
-                    ),
-                    (
-                        1,
-                        Layout::one(Pane::Bars {
-                            title: "Por classe".into(),
-                            rows: barras(|l| l.posicao.classe.label().to_string()),
-                            full: None,
-                        }),
-                    ),
-                    (
-                        1,
-                        Layout::one(Pane::Bars {
-                            title: "Por corretora".into(),
-                            rows: barras(|l| l.posicao.fonte.clone()),
-                            full: None,
-                        }),
-                    ),
-                ]),
+                1,
+                Layout::one(Pane::Facts {
+                    title: "Hoje".into(),
+                    rows: fatos,
+                }),
             ),
+            (
+                1,
+                Layout::one(Pane::Bars {
+                    title: "Por classe".into(),
+                    rows: barras(|l| l.posicao.classe.label().to_string()),
+                    full: None,
+                }),
+            ),
+            (
+                1,
+                Layout::one(Pane::Bars {
+                    title: "Por corretora".into(),
+                    rows: barras(|l| l.posicao.fonte.clone()),
+                    full: None,
+                }),
+            ),
+        ])
+    }
+
+    /// A tela do primeiro dia: o painel de valores, os gráficos, e o aviso de que a
+    /// curva do período ainda não tem dois pontos.
+    fn hoje(&self, ctx: &Ctx, pontos: usize) -> Layout {
+        if ctx.portfolio.posicoes.is_empty() {
+            return Layout::one(Pane::Empty {
+                title: "Patrimônio".into(),
+                note: "Sem posições, não há patrimônio a somar.\n\n\
+                       Importe em Importação, ou adicione à mão em Posições."
+                    .into(),
+            });
+        }
+        Layout::rows(vec![
+            (2, self.painel_de_valores(ctx)),
             (
                 2,
                 Layout::cols(vec![
@@ -604,9 +626,7 @@ impl Vista {
                         "Há {} ponto(s) na série, e uma curva precisa de dois.\n\n\
                          Um ponto é gravado por dia, no primeiro tique da aba naquele dia \n\
                          — e um dia sem o programa aberto fica como lacuna, e não como \n\
-                         linha reta que não aconteceu.\n\n\
-                         Reconstruir o passado a partir de lançamentos e histórico de \n\
-                         preços é possível e caro, e ficou de fora desta versão.",
+                         linha reta que não aconteceu.",
                         pontos
                     ),
                 }),
@@ -639,13 +659,6 @@ impl ModuleView for Vista {
             return self.hoje(ctx, janela.len());
         }
 
-        let valores: Vec<f64> = janela.iter().map(|p| p.total_brl).collect();
-        // As datas da própria série: um ponto por dia, e o eixo diz quais.
-        let rotulos: Vec<String> = janela
-            .iter()
-            .filter_map(|p| p.data())
-            .map(|d| format!("{:02}/{:02}", d.dia, d.mes))
-            .collect();
         let decomposicao = serie::decompor(&janela);
         let lacunas = serie::lacunas(&janela);
 
@@ -690,20 +703,15 @@ impl ModuleView for Vista {
             ));
         }
 
+        // Os valores em cima, os gráficos embaixo — e **a mesma ordem do primeiro dia**.
+        //
+        // A curva do período ficava no alto e empurrava para o rodapé o número que se vem
+        // ver. Ela também não fazia falta: o gráfico dia a dia logo abaixo desenha a mesma
+        // coisa, com eixo rotulado e escala escrita, o que a curva não tinha.
         Layout::rows(vec![
+            (2, self.painel_de_valores(ctx)),
             (
                 3,
-                Layout::one(Pane::Chart {
-                    title: format!("Patrimônio · {}", PERIODOS[self.periodo].0),
-                    series: valores,
-                    format: |v| format!("R$ {}", calc::moeda(v)),
-                    marks: Vec::new(),
-                    x_labels: rotulos,
-                    note: None,
-                }),
-            ),
-            (
-                2,
                 Layout::cols(vec![
                     (1, Layout::one(self.diario(ctx))),
                     (1, Layout::one(self.mensal(ctx))),
