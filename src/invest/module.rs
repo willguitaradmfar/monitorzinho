@@ -16,7 +16,7 @@
 use crossterm::event::KeyEvent;
 
 use crate::invest::model::{
-    Alerta, AssetId, Lancamento, Meta, Portfolio, PosKey, Position, Provento,
+    Alerta, AssetId, Carteira, Lancamento, Portfolio, PosKey, Position, Provento,
 };
 use crate::invest::provider::MarketSnapshot;
 
@@ -60,7 +60,6 @@ pub enum Need {
     Cotacao,
     Cambio,
     Historico,
-    Lancamentos,
     /// Precisa de uma fonte que este build não tem. A linha diz qual.
     Provedor(&'static str),
 }
@@ -137,16 +136,27 @@ pub enum Edit {
     RemoverProvento(usize),
     AddLancamento(Box<Lancamento>),
     RemoverLancamento(usize),
-    SetMetas(Vec<Meta>),
     SetAlertas(Vec<Alerta>),
-    SetPrejuizoAbertura(String, f64),
+    /// Cria ou substitui uma carteira recomendada, pelo nome.
+    ///
+    /// Uma operação só porque a carteira é uma coisa só: mexer num alvo e gravar a lista
+    /// inteira mantém a tela e o arquivo sempre de acordo, sem um caminho em que metade
+    /// da mudança foi aplicada.
+    SetCarteira(Box<Carteira>),
+    /// Apaga uma carteira recomendada, e desmarca os ativos que apontavam para ela.
+    RemoverCarteira(String),
+    /// Diz de qual carteira um ativo é. `None` o desmarca.
+    ///
+    /// Aplica-se a **todas** as linhas daquele ativo, em qualquer corretora: o vínculo é
+    /// do papel, não da posição, e duas linhas discordando fariam o mesmo dinheiro contar
+    /// em duas carteiras.
+    SetCarteiraDoAtivo(AssetId, Option<String>),
     SetSetor(AssetId, String),
     /// O mapeamento de colunas aprendido para uma fonte — o que faz a segunda
     /// importação daquela corretora não perguntar nada.
     SetMapeamento(String, std::collections::BTreeMap<String, String>),
     AddFeed(String),
     RemoveFeed(String),
-    SetFita(Vec<AssetId>),
     /// Substitui as posições de uma fonte inteira — a importação. É uma operação só
     /// porque ela **tem** que ser atômica: metade de uma importação aplicada é uma
     /// carteira que não corresponde a nada.
@@ -465,6 +475,30 @@ pub trait InvestModule: Send + Sync {
         None
     }
 
+    /// Os cartões que este módulo põe na home.
+    ///
+    /// Quase todo módulo põe **um**, com o nome dele — é o que o padrão faz. Carteiras
+    /// recomendadas põe **um por carteira**: cada uma é uma coisa que se acompanha por si,
+    /// e uma linha «3 carteiras» num painel não responde nada sobre nenhuma delas.
+    ///
+    /// Vale a mesma regra de `widget`: nunca bloqueia.
+    fn cartazes(&self, ctx: &Ctx) -> Vec<Cartaz> {
+        vec![Cartaz {
+            titulo: self.name().to_string(),
+            sub: None,
+            pane: self.widget(ctx),
+        }]
+    }
+
+    /// Abre **numa coisa específica** de dentro do módulo — a carteira do cartão que foi
+    /// apertado, por exemplo.
+    ///
+    /// O padrão ignora o `sub` e abre como sempre: só quem põe mais de um cartão precisa
+    /// saber em qual deles a tecla foi.
+    fn open_em(&self, ctx: &Ctx, _sub: Option<&str>) -> Box<dyn ModuleView> {
+        self.open(ctx, None)
+    }
+
     /// Abre. É aqui, e só aqui, que qualquer custo nasce.
     ///
     /// `alvo` é o ativo em que o módulo deve abrir, quando quem pediu tinha um sob o
@@ -477,6 +511,15 @@ pub trait InvestModule: Send + Sync {
     fn keywords(&self) -> &'static str {
         ""
     }
+}
+
+/// Um cartão que um módulo põe na home.
+pub struct Cartaz {
+    pub titulo: String,
+    /// Que coisa dentro do módulo este cartão representa — o nome de uma carteira. `None`
+    /// no caso comum, em que o cartão é o módulo inteiro.
+    pub sub: Option<String>,
+    pub pane: Option<Pane>,
 }
 
 /// A tela viva de um módulo.
@@ -628,7 +671,7 @@ mod alvo_tests {
         let ctx = ctx_de_teste(&portfolio, &market, &providers);
 
         let alvo = AssetId::new(Market::Fx, "USDBRL");
-        for id in ["grafico", "indicadores", "comparador"] {
+        for id in ["grafico", "indicadores"] {
             let m = modules::todos()
                 .into_iter()
                 .find(|m| m.id() == id)

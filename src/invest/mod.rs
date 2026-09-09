@@ -30,6 +30,7 @@ pub mod b3;
 pub mod calc;
 pub mod calendario;
 pub mod carteira;
+pub mod carteiras;
 pub mod csv;
 pub mod feed;
 pub mod fundamento;
@@ -197,9 +198,6 @@ impl InvestState {
         for need in m.needs() {
             let falta = match need {
                 Need::Posicoes if ctx.portfolio.posicoes.is_empty() => Some("sem posições"),
-                Need::Lancamentos if ctx.portfolio.lancamentos.is_empty() => {
-                    Some("sem lançamentos")
-                }
                 Need::Cotacao if ctx.market.quotes.is_empty() => Some("sem cotação"),
                 Need::Cambio if ctx.market.taxa(model::Moeda::Usd).is_none() => Some("sem câmbio"),
                 Need::Historico if !self.tem_historico() => Some("sem histórico"),
@@ -480,10 +478,38 @@ impl InvestState {
                     self.portfolio.lancamentos.remove(i);
                 }
             }
-            E::SetMetas(m) => self.portfolio.metas = m,
             E::SetAlertas(a) => self.portfolio.alertas = a,
-            E::SetPrejuizoAbertura(cat, v) => {
-                self.portfolio.prejuizo_abertura.insert(cat, v);
+            E::SetCarteira(c) => {
+                match self
+                    .portfolio
+                    .carteiras
+                    .iter_mut()
+                    .find(|x| x.nome == c.nome)
+                {
+                    Some(slot) => *slot = *c,
+                    None => self.portfolio.carteiras.push(*c),
+                }
+            }
+            E::RemoverCarteira(nome) => {
+                self.portfolio.carteiras.retain(|c| c.nome != nome);
+                // Um vínculo apontando para uma carteira que não existe mais é uma
+                // posição que nenhuma tela soma. Some junto.
+                for p in &mut self.portfolio.posicoes {
+                    if p.carteira.as_deref() == Some(nome.as_str()) {
+                        p.carteira = None;
+                    }
+                }
+            }
+            E::SetCarteiraDoAtivo(ativo, carteira) => {
+                for p in self
+                    .portfolio
+                    .posicoes
+                    .iter_mut()
+                    .filter(|p| p.ativo == ativo)
+                {
+                    p.carteira.clone_from(&carteira);
+                    p.atualizado_em = agora;
+                }
             }
             E::SetSetor(a, setor) => {
                 self.portfolio.setores.insert(a.to_string(), setor);
@@ -497,7 +523,6 @@ impl InvestState {
                 }
             }
             E::RemoveFeed(url) => self.portfolio.feeds.retain(|f| *f != url),
-            E::SetFita(f) => self.portfolio.fita = f,
             E::SubstituirFonte { fonte, posicoes } => {
                 // O preço médio informado **sobrevive** à substituição.
                 //
@@ -626,6 +651,7 @@ mod tests {
             preco_manual: None,
             preco_manual_em: None,
             atualizado_em: 0,
+            carteira: None,
         })));
         assert!(s.sujo);
         // Informar preço de mercado não pode mexer no custo.
@@ -653,6 +679,7 @@ mod tests {
             preco_manual: None,
             preco_manual_em: None,
             atualizado_em: 0,
+            carteira: None,
         };
         s.aplicar(module::Edit::UpsertPosicao(Box::new(nova("a", "PETR4"))));
         s.aplicar(module::Edit::UpsertPosicao(Box::new(nova("b", "VALE3"))));
@@ -699,6 +726,7 @@ mod tests {
                 preco_manual: None,
                 preco_manual_em: None,
                 atualizado_em: 0,
+                carteira: None,
             }
         }
 

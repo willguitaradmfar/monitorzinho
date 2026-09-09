@@ -244,31 +244,9 @@ impl Provider for Bcb {
     }
 }
 
-/// Acumula uma série de taxas diárias em porcento. **Por produto, nunca por soma**: somar
-/// taxas diárias é o erro clássico, e num ano de CDI alto ele erra por vários décimos de
-/// ponto percentual.
-pub fn acumular(taxas: &[f64]) -> f64 {
-    (taxas.iter().fold(1.0, |acc, t| acc * (1.0 + t / 100.0)) - 1.0) * 100.0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn acumular_e_produto_e_nao_soma() {
-        // Trinta dias a 0,05% ao dia. A soma daria 1,5000%; o produto dá um pouco mais.
-        let taxas = vec![0.05; 30];
-        let composto = acumular(&taxas);
-        let somado = 30.0 * 0.05;
-        assert!(composto > somado, "juro composto tem que passar da soma");
-        assert!((composto - 1.5105).abs() < 0.001, "deu {composto}");
-    }
-
-    #[test]
-    fn acumular_serie_vazia_e_zero() {
-        assert_eq!(acumular(&[]), 0.0);
-    }
 
     #[test]
     fn data_brasileira_e_lida() {

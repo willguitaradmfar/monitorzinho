@@ -306,6 +306,13 @@ pub struct Position {
     /// Quando a linha inteira foi importada ou editada.
     #[serde(default)]
     pub atualizado_em: u64,
+    /// A carteira recomendada de que este ativo participa, pelo nome.
+    ///
+    /// **Uma só por ativo**, e a regra é mantida na aplicação da edição: marcar um papel
+    /// como de uma carteira marca todas as linhas dele, em qualquer corretora. Um ativo
+    /// que estivesse em duas carteiras seria contado duas vezes no que aportar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carteira: Option<String>,
 }
 
 impl Position {
@@ -483,23 +490,50 @@ impl TipoLancamento {
     }
 }
 
-/// Uma meta: de aporte, que só depende de quem investe, ou de patrimônio, que depende
-/// também do mercado. A distinção não é cosmética — ver `docs/invest/52`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Meta {
-    pub tipo: TipoMeta,
-    pub valor: f64,
-    /// Epoch do prazo, para uma meta de patrimônio. Ignorado numa de aporte.
+/// Uma carteira recomendada: **o alvo, não a posição**.
+///
+/// Ela descreve para onde a carteira deve ir — que ativos, em que proporção, e até que
+/// preço vale a pena comprar. O que se tem de fato continua sendo as `Position`; a
+/// diferença entre as duas é o que este módulo calcula.
+///
+/// Os percentuais **não** são normalizados nem obrigados a somar cem. Somar noventa é uma
+/// carteira com dez por cento em caixa, e somar cento e dez é um erro de quem digitou —
+/// os dois são informação, e corrigir em silêncio esconderia o segundo.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Carteira {
+    pub nome: String,
     #[serde(default)]
-    pub prazo: Option<u64>,
+    pub alvos: Vec<AlvoCarteira>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum TipoMeta {
-    #[serde(rename = "aporte_mensal")]
-    AporteMensal,
-    #[serde(rename = "patrimonio")]
-    Patrimonio,
+/// Um ativo dentro de uma carteira recomendada.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AlvoCarteira {
+    /// A posição do ativo na recomendação — o `1`, `2`, `3` da lista publicada.
+    ///
+    /// **É a ordem do analista, e a tela a respeita.** Ordenar pelo que falta comprar era
+    /// impor um critério nosso sobre uma lista que já vem priorizada, e a prioridade é
+    /// parte da recomendação: o primeiro da lista é o primeiro por uma razão que este
+    /// programa não conhece.
+    #[serde(default)]
+    pub ordem: u32,
+    pub ativo: AssetId,
+    /// Quanto por cento da carteira ele deve ocupar.
+    pub percentual: f64,
+    /// O preço máximo que se aceita pagar por ele.
+    ///
+    /// `None` é «sem teto», e é diferente de zero: zero significaria «nunca comprar». Um
+    /// ativo acima do teto **não** some da conta — ele aparece com o aporte suspenso e a
+    /// razão ao lado, porque o alvo continua sendo o alvo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teto: Option<f64>,
+}
+
+impl Carteira {
+    /// Quanto os alvos somam. Cem é o esperado, e o que difere disso a tela mostra.
+    pub fn soma(&self) -> f64 {
+        self.alvos.iter().map(|a| a.percentual).sum()
+    }
 }
 
 /// Uma regra de alerta. É uma `Execution` com outro nome — ver `docs/invest/42`.
@@ -575,13 +609,7 @@ pub struct Portfolio {
     #[serde(default)]
     pub lancamentos: Vec<Lancamento>,
     #[serde(default)]
-    pub metas: Vec<Meta>,
-    #[serde(default)]
     pub alertas: Vec<Alerta>,
-    /// Prejuízo acumulado de antes de o programa começar a ser usado, por categoria.
-    /// Sem poder informá-lo, o módulo de imposto erra desde o primeiro mês.
-    #[serde(default)]
-    pub prejuizo_abertura: BTreeMap<String, f64>,
     /// Setor informado por ativo. Informado, e não raspado: um setor errado é pior que um
     /// setor em branco, porque leva a uma conclusão sobre concentração.
     #[serde(default)]
@@ -590,10 +618,11 @@ pub struct Portfolio {
     /// importação de uma tarefa chata numa que se usa todo mês.
     #[serde(default)]
     pub mapeamentos: BTreeMap<String, BTreeMap<String, String>>,
+    /// As carteiras recomendadas — o alvo para onde a carteira de verdade caminha.
+    #[serde(default)]
+    pub carteiras: Vec<Carteira>,
     #[serde(default)]
     pub feeds: Vec<String>,
-    #[serde(default)]
-    pub fita: Vec<AssetId>,
 }
 
 pub const VERSAO_ATUAL: u32 = 1;
@@ -616,13 +645,11 @@ impl Default for Portfolio {
             alvos: BTreeMap::new(),
             proventos: Vec::new(),
             lancamentos: Vec::new(),
-            metas: Vec::new(),
             alertas: Vec::new(),
-            prejuizo_abertura: BTreeMap::new(),
             setores: BTreeMap::new(),
             mapeamentos: BTreeMap::new(),
+            carteiras: Vec::new(),
             feeds: Vec::new(),
-            fita: Vec::new(),
         }
     }
 }
@@ -637,7 +664,7 @@ impl Portfolio {
                 out.push(p.ativo.clone());
             }
         }
-        for a in self.watchlist.iter().chain(self.fita.iter()) {
+        for a in self.watchlist.iter() {
             if !out.contains(a) {
                 out.push(a.clone());
             }
@@ -712,6 +739,7 @@ mod tests {
             preco_manual: None,
             preco_manual_em: None,
             atualizado_em: 0,
+            carteira: None,
         };
         p.upsert(base.clone());
         p.upsert(base.clone());
@@ -739,6 +767,7 @@ mod tests {
             preco_manual: None,
             preco_manual_em: None,
             atualizado_em: 0,
+            carteira: None,
         };
         let mut b = a.clone();
         b.fonte = "b".into();
@@ -771,6 +800,7 @@ mod tests {
             preco_manual: None,
             preco_manual_em: None,
             atualizado_em: 0,
+            carteira: None,
         };
         assert!(p.validate().is_err(), "quantidade zero não é posição");
         p.quantidade = 100.0;

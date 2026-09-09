@@ -311,8 +311,19 @@ impl Vista {
         saida
     }
 
-    fn abrir_form(&mut self, existente: Option<&Position>) {
+    fn abrir_form(&mut self, existente: Option<&Position>, ctx: &Ctx) {
         let p = existente.cloned();
+        // As carteiras recomendadas cadastradas, mais a opção de não estar em nenhuma.
+        // Um campo de escolha e não de texto: o nome tem que casar com uma que existe,
+        // e digitar à mão é a forma mais fácil de criar um vínculo que não aponta para
+        // lugar nenhum.
+        let mut carteiras = vec![SEM_CARTEIRA.to_string()];
+        carteiras.extend(ctx.portfolio.carteiras.iter().map(|c| c.nome.clone()));
+        let carteira_atual = p
+            .as_ref()
+            .and_then(|p| p.carteira.clone())
+            .filter(|c| carteiras.iter().any(|x| x == c))
+            .unwrap_or_else(|| SEM_CARTEIRA.to_string());
         let classes: Vec<String> = Classe::ALL.iter().map(|c| c.code().to_string()).collect();
         let moedas: Vec<String> = Moeda::ALL.iter().map(|m| m.code().to_string()).collect();
         self.form = Some(Formulario::novo(
@@ -382,10 +393,20 @@ impl Vista {
                         .unwrap_or_default(),
                     "Só onde não há cotação ao vivo. É valor de mercado, não custo",
                 ),
+                Field::choice(
+                    "carteira",
+                    carteira_atual,
+                    carteiras,
+                    "De qual carteira recomendada este ativo é. Uma só por ativo",
+                ),
             ],
         ));
     }
 }
+
+/// O rótulo de «não pertence a carteira nenhuma». Um valor de escolha e não o vazio,
+/// porque um campo de escolha em branco parece um campo por preencher.
+pub const SEM_CARTEIRA: &str = "(nenhuma)";
 
 /// Monta a posição a partir do formulário, recusando com a caixa aberta o que não pode
 /// ser gravado. Função livre e não método: ela não olha para o estado da vista, e sendo
@@ -423,6 +444,7 @@ fn ler_form(form: &Formulario) -> Result<Position, String> {
         preco_manual,
         preco_manual_em: preco_manual.map(|_| 0),
         atualizado_em: 0,
+        carteira: None,
     };
     p.validate()?;
     Ok(p)
@@ -576,12 +598,22 @@ impl ModuleView for Vista {
                 match ler_form(form) {
                     Ok(p) => {
                         let setor = form.valor("setor").trim().to_string();
+                        let carteira = form.valor("carteira");
                         let ativo = p.ativo.clone();
                         self.form = None;
                         let mut edits = vec![Edit::UpsertPosicao(Box::new(p))];
                         if !setor.is_empty() {
-                            edits.push(Edit::SetSetor(ativo, setor));
+                            edits.push(Edit::SetSetor(ativo.clone(), setor));
                         }
+                        // Depois do upsert, e sobre **todas** as linhas do ativo: o
+                        // vínculo é do papel, não desta linha. Ver `Edit::SetCarteiraDoAtivo`.
+                        edits.push(Edit::SetCarteiraDoAtivo(
+                            ativo,
+                            match carteira.as_str() {
+                                SEM_CARTEIRA | "" => None,
+                                nome => Some(nome.to_string()),
+                            },
+                        ));
                         return Outcome::Editar(edits);
                     }
                     // Falhar com a caixa ainda aberta é a diferença entre corrigir e
@@ -624,7 +656,7 @@ impl ModuleView for Vista {
             // que funcionar *enquanto* se procura — que é geralmente como se descobre que
             // a posição não existe.
             KeyCode::Char('a') if ctrl => {
-                self.abrir_form(None);
+                self.abrir_form(None, ctx);
                 Outcome::Ok
             }
             KeyCode::Char('g') if ctrl => {
@@ -637,7 +669,7 @@ impl ModuleView for Vista {
                     && let Some(l) = linhas.get(i)
                 {
                     let p = l.posicao.clone();
-                    self.abrir_form(Some(&p));
+                    self.abrir_form(Some(&p), ctx);
                 }
                 Outcome::Ok
             }

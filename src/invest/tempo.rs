@@ -121,11 +121,6 @@ impl Data {
         format!("{:02}/{:02}/{}", self.dia, self.mes, self.ano)
     }
 
-    /// `2026-09` — a chave de um mês, que ordena alfabeticamente na ordem certa.
-    pub fn chave_mes(&self) -> String {
-        format!("{}-{:02}", self.ano, self.mes)
-    }
-
     pub fn mes_anterior(&self) -> Data {
         match self.mes {
             1 => Data {
@@ -284,32 +279,6 @@ mod tests {
         };
         assert_eq!(dez.mes_seguinte().mes, 1);
         assert_eq!(dez.mes_seguinte().ano, 2027);
-    }
-
-    #[test]
-    fn chave_de_mes_ordena_alfabeticamente_na_ordem_certa() {
-        let mut chaves = vec![
-            Data {
-                ano: 2026,
-                mes: 10,
-                dia: 1,
-            }
-            .chave_mes(),
-            Data {
-                ano: 2026,
-                mes: 2,
-                dia: 1,
-            }
-            .chave_mes(),
-            Data {
-                ano: 2025,
-                mes: 12,
-                dia: 1,
-            }
-            .chave_mes(),
-        ];
-        chaves.sort();
-        assert_eq!(chaves, vec!["2025-12", "2026-02", "2026-10"]);
     }
 
     #[test]

@@ -19,11 +19,12 @@ use crate::invest::modules::comum::{Formulario, Lista, hint, sem_preco};
 pub struct Indices;
 
 /// Os indicadores que valem a pena mostrar, e de onde cada um vem hoje.
+///
+/// As séries do Banco Central **não** estão escritas aqui: elas vêm do catálogo do
+/// provedor, em `providers::bcb::SERIES`. Duas listas seriam duas chances de discordarem,
+/// e foi para cá que a tela de Renda fixa se mudou — ela existia só para mostrar essas
+/// séries, e mostrar juro num módulo e câmbio noutro separava coisas que se leem juntas.
 const MACRO: &[(&str, Market, &str)] = &[
-    ("SELIC-META", Market::Bcb, "Selic (meta)"),
-    ("SELIC", Market::Bcb, "Selic (efetiva a.a.)"),
-    ("CDI", Market::Bcb, "CDI (ao dia)"),
-    ("IPCA", Market::Bcb, "IPCA (mensal)"),
     ("USDBRL", Market::Fx, "USD/BRL"),
     ("EURBRL", Market::Fx, "EUR/BRL"),
     ("BTCBRL", Market::Binance, "Bitcoin (BRL)"),
@@ -37,6 +38,20 @@ const MACRO: &[(&str, Market, &str)] = &[
     ("VIX", Market::Outro, "VIX"),
     ("UST10Y", Market::Outro, "Treasury 10 anos"),
 ];
+
+/// Todos os indicadores da tela: o catálogo do Banco Central primeiro — juro e inflação
+/// são o pano de fundo de tudo — e depois câmbio, cripto e os índices de bolsa.
+fn indicadores() -> Vec<(AssetId, &'static str)> {
+    crate::invest::providers::bcb::SERIES
+        .iter()
+        .map(|s| (AssetId::new(Market::Bcb, s.simbolo), s.nome))
+        .chain(
+            MACRO
+                .iter()
+                .map(|(simbolo, mercado, nome)| (AssetId::new(*mercado, *simbolo), *nome)),
+        )
+        .collect()
+}
 
 impl InvestModule for Indices {
     fn id(&self) -> &'static str {
@@ -59,23 +74,24 @@ impl InvestModule for Indices {
     }
 
     fn summary(&self, ctx: &Ctx) -> String {
-        let vivos = MACRO
+        let todos = indicadores();
+        let vivos = todos
             .iter()
-            .filter(|(s, m, _)| ctx.market.quote(&AssetId::new(*m, *s)).is_some())
+            .filter(|(a, _)| ctx.market.quote(a).is_some())
             .count();
-        format!("{vivos} de {} ao vivo · o resto é informado", MACRO.len())
+        format!("{vivos} de {} ao vivo · o resto é informado", todos.len())
     }
 
     fn widget(&self, ctx: &Ctx) -> Option<Pane> {
         Some(Pane::Facts {
             title: String::new(),
-            rows: MACRO
-                .iter()
-                .map(|(simbolo, mercado, nome)| (AssetId::new(*mercado, *simbolo), mercado, nome))
+            rows: indicadores()
+                .into_iter()
                 // Quem tem fonte de verdade. O Ibovespa entra por aqui desde que a Kinvo
                 // passou a servi-lo, sem que esta linha precisasse saber o nome dele.
-                .filter(|(ativo, _, _)| ctx.providers.quem_busca(ativo).is_some())
-                .map(|(ativo, mercado, nome)| {
+                .filter(|(ativo, _)| ctx.providers.quem_busca(ativo).is_some())
+                .map(|(ativo, nome)| {
+                    let mercado = &ativo.market;
                     let Some(q) = ctx.market.quote(&ativo) else {
                         return ((*nome).to_string(), sem_preco(ctx), Tone::Dim);
                     };
@@ -133,7 +149,7 @@ impl ModuleView for Vista {
         // Todos, inclusive os de `Outro`: quem decide se há o que buscar é o despacho,
         // que só pergunta a quem cobre. Filtrar aqui por mercado era o que mantinha o
         // Ibovespa fora da busca mesmo depois de ele ganhar uma fonte.
-        MACRO.iter().map(|(s, m, _)| AssetId::new(*m, *s)).collect()
+        indicadores().into_iter().map(|(a, _)| a).collect()
     }
 
     fn layout(&self, ctx: &Ctx) -> Layout {
@@ -151,8 +167,8 @@ impl ModuleView for Vista {
             crate::invest::tempo::Data::de_epoch(ctx.agora, crate::invest::tempo::BRT_OFFSET);
         let mut vivos: Vec<Row> = Vec::new();
         let mut informados = Vec::new();
-        for (simbolo, mercado, nome) in MACRO {
-            let ativo = AssetId::new(*mercado, *simbolo);
+        for (ativo, nome) in indicadores() {
+            let mercado = &ativo.market;
             // Um indicador que **tem fonte** e ainda não respondeu não é «informado»: ele
             // está a caminho. Misturar os dois faria a coluna da direita acusar de falta
             // de fonte um número que chega em dois segundos.
@@ -168,7 +184,7 @@ impl ModuleView for Vista {
                     // «0,0517» não diz o que é. E taxa diária precisa de quatro casas.
                     let valor = match mercado {
                         Market::Bcb => {
-                            calc::pct_casas(q.preco, if *simbolo == "CDI" { 4 } else { 2 })
+                            calc::pct_casas(q.preco, if ativo.symbol == "CDI" { 4 } else { 2 })
                         }
                         _ => calc::preco(q.preco),
                     };
@@ -200,7 +216,7 @@ impl ModuleView for Vista {
                         (None, _) => (String::new(), Tone::Dim),
                     };
                     let (proximo, exato) =
-                        crate::invest::modules::agenda::proximo_anuncio(simbolo, &hoje)
+                        crate::invest::modules::agenda::proximo_anuncio(&ativo.symbol, &hoje)
                             .unwrap_or_default();
                     vivos.push(
                         Row::new(vec![
@@ -306,12 +322,13 @@ impl ModuleView for Vista {
                     form.erro = Some("valor não é um número".into());
                     return Outcome::Ok;
                 };
-                let Some((s, m, _)) = MACRO.iter().find(|(s, _, _)| *s == simbolo) else {
+                let Some((ativo, _)) = indicadores().into_iter().find(|(a, _)| a.symbol == simbolo)
+                else {
                     form.erro = Some("indicador desconhecido — use ←/→".into());
                     return Outcome::Ok;
                 };
                 self.form = None;
-                return Outcome::Editar(vec![Edit::PrecoManual(AssetId::new(*m, *s), valor)]);
+                return Outcome::Editar(vec![Edit::PrecoManual(ativo, valor)]);
             }
             return Outcome::Ok;
         }
@@ -335,7 +352,7 @@ impl ModuleView for Vista {
                 ));
                 Outcome::Ok
             }
-            _ => match self.lista.tecla(key, MACRO.len()) {
+            _ => match self.lista.tecla(key, indicadores().len()) {
                 true => Outcome::Ok,
                 false => Outcome::Ignorada,
             },

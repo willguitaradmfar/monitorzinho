@@ -41,6 +41,7 @@ confiável, o preço é informado, e a tela diz a origem e a idade dele.
 | | | |
 | --- | --- | --- |
 | [10](10-posicoes.md) | **Posições** | Ativo, quantidade, preço médio informado, preço atual, P&L. A fonte da verdade. |
+| [17](17-carteiras.md) | **Carteiras recomendadas** | O alvo de cada carteira, e o que aportar para chegar nele. |
 | [11](11-alocacao.md) | **Alocação** | Por classe, setor, moeda, país. Alvo × real e o desvio. |
 | [12](12-rebalanceamento.md) | **Rebalanceamento** | Quanto comprar e vender para voltar ao alvo — e como distribuir o aporte. |
 | [13](13-patrimonio.md) | **Patrimônio** | A curva do total ao longo do tempo, e de onde veio cada movimento dela. |
@@ -53,12 +54,10 @@ confiável, o preço é informado, e a tela diz a origem e a idade dele.
 | | | |
 | --- | --- | --- |
 | [20](20-cotacoes.md) | **Cotações** | A watchlist: último, variação, volume, mini-gráfico. |
-| [21](21-fita.md) | **Fita** | A faixa fina do topo da aba, sempre visível. |
 | [22](22-grafico.md) | **Gráfico** | Preço no tempo, com timeframes e cursor. |
 | [23](23-heatmap.md) | **Heatmap** | A grade colorida por variação — o mercado inteiro num olhar. |
 | [24](24-indices-e-macro.md) | **Índices e macro** | IBOV, S&P, DXY, VIX, DI, treasury. |
 | [25](25-cambio.md) | **Câmbio** | USD/BRL, EUR/BRL, e a conversão que todo o resto usa. |
-| [26](26-renda-fixa.md) | **Renda fixa** | Selic, CDI, IPCA e a curva de juros. Fonte pública e grátis. |
 | [27](27-cripto.md) | **Cripto** | Preço, funding, dominância. A única fonte com tempo real de graça. |
 | [28](28-book.md) | **Book e negócios** | Profundidade e times & trades, onde a fonte permitir. |
 
@@ -68,10 +67,7 @@ confiável, o preço é informado, e a tela diz a origem e a idade dele.
 | --- | --- | --- |
 | [30](30-indicadores.md) | **Indicadores** | Médias, RSI, MACD, bandas — sobre a série do gráfico. |
 | [31](31-risco.md) | **Risco** | Volatilidade, drawdown, Sharpe, beta, VaR. |
-| [32](32-correlacao.md) | **Correlação** | A matriz que mostra a diversificação que não existe. |
-| [33](33-comparador.md) | **Comparador** | N ativos normalizados na mesma escala. |
 | [34](34-fundamentos.md) | **Fundamentos** | P/L, P/VP, DY, ROE, dívida. |
-| [35](35-simulador.md) | **Simulador** | Projeção de aporte e backtest simples. |
 
 ### Informação — o que eu preciso saber
 
@@ -85,9 +81,7 @@ confiável, o preço é informado, e a tela diz a origem e a idade dele.
 
 | | | |
 | --- | --- | --- |
-| [50](50-imposto-de-renda.md) | **Imposto de renda** | Apuração mensal e DARF. Estimativa honesta, não precisão fingida. |
 | [51](51-importacao.md) | **Importação** | CSV, OFX, extrato da B3. Como a carteira entra sem digitação. |
-| [52](52-metas.md) | **Metas** | O plano de aporte e o quanto dele já foi cumprido. |
 
 ## O que a construção descobriu
 

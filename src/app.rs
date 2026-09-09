@@ -188,6 +188,8 @@ pub fn ordenar_cartoes(cartoes: &mut [Cartao]) {
 /// Um cartão da home da aba Invest: o que a grade desenha e o que a tecla de atalho abre.
 pub struct Cartao {
     pub id: String,
+    /// Que coisa dentro do módulo este cartão abre — ver `InvestModule::cartazes`.
+    pub sub: Option<String>,
     pub nome: String,
     pub resumo: String,
     /// Quanto lugar o módulo pediu — ver `InvestModule::destaque`. Manda na ordem e na
@@ -2064,10 +2066,14 @@ impl App {
         };
         if let ShortcutTarget::Module(posicao) = target {
             // Da mesma lista que desenhou o crachá — ver `invest_home`.
-            let Some(id) = self.invest_home().get(posicao).map(|c| c.id.clone()) else {
+            let Some((id, sub)) = self
+                .invest_home()
+                .get(posicao)
+                .map(|c| (c.id.clone(), c.sub.clone()))
+            else {
                 return;
             };
-            self.open_module_by_id(&id);
+            self.abrir_modulo_em(&id, sub.as_deref(), None);
             return;
         }
         self.focus = match target {
@@ -4129,21 +4135,24 @@ impl App {
             .ordem()
             .into_iter()
             .take(MAX_SHORTCUTS)
-            .map(|m| {
-                // O painel de `widget()` nasce sem título: quem manda no título é a home,
-                // e lá ele é o nome do módulo. Titular aqui e não ao desenhar deixa o
-                // `Pane` que sai daqui pronto, sem precisar ser clonado na tela.
-                let mut pane = m.widget(&ctx);
-                if let Some(pane) = pane.as_mut() {
-                    pane.intitular(m.name());
-                }
-                Cartao {
-                    id: m.id().to_string(),
-                    nome: m.name().to_string(),
-                    resumo: m.summary(&ctx),
-                    destaque: m.destaque(),
-                    pane,
-                }
+            .flat_map(|m| {
+                let resumo = m.summary(&ctx);
+                // Um módulo pode pôr mais de um cartão — ver `InvestModule::cartazes`.
+                m.cartazes(&ctx).into_iter().map(move |mut c| {
+                    // O painel nasce sem título: quem manda no título é a home. Titular
+                    // aqui e não ao desenhar deixa o `Pane` pronto, sem clonar na tela.
+                    if let Some(pane) = c.pane.as_mut() {
+                        pane.intitular(&c.titulo);
+                    }
+                    Cartao {
+                        id: m.id().to_string(),
+                        sub: c.sub,
+                        nome: c.titulo,
+                        resumo: resumo.clone(),
+                        destaque: m.destaque(),
+                        pane: c.pane,
+                    }
+                })
             })
             .collect();
         ordenar_cartoes(&mut grade);
@@ -4294,6 +4303,21 @@ impl App {
         &mut self,
         id: &str,
         alvo: Option<crate::invest::model::AssetId>,
+        anterior: Option<Box<ModuleFocus>>,
+    ) {
+        self.abrir(id, alvo, None, anterior);
+    }
+
+    /// O mesmo, apontando para uma coisa de dentro do módulo — ver `InvestModule::open_em`.
+    fn abrir_modulo_em(&mut self, id: &str, sub: Option<&str>, anterior: Option<Box<ModuleFocus>>) {
+        self.abrir(id, None, sub, anterior);
+    }
+
+    fn abrir(
+        &mut self,
+        id: &str,
+        alvo: Option<crate::invest::model::AssetId>,
+        sub: Option<&str>,
         mut anterior: Option<Box<ModuleFocus>>,
     ) {
         let Some(invest) = self.invest.as_mut() else {
@@ -4307,10 +4331,10 @@ impl App {
         if id == "alertas" {
             invest.marcar_disparos_vistos();
         }
-        let Some(view) = invest
-            .modulo(id)
-            .map(|m| m.open(&invest.ctx(), alvo.as_ref()))
-        else {
+        let Some(view) = invest.modulo(id).map(|m| match sub {
+            Some(sub) => m.open_em(&invest.ctx(), Some(sub)),
+            None => m.open(&invest.ctx(), alvo.as_ref()),
+        }) else {
             return;
         };
         // A thread só nasce agora — nunca ao entrar na aba.
@@ -4734,6 +4758,7 @@ mod home_tests {
     fn cartao(id: &str, destaque: u8) -> Cartao {
         Cartao {
             id: id.to_string(),
+            sub: None,
             nome: id.to_string(),
             resumo: String::new(),
             destaque,

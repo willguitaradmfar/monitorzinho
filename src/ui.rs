@@ -3086,26 +3086,13 @@ fn settle_scroll(
 /// A grade mostra os que couberem. São 28 módulos e nenhuma tela cabe todos, então o
 /// Enter abre a lista completa, buscável, para chegar ao resto.
 fn render_invest_tab(frame: &mut Frame, area: Rect, app: &App) {
-    let fita = invest_fita(app);
-    // Vazia, a fita não ocupa linha nenhuma. Nada de faixa em branco no topo.
     let linhas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(u16::from(!fita.is_empty())),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Fill(1), Constraint::Length(1)])
         .split(area);
 
-    if !fita.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(fita)).style(Style::default().fg(palette::DIM)),
-            linhas[0],
-        );
-    }
-
     let cartoes = app.invest_home();
-    render_invest_grade(frame, linhas[1], &cartoes);
+    render_invest_grade(frame, linhas[0], &cartoes);
 
     // O rodapé diz as duas teclas que a grade não consegue mostrar sozinha, e cede o
     // lugar para um problema de gravação quando há um — um erro ao salvar a carteira
@@ -3117,7 +3104,7 @@ fn render_invest_tab(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(palette::DIM),
         ),
     };
-    frame.render_widget(Paragraph::new(rodape), linhas[2]);
+    frame.render_widget(Paragraph::new(rodape), linhas[1]);
 }
 
 /// Largura e altura mínimas de um cartão. Abaixo disso ele não mostra nada além da
@@ -3275,39 +3262,6 @@ fn render_cartao(
             },
         );
     }
-}
-
-/// A faixa fina do topo. Não rola nem anima: um terminal não é telão de corretora, texto
-/// que se move é texto que não se lê, e animar forçaria um redesenho constante — que é
-/// exatamente o que o laço principal foi desenhado para evitar.
-fn invest_fita(app: &App) -> Vec<Span<'static>> {
-    let Some(invest) = &app.invest else {
-        return Vec::new();
-    };
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for ativo in &invest.portfolio.fita {
-        let Some(q) = invest.market.quote(ativo) else {
-            continue;
-        };
-        if !spans.is_empty() {
-            spans.push(Span::styled(" · ", Style::default().fg(palette::DIM)));
-        }
-        spans.push(Span::styled(
-            format!("{} ", ativo.short()),
-            Style::default().fg(palette::DIM),
-        ));
-        spans.push(Span::raw(crate::invest::calc::preco(q.preco)));
-        if let Some(v) = q.variacao().filter(|_| q.grade.ao_vivo()) {
-            spans.push(Span::styled(
-                format!(" {}", crate::invest::calc::pct(v)),
-                Style::default().fg(match v >= 0.0 {
-                    true => palette::GREEN,
-                    false => palette::RED,
-                }),
-            ));
-        }
-    }
-    spans
 }
 
 /// A nota do rodapé da lista: o que houve de errado ao ler a carteira, e o que a

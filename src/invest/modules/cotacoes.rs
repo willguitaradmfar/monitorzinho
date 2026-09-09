@@ -377,6 +377,7 @@ mod tests {
             preco_manual: None,
             preco_manual_em: None,
             atualizado_em: 0,
+            carteira: None,
         });
         p.watchlist.push(AssetId::new(Market::Binance, "BTCBRL"));
         let m = MarketSnapshot::default();
@@ -401,6 +402,7 @@ mod tests {
             preco_manual: None,
             preco_manual_em: None,
             atualizado_em: 0,
+            carteira: None,
         });
         p.watchlist.push(btc);
         let m = MarketSnapshot::default();

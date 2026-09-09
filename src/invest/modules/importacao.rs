@@ -378,6 +378,7 @@ impl Vista {
                     preco_manual,
                     preco_manual_em: None,
                     atualizado_em: 0,
+                    carteira: None,
                 };
                 if let Err(e) = posicao.validate() {
                     return Lida {

@@ -80,6 +80,14 @@ pub fn pct(valor: f64) -> String {
 /// resto da tela escreve dinheiro com vírgula — misturar os dois na mesma coluna é como
 /// se lê 2.14 como dois mil e cento e quarenta.
 fn virgula(valor: f64, casas: usize) -> String {
+    // Zero negativo nunca vai para a tela. `-0.0 == 0.0` é verdadeiro, mas o formatador
+    // imprime «-0,0» — e um peso de «-0,0%» num ativo que simplesmente não se tem parece
+    // um erro de conta. Somar zero normaliza o sinal.
+    let valor = valor + 0.0;
+    let valor = match valor == 0.0 {
+        true => 0.0,
+        false => valor,
+    };
     format!("{:.*}", casas, valor).replace('.', ",")
 }
 
@@ -311,26 +319,6 @@ pub fn var_historico(retornos: &[f64], percentil: f64) -> Option<f64> {
         .map(|v| v * 100.0)
 }
 
-/// Correlação de Pearson entre duas séries de retornos.
-pub fn correlacao(a: &[f64], b: &[f64]) -> Option<f64> {
-    let n = a.len().min(b.len());
-    if n < 3 {
-        return None;
-    }
-    let (a, b) = (&a[a.len() - n..], &b[b.len() - n..]);
-    let (ma, mb) = (media(a), media(b));
-    let mut num = 0.0;
-    let (mut da, mut db) = (0.0, 0.0);
-    for i in 0..n {
-        let (x, y) = (a[i] - ma, b[i] - mb);
-        num += x * y;
-        da += x * x;
-        db += y * y;
-    }
-    let den = (da * db).sqrt();
-    (den > 0.0).then(|| num / den)
-}
-
 /// Média móvel simples. Devolve `None` nos pontos em que ela ainda não existe, para que o
 /// gráfico não desenhe uma linha errada nos primeiros períodos.
 pub fn sma(serie: &[f64], periodo: usize) -> Vec<Option<f64>> {
@@ -429,15 +417,6 @@ pub fn macd(
             Some((linha[i], sig, linha[i] - sig))
         })
         .collect()
-}
-
-/// Normaliza uma série para começar em 100 — a base da comparação entre ativos de escalas
-/// diferentes. Sem isso, uma ação a 38 reais e um índice a 142 mil não cabem no mesmo eixo.
-pub fn base_100(serie: &[f64]) -> Vec<f64> {
-    let Some(&primeiro) = serie.iter().find(|v| **v > 0.0) else {
-        return serie.to_vec();
-    };
-    serie.iter().map(|v| v / primeiro * 100.0).collect()
 }
 
 #[cfg(test)]
@@ -561,32 +540,11 @@ mod tests {
     }
 
     #[test]
-    fn correlacao_de_uma_serie_com_ela_mesma_e_um() {
-        let a = vec![0.01, -0.02, 0.03, 0.005, -0.01, 0.02];
-        assert!((correlacao(&a, &a).unwrap() - 1.0).abs() < 1e-9);
-        // E com o oposto dela é −1.
-        let b: Vec<f64> = a.iter().map(|x| -x).collect();
-        assert!((correlacao(&a, &b).unwrap() + 1.0).abs() < 1e-9);
-        // Séries curtas demais não dão número: vazio significa «não sabemos», e zero
-        // significaria «não andam juntos», que é uma afirmação.
-        assert_eq!(correlacao(&[1.0], &[1.0]), None);
-    }
-
-    #[test]
     fn var_precisa_de_amostra() {
         assert_eq!(var_historico(&[0.01, -0.02], 5.0), None);
         let r: Vec<f64> = (0..100).map(|i| (i as f64 - 50.0) / 1000.0).collect();
         let v = var_historico(&r, 5.0).unwrap();
         assert!(v < 0.0, "o VaR de 5% tem que estar na cauda de perda");
-    }
-
-    #[test]
-    fn base_100_deixa_series_comparaveis() {
-        let a = base_100(&[38.0, 41.8]);
-        let b = base_100(&[142000.0, 156200.0]);
-        assert!((a[0] - 100.0).abs() < 1e-9 && (b[0] - 100.0).abs() < 1e-9);
-        // Os dois subiram 10%.
-        assert!((a[1] - b[1]).abs() < 1e-9);
     }
 
     #[test]
