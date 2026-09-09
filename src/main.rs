@@ -14,6 +14,7 @@ mod app;
 mod container;
 mod format;
 mod history;
+mod invest;
 mod monitor;
 mod tmux;
 mod tools;
@@ -177,6 +178,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
     let mut last_tick = Instant::now();
     let mut drawn_activity = tools::activity();
     let mut drawn_containers = app.container_revision();
+    let mut drawn_invest = app.invest_revision();
     let mut dirty = true;
 
     loop {
@@ -294,8 +296,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                         Focus::Wizard(_) => app.wizard_back(),
                         Focus::ToolMonitor(_) => app.tool_monitor_escape(),
                         Focus::Table(tf) if !tf.query.is_empty() => app.clear_search(),
+                        // Um módulo desfaz uma camada por vez e, quando não tem mais o
+                        // que desfazer, **pergunta** em vez de sair. `Esc` é uma tecla
+                        // que a mão aperta sozinha ao voltar de qualquer outra coisa, e
+                        // um módulo é uma tela em que se fica.
+                        Focus::Module(_) => app.module_escape(),
                         _ => app.exit_focus(),
                     },
+
+                    // Todo o resto vai para o módulo aberto: letras, setas, Enter, Del e
+                    // combinações com Ctrl. Um módulo pode ter busca digitada direto, e
+                    // por isso não pode haver letra reservada pelo app. `Tab` já é
+                    // bloqueado sem código nenhum, porque a troca de aba exige
+                    // `Focus::None`.
+                    _ if app.in_module() => app.module_key(key),
                     // 'q' closes whatever is fullscreened, and only that — on the plain
                     // dashboard it does nothing (it isn't a shortcut letter either).
                     KeyCode::Char('q')
@@ -414,6 +428,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     KeyCode::PageDown if on_tools_tab(&app) => {
                         app.move_tool_selection(app::PAGE_ROWS);
                     }
+                    // A grade da Invest dá tecla aos módulos que cabem na tela. Enter
+                    // abre a lista completa, buscável, para chegar aos outros.
+                    KeyCode::Enter if matches!(app.focus, Focus::None) => {
+                        app.abrir_lista_de_modulos();
+                    }
                     KeyCode::Tab if matches!(app.focus, Focus::None) => app.next_tab(),
                     KeyCode::BackTab if matches!(app.focus, Focus::None) => app.prev_tab(),
                     // Like top's spacebar: force an immediate refresh without waiting for
@@ -494,6 +513,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
             dirty |= app.shows_containers();
         }
 
+        // O mesmo, para o retrato de mercado: um preço chega quando a thread o publica, e
+        // não no ritmo do tique. Redesenhar só onde isso apareceria — repintar um gráfico
+        // de CPU porque o dólar mexeu é gastar um núcleo para mostrar a mesma tela.
+        let invest = app.invest_revision();
+        if invest != drawn_invest {
+            drawn_invest = invest;
+            dirty |= app.shows_invest();
+        }
+
         if last_tick.elapsed() >= app.interval() {
             app.tick();
             last_tick = Instant::now();
@@ -502,5 +530,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
     }
 
     app.persist();
+    app.persist_invest();
+    app.stop_invest();
     Ok(())
 }

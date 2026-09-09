@@ -14,6 +14,7 @@ pub mod cpu;
 pub mod disk;
 pub mod gpu;
 pub mod iface;
+pub mod invest;
 pub mod live;
 pub mod mark;
 pub mod memory;
@@ -480,6 +481,15 @@ pub trait TableMonitor: Send {
         false
     }
 
+    /// O canal por onde uma tabela recebe as linhas já prontas, em vez de amostrá-las.
+    ///
+    /// `None` em toda tabela que lê o sistema por conta própria — que são todas menos uma.
+    /// A lista de módulos da aba Invest é a exceção: quem sabe montar as linhas dela é a
+    /// `App`, que tem o `InvestState`, e não um monitor que só recebe o `SystemState`.
+    fn feed(&self) -> Option<std::sync::Arc<std::sync::Mutex<Vec<TableRow>>>> {
+        None
+    }
+
     /// Whether this table has a detail view at all. Only drives the fullscreen footer
     /// hint — `detail()` is what actually decides — so a table that can't say anything
     /// about its rows doesn't advertise an Enter that would do nothing.
@@ -530,5 +540,9 @@ pub fn all_table_monitors() -> Vec<Box<dyn TableMonitor>> {
         Box::new(tmux::SessionsMonitor::default()),
         Box::new(tmux::WindowsMonitor),
         Box::new(tmux::SummaryMonitor),
+        // A aba Invest. Registrada aqui como todas as outras — o construtor é uma struct
+        // vazia e **não faz I/O nenhum**, que é o que permite registrá-la no arranque de
+        // toda sessão, inclusive a de quem nunca vai abrir a aba.
+        Box::new(invest::ModulesMonitor::default()),
     ]
 }

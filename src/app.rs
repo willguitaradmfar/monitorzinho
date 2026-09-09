@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent};
 use sysinfo::{Pid, Signal};
 
 use crate::action::Target;
@@ -49,17 +49,31 @@ pub enum Tab {
     /// executions the user has started, which keep running regardless of which tab is
     /// on screen.
     Tools,
+    /// A carteira, o mercado, e o que se conclui dos dois — ver `docs/invest/`.
+    ///
+    /// É a primeira aba que **não fala sobre esta máquina**, e a única cujo dado é do
+    /// usuário. Aparece sempre, ao contrário de Containers e tmux: a regra daquelas é
+    /// «uma aba permanentemente vazia é ruído», e aqui a aba nunca está vazia — o
+    /// catálogo de módulos *é* o conteúdo inicial, e é por ele que se começa a usar a
+    /// coisa. Uma aba condicional que só aparecesse depois de configurada seria uma aba
+    /// que ninguém descobre.
+    ///
+    /// Última na barra porque é a mais distante do assunto do programa: quem abriu o
+    /// monitorzinho para ver por que o servidor está lento passa por ela, e não por cima
+    /// dela.
+    Invest,
 }
 
 impl Tab {
     /// Toda aba que existe no programa. Qual delas aparece é decidido no arranque — ver
     /// `App::tabs`.
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Overview,
         Tab::Processes,
         Tab::Containers,
         Tab::Tmux,
         Tab::Tools,
+        Tab::Invest,
     ];
 
     pub fn title(&self) -> &'static str {
@@ -69,6 +83,7 @@ impl Tab {
             Tab::Containers => "Containers",
             Tab::Tmux => "tmux",
             Tab::Tools => "Ferramentas",
+            Tab::Invest => "Invest",
         }
     }
 }
@@ -134,12 +149,51 @@ fn expanded_seed(rows: &[TableRow], expand_all: bool) -> HashSet<u32> {
 /// fresh, uncapped sample instead — see `App::activate_shortcut`.
 pub const OVERVIEW_TABLE_ROWS: usize = 10;
 
+/// De quanto em quanto tempo a home da aba Invest se atualiza.
+///
+/// Trinta segundos porque a home é um relance, não uma mesa de operação: quem está
+/// olhando o painel quer saber se o dia está de pé ou de queda, e isso não muda a cada
+/// dois segundos. Dentro de um módulo o piso cai a zero e cada fonte volta ao ritmo dela.
+///
+/// Sem o piso, a Binance sozinha faria trinta chamadas por minuto para encher um cartão
+/// que se olha de passagem.
+const PISO_DA_HOME: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What a shortcut key points at: chart panels on the Overview tab, table panels on
 /// the Processes tab — see `App::shortcut_targets`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutTarget {
     Chart(usize),
     Table(usize),
+    /// Um módulo da aba Invest, pela posição dele na ordem da tela.
+    ///
+    /// A tecla **entra no módulo** em vez de ampliar um painel. É a diferença entre um
+    /// painel, que se olha, e um módulo, que se usa: ampliar o painel de Posições daria
+    /// uma tabela maior, e o que se quer é a tela que edita, importa e agrupa.
+    Module(usize),
+}
+
+/// Põe os módulos de mais destaque no alto da home.
+///
+/// O critério é **declarado pelo módulo**, e não medido no cartão. Medir era o bug: o
+/// número de linhas de um cartão cresce quando a cotação chega ou quando um cache enche,
+/// e a grade se rearranjava sozinha debaixo de quem estava olhando. Com um número que não
+/// muda em execução, a tecla de um módulo é a mesma hoje e amanhã.
+///
+/// A ordenação é **estável**: empate mantém a ordem de registro, que é a dos grupos.
+pub fn ordenar_cartoes(cartoes: &mut [Cartao]) {
+    cartoes.sort_by_key(|c| std::cmp::Reverse(c.destaque));
+}
+
+/// Um cartão da home da aba Invest: o que a grade desenha e o que a tecla de atalho abre.
+pub struct Cartao {
+    pub id: String,
+    pub nome: String,
+    pub resumo: String,
+    /// Quanto lugar o módulo pediu — ver `InvestModule::destaque`. Manda na ordem e na
+    /// altura, e não muda em tempo de execução: é o que mantém a grade parada.
+    pub destaque: u8,
+    pub pane: Option<crate::invest::module::Pane>,
 }
 
 /// A table panel that's been fullscreened: its row order/shape is frozen at the
@@ -185,16 +239,25 @@ impl TableFocus {
     }
 
     /// Indices into `rows` (regardless of current visibility) with a cell matching
-    /// `query`, case-insensitively, in tree order. Empty when there's no query.
+    /// `query`, case-insensitively **and sem acento**, in tree order. Empty when there's
+    /// no query.
+    ///
+    /// A dobra de acento é estritamente mais permissiva — tudo que casava antes continua
+    /// casando — e é o que faz «camb» achar «Câmbio» e «sessao» achar «sessão». Ninguém
+    /// digita acento numa caixa de busca.
     fn match_indices(&self) -> Vec<usize> {
         if self.query.is_empty() {
             return Vec::new();
         }
-        let needle = self.query.to_lowercase();
+        let needle = crate::format::fold(&self.query);
         self.rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.cells.iter().any(|c| c.to_lowercase().contains(&needle)))
+            .filter(|(_, r)| {
+                r.cells
+                    .iter()
+                    .any(|c| crate::format::fold(c).contains(&needle))
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -228,10 +291,25 @@ impl TableFocus {
     }
 
     /// Focuses the first match, if any. Called whenever the query changes, so editing
-    /// the search box always jumps back to its first hit — same as before search
-    /// stopped filtering the row list.
+    /// the search box always jumps back to its first hit.
+    ///
+    /// Um acerto na **primeira coluna** ganha de um acerto em qualquer outra, mesmo que
+    /// venha depois na lista. A primeira coluna é o nome da coisa, e as outras são o que
+    /// se sabe sobre ela: procurando «importa», a linha chamada «Importação» é a resposta,
+    /// e não a linha «Corretoras» que por acaso menciona importação no que diz de si.
+    ///
+    /// Só o salto inicial é reordenado. Andar entre acertos com ↑/↓ continua seguindo a
+    /// ordem da tela — saltos que pulam para trás seriam desorientadores.
     fn focus_first_match(&mut self) {
-        if let Some(idx) = self.match_indices().first().copied() {
+        let acertos = self.match_indices();
+        let needle = crate::format::fold(&self.query);
+        let por_nome = acertos.iter().find(|&&i| {
+            self.rows[i]
+                .cells
+                .first()
+                .is_some_and(|c| crate::format::fold(c).contains(&needle))
+        });
+        if let Some(&idx) = por_nome.or(acertos.first()) {
             self.focus_row(idx);
         }
     }
@@ -1288,6 +1366,31 @@ pub enum Focus {
     /// Um texto longo e só de leitura — o que a engine responde quando se pede tudo que
     /// ela sabe sobre alguma coisa.
     Text(Box<TextView>),
+    /// Um módulo da aba Invest rodando em tela cheia. Boxed pela mesma razão do detalhe e
+    /// do menu de operações: carrega inteira a tabela de onde veio.
+    Module(Box<ModuleFocus>),
+}
+
+/// Um módulo aberto: qual é, a tela viva dele, e a lista de onde ele veio.
+pub struct ModuleFocus {
+    /// Por `InvestModule::id`, nunca por índice — a ordem da lista é a de último acesso e
+    /// muda no instante em que o módulo abre.
+    pub module: String,
+    pub view: Box<dyn crate::invest::module::ModuleView>,
+    /// A lista de onde veio, devolvida intacta no Esc: mesma seleção, mesma busca. É o
+    /// mesmo padrão de `DetailFocus` e de `ActionMenu`.
+    ///
+    /// `None` quando o módulo foi aberto pela tecla de um cartão da home — ali não há
+    /// lista para devolver, e o Esc volta para a própria grade.
+    pub parent: Option<TableFocus>,
+    /// O módulo de onde este foi aberto, **inteiro**, com o cursor e a busca onde
+    /// estavam.
+    ///
+    /// Um módulo abre outro: `Enter` sobre uma linha de Cotações abre o Gráfico daquele
+    /// ativo. O `Esc` de lá tem que voltar para a lista de Cotações como ela estava, e não
+    /// para a home — guardar só o nome do módulo o reabriria do zero, com o cursor na
+    /// primeira linha e a busca perdida.
+    pub anterior: Option<Box<ModuleFocus>>,
 }
 
 /// O menu que o Enter abre sobre uma linha da aba Containers.
@@ -1417,6 +1520,15 @@ pub struct App {
     /// every key while it's open, so nothing underneath can act on the keypress that
     /// dismisses it.
     pub pending: Option<Pending>,
+    /// Tudo da aba Invest — a carteira, os provedores, os módulos.
+    ///
+    /// `None` até alguém entrar na aba pela primeira vez, e essa é a regra 1 de
+    /// `docs/invest/00 §3`: abrir o monitorzinho para olhar CPU não pode ler arquivo de
+    /// carteira, nem resolver DNS, nem alocar cache de cotação.
+    pub invest: Option<Box<crate::invest::InvestState>>,
+    /// O canal por onde as linhas prontas chegam à tabela da lista de módulos — ver
+    /// `TableMonitor::feed`.
+    invest_rows: Option<std::sync::Arc<std::sync::Mutex<Vec<TableRow>>>>,
     state: SystemState,
     ticks_since_save: u32,
 }
@@ -1552,9 +1664,15 @@ impl App {
             session_editor: None,
             last_sample: Duration::ZERO,
             pending: None,
+            // Nada da aba Invest existe até alguém entrar nela — regra 1 de
+            // `docs/invest/00 §3`. O canal é pego agora porque é só um `Arc`, e é o que
+            // permite entregar as linhas prontas à tabela sem downcast.
+            invest: None,
+            invest_rows: None,
             state: SystemState::new(),
             ticks_since_save: 0,
         };
+        app.invest_rows = app.table_monitors.iter().find_map(|m| m.feed());
         // A restored execution that charts something gets its panel back here, so the
         // Overview tab looks the same as it did when the app was closed.
         app.sync_tool_charts();
@@ -1667,6 +1785,17 @@ impl App {
         if tab == self.tab {
             return;
         }
+        // Sair da aba Invest grava o retrato de mercado e a série do patrimônio. É o que
+        // faz a próxima abertura mostrar números em vez de traços — e a thread está
+        // prestes a parar, então este é o último momento em que há o que gravar.
+        if self.tab == Tab::Invest
+            && let Some(invest) = self.invest.as_mut()
+        {
+            invest.persist();
+            invest.persist_cache();
+            invest.persist_serie();
+            invest.persist_agenda();
+        }
         self.tab = tab;
         // Not sampled here. Sampling the Processes tab means reading /proc for every
         // process on the machine, which on a busy server is a third of a second — and
@@ -1744,6 +1873,20 @@ impl App {
         if let Some(store) = &self.state.containers {
             store.set_watched(self.shows_containers());
         }
+        // O mesmo, para a busca de cotações — em duas velocidades: dentro de um módulo
+        // cada fonte anda no ritmo dela, e com a aba só à vista vale o piso da home. Dito
+        // a cada tick e não na troca de aba porque há mais de um caminho para entrar e
+        // sair de um módulo.
+        let quer_mercado = self.invest_quer_mercado();
+        let em_modulo = self.in_module();
+        if let Some(invest) = &self.invest {
+            invest.providers.set_ativo(quer_mercado);
+            invest.providers.set_piso(match em_modulo {
+                true => std::time::Duration::ZERO,
+                false => PISO_DA_HOME,
+            });
+        }
+        self.tick_module();
         // Executions come and go between ticks — from the wizard, from a hand-off, from
         // being removed — and the panels follow whatever exists now.
         self.sync_tool_charts();
@@ -1755,6 +1898,7 @@ impl App {
             // Nothing to refresh: an execution's counters are atomics the UI reads
             // directly, and its log is appended to by the tool's own threads.
             Tab::Tools => {}
+            Tab::Invest => self.refresh_invest(),
         }
         self.sample_active_tab();
         self.last_sample = started.elapsed();
@@ -1791,7 +1935,7 @@ impl App {
                     panel.capacity = panel.monitor.capacity(&self.state);
                 }
             }
-            Tab::Processes | Tab::Containers | Tab::Tmux => {
+            Tab::Processes | Tab::Containers | Tab::Tmux | Tab::Invest => {
                 // The fullscreened table (if any) keeps its row order/shape frozen —
                 // re-sampling would re-rank and reshape it out from under whatever the
                 // user is reading, searching, or has expanded — but its live values
@@ -1894,6 +2038,13 @@ impl App {
             // Cada aba numera do 1: os atalhos sempre foram por aba, então a nova ganha
             // a própria sequência sem que a de Processos mude de tecla.
             Tab::Processes | Tab::Containers | Tab::Tmux => self.tables_on(self.tab),
+            // Na Invest a tecla não amplia um painel: ela **entra** no módulo daquele
+            // cartão. A home é uma mesa de trabalho, e cada cartão já mostra o que tem a
+            // dizer — ampliá-lo daria a mesma coisa maior, e o que se quer é a tela que
+            // edita, importa e agrupa. A lista completa dos 28 continua a um Enter.
+            Tab::Invest => (0..self.invest_visiveis())
+                .map(ShortcutTarget::Module)
+                .collect(),
             // No shortcut-able panels here, which is also what frees the letter keys
             // on this tab for its own bindings ('a' to add an execution).
             Tab::Tools => Vec::new(),
@@ -1911,9 +2062,27 @@ impl App {
         let Some(&target) = targets.get(index) else {
             return;
         };
+        if let ShortcutTarget::Module(posicao) = target {
+            // Da mesma lista que desenhou o crachá — ver `invest_home`.
+            let Some(id) = self.invest_home().get(posicao).map(|c| c.id.clone()) else {
+                return;
+            };
+            self.open_module_by_id(&id);
+            return;
+        }
         self.focus = match target {
             ShortcutTarget::Chart(idx) => Focus::Chart(idx),
-            ShortcutTarget::Table(idx) => {
+            // Tratado acima: um módulo não é um painel para ampliar.
+            ShortcutTarget::Module(_) => return,
+            ShortcutTarget::Table(idx) => self.tela_cheia_da_tabela(idx),
+        };
+    }
+
+    /// A tela cheia de uma tabela. Separado de `activate_shortcut` porque a lista de
+    /// módulos da Invest chega aqui pelo Enter, e não por uma tecla de atalho.
+    fn tela_cheia_da_tabela(&mut self, idx: usize) -> Focus {
+        {
+            {
                 // A árvore do tmux é relida *agora*, e não no próximo tick. A tela cheia
                 // congela a forma da lista de propósito — ela não pode reordenar debaixo
                 // de quem está lendo —, e congelar um retrato de até dois segundos atrás
@@ -1943,7 +2112,21 @@ impl App {
                     expanded,
                 })
             }
+        }
+    }
+
+    /// A lista completa dos módulos, buscável, pelo Enter na home da Invest.
+    ///
+    /// A grade mostra os que cabem na tela; são 28 módulos e nenhum monitor cabe todos.
+    /// Esta é a porta para o resto — digitar filtra, Enter entra.
+    pub fn abrir_lista_de_modulos(&mut self) {
+        if self.tab != Tab::Invest || !matches!(self.focus, Focus::None) {
+            return;
+        }
+        let Some(&ShortcutTarget::Table(idx)) = self.tables_on(Tab::Invest).first() else {
+            return;
         };
+        self.focus = self.tela_cheia_da_tabela(idx);
     }
 
     pub fn exit_focus(&mut self) {
@@ -2011,6 +2194,13 @@ impl App {
                 .is_some_and(|row| row.key == "engine")
         {
             self.open_endpoint_editor();
+            return;
+        }
+        // A lista de módulos da aba Invest: o Enter entra no módulo, e não num detalhe.
+        if let Focus::Table(tf) = &self.focus
+            && self.table_monitors[tf.table_index].id() == crate::monitor::invest::ID
+        {
+            self.open_invest_module();
             return;
         }
         let opens_actions = match &self.focus {
@@ -3872,6 +4062,375 @@ impl App {
         tool.on_demand(&wizard.values())
     }
 
+    // -----------------------------------------------------------------------
+    // A aba Invest
+    // -----------------------------------------------------------------------
+
+    /// Se a aba Invest está na frente, de qualquer forma — a grade dela, a lista em tela
+    /// cheia, ou um módulo aberto.
+    pub fn shows_invest(&self) -> bool {
+        if matches!(self.focus, Focus::Module(_)) {
+            return true;
+        }
+        match &self.focus {
+            Focus::None => self.tab == Tab::Invest,
+            Focus::Table(tf) => self.table_monitors[tf.table_index].tab() == Tab::Invest,
+            _ => false,
+        }
+    }
+
+    /// Grava tudo da aba Invest. Chamado ao fechar o programa, ao lado do `persist` das
+    /// ferramentas — uma carteira não pode ficar só na memória de um processo que morre.
+    pub fn persist_invest(&mut self) {
+        if let Some(invest) = self.invest.as_mut() {
+            invest.persist();
+            invest.persist_cache();
+            invest.persist_serie();
+            invest.persist_agenda();
+        }
+    }
+
+    /// A revisão do retrato de mercado. O laço principal a compara para redesenhar quando
+    /// um preço muda — sem isso, uma cotação ao vivo só apareceria no tique seguinte, e a
+    /// tela pareceria travada entre um e outro.
+    pub fn invest_revision(&self) -> u64 {
+        self.invest.as_ref().map_or(0, |i| i.providers.revisao())
+    }
+
+    /// Para as threads da aba. Chamado ao fechar o programa: uma thread de rede que
+    /// sobrevive ao `main` é uma que ninguém mais lê.
+    pub fn stop_invest(&mut self) {
+        if let Some(invest) = &self.invest {
+            invest.providers.parar();
+        }
+    }
+
+    /// Quantos módulos a grade da home mostra. Todos ganham atalho — são 33 teclas para
+    /// menos módulos que isso —, e a grade desenha os que couberem.
+    pub fn invest_visiveis(&self) -> usize {
+        self.invest
+            .as_ref()
+            .map(|i| i.ordem().len().min(MAX_SHORTCUTS))
+            .unwrap_or(0)
+    }
+
+    /// Um cartão da home: o módulo, o que ele tem a dizer, e o painel compacto dele.
+    ///
+    /// Carrega o `id` porque a tecla de atalho precisa dele: o crachá `[3]` e o módulo
+    /// que o `3` abre têm que sair **da mesma lista**. Quando eram duas listas — uma
+    /// ordenada para desenhar e outra para abrir —, a tecla do cartão de Índices abria
+    /// Posições.
+    pub fn invest_home(&self) -> Vec<Cartao> {
+        let Some(invest) = &self.invest else {
+            return Vec::new();
+        };
+        let ctx = invest.ctx();
+        let mut grade: Vec<Cartao> = invest
+            .ordem()
+            .into_iter()
+            .take(MAX_SHORTCUTS)
+            .map(|m| {
+                // O painel de `widget()` nasce sem título: quem manda no título é a home,
+                // e lá ele é o nome do módulo. Titular aqui e não ao desenhar deixa o
+                // `Pane` que sai daqui pronto, sem precisar ser clonado na tela.
+                let mut pane = m.widget(&ctx);
+                if let Some(pane) = pane.as_mut() {
+                    pane.intitular(m.name());
+                }
+                Cartao {
+                    id: m.id().to_string(),
+                    nome: m.name().to_string(),
+                    resumo: m.summary(&ctx),
+                    destaque: m.destaque(),
+                    pane,
+                }
+            })
+            .collect();
+        ordenar_cartoes(&mut grade);
+        grade
+    }
+
+    pub fn in_module(&self) -> bool {
+        matches!(self.focus, Focus::Module(_))
+    }
+
+    /// Se alguma coisa na tela precisa que a busca de cotações esteja rodando.
+    ///
+    /// **Só um módulo aberto liga a thread** — não basta a aba estar visível. É a regra 3
+    /// de `docs/invest/00 §3`, e ela é mais rígida que a dos containers de propósito: ler
+    /// um socket local de graça a cada 20 s é aceitável, gastar cota de uma API de mercado
+    /// quando ninguém está olhando não é. A cota é um recurso finito do usuário.
+    fn invest_quer_mercado(&self) -> bool {
+        match &self.focus {
+            Focus::Module(mf) => mf.view.quer_mercado(),
+            // **A aba à vista também busca**, na cadência de vitrine — ver
+            // `PISO_DA_HOME`. A regra era mais estrita que isto: só um módulo aberto
+            // ligava a thread, e o resultado era um painel de vinte e oito cartões que só
+            // se enchia depois de entrar em cada um. Um dashboard que não atualiza não é
+            // um dashboard.
+            //
+            // O que tornou isto barato foi a fonte em lote: dezoito papéis da B3 numa
+            // chamada, contra um pedido por ativo de antes.
+            _ => {
+                self.tab == Tab::Invest
+                    // Alertas ligados rodam com a aba fechada — é a exceção, e ela é
+                    // escolhida um a um pelo usuário.
+                    || self
+                        .invest
+                        .as_ref()
+                        .is_some_and(|i| i.portfolio.alertas.iter().any(|a| a.ligado))
+            }
+        }
+    }
+
+    /// A volta da aba Invest. Cria o estado na primeira vez, atualiza o retrato de
+    /// mercado, e remonta as linhas da lista.
+    fn refresh_invest(&mut self) {
+        // Aqui, e não em `App::new`: é a primeira vez que alguém pediu para ver a aba.
+        // Custa dois arquivos pequenos e alocação.
+        if self.invest.is_none() {
+            let state = crate::invest::InvestState::load();
+            state.sincronizar_pedido();
+            // A thread nasce ao **entrar na aba**, e não ao abrir um módulo. Era mais
+            // apertado que isso, e o painel de vinte e oito cartões só se enchia depois de
+            // entrar em cada um deles — o que não é um dashboard. Ela nasce devagar: ver
+            // `PISO_DA_HOME`.
+            state.providers.start();
+            self.invest = Some(Box::new(state));
+        }
+        // O que o módulo aberto quer buscar, além do que a carteira já pede. Sai do
+        // pedido no instante em que ele fecha, que é o ponto: as séries do Banco Central
+        // não são buscadas por quem nunca abriu a tela de Renda Fixa.
+        let extras = match &self.focus {
+            Focus::Module(mf) => mf.view.ativos(),
+            _ => Vec::new(),
+        };
+        let Some(invest) = self.invest.as_mut() else {
+            return;
+        };
+        invest.sincronizar_pedido_com(&extras);
+        invest.atualizar_market();
+        let linhas = Self::montar_linhas_invest(invest);
+        if let Some(canal) = &self.invest_rows
+            && let Ok(mut destino) = canal.lock()
+        {
+            *destino = linhas;
+        }
+    }
+
+    /// As linhas da lista de módulos: nome, grupo, o que falta, e o resumo que cada
+    /// módulo dá de si fechado.
+    fn montar_linhas_invest(invest: &crate::invest::InvestState) -> Vec<TableRow> {
+        use crate::invest::module::Estado;
+        let ctx = invest.ctx();
+        invest
+            .ordem()
+            .into_iter()
+            .map(|m| {
+                let estado = match invest.estado(m) {
+                    Estado::Pronto => String::new(),
+                    Estado::Falta(f) => f,
+                };
+                // O estado entra no começo do resumo em vez de numa coluna própria: é
+                // curto, é a primeira coisa que se quer ler sobre um módulo que não está
+                // pronto, e uma coluna a mais não caberia no painel compacto.
+                let resumo = match estado.is_empty() {
+                    true => m.summary(&ctx),
+                    false => format!("{estado} · {}", m.summary(&ctx)),
+                };
+                // A terceira coluna é o grupo **mais as palavras-chave**: é o que faz
+                // «RSI» achar Indicadores e «DARF» achar Imposto. Ela é conteúdo de
+                // verdade — lê-se como as etiquetas do módulo —, e não um campo
+                // escondido para enganar a busca.
+                let assunto = match m.keywords().is_empty() {
+                    true => format!("{} · {}", m.group().label(), m.description()),
+                    false => format!(
+                        "{} · {} · {}",
+                        m.group().label(),
+                        m.description(),
+                        m.keywords()
+                    ),
+                };
+                let mut row = TableRow::leaf(vec![m.name().to_string(), resumo, assunto], 0);
+                // O `key` carrega o id do módulo, que é como o Enter sabe o que abrir —
+                // nunca o índice, que a ordem de último acesso muda.
+                row.key = m.id().to_string();
+                row
+            })
+            .collect()
+    }
+
+    /// `Enter` na lista de módulos. Carimba a abertura, abre a tela do módulo, e leva a
+    /// lista junto para o Esc poder devolvê-la intacta.
+    pub fn open_invest_module(&mut self) {
+        let Focus::Table(tf) = &self.focus else {
+            return;
+        };
+        let Some(id) = tf
+            .visible_indices()
+            .get(tf.selected)
+            .and_then(|&i| tf.rows.get(i))
+            .map(|row| row.key.clone())
+            .filter(|k| !k.is_empty())
+        else {
+            return;
+        };
+        self.open_module_by_id(&id);
+    }
+
+    /// Abre um módulo pelo id, de onde quer que o pedido tenha vindo.
+    pub fn open_module_by_id(&mut self, id: &str) {
+        self.open_module_com(id, None);
+    }
+
+    /// Abre um módulo **num ativo**: é o que faz «Enter no PETR4» chegar ao gráfico do
+    /// PETR4, e não ao do primeiro ativo que por acaso tenha série.
+    pub fn open_module_com(&mut self, id: &str, alvo: Option<crate::invest::model::AssetId>) {
+        self.abrir_modulo(id, alvo, None);
+    }
+
+    /// O mesmo, guardando o módulo de onde se veio — ver `ModuleFocus::anterior`.
+    fn abrir_modulo(
+        &mut self,
+        id: &str,
+        alvo: Option<crate::invest::model::AssetId>,
+        mut anterior: Option<Box<ModuleFocus>>,
+    ) {
+        let Some(invest) = self.invest.as_mut() else {
+            return;
+        };
+        // O carimbo é escrito **no momento em que o módulo abre**, e não quando fecha:
+        // abrir é o gesto que expressa interesse, e reordenar por tempo de permanência
+        // seria adivinhar intenção.
+        invest.marcar_aberto(id);
+        // Ver a tela é o que zera o aviso da barra.
+        if id == "alertas" {
+            invest.marcar_disparos_vistos();
+        }
+        let Some(view) = invest
+            .modulo(id)
+            .map(|m| m.open(&invest.ctx(), alvo.as_ref()))
+        else {
+            return;
+        };
+        // A thread só nasce agora — nunca ao entrar na aba.
+        invest.providers.start();
+
+        // Só depois de haver o que abrir é que o foco é tomado: desistir acima tem que
+        // deixar o foco intacto, mesma disciplina de `open_detail`.
+        //
+        // Dois caminhos chegam aqui, e os dois são legítimos: a tecla de um cartão da
+        // home, com o foco em `None`, e o Enter na lista completa, com a lista aberta. Só
+        // o segundo tem uma tela para devolver no Esc.
+        let parent = match std::mem::replace(&mut self.focus, Focus::None) {
+            Focus::Table(tf) => Some(tf),
+            Focus::None => None,
+            outro => {
+                self.focus = outro;
+                return;
+            }
+        };
+        self.focus = Focus::Module(Box::new(ModuleFocus {
+            module: id.to_string(),
+            view,
+            // Quem veio de outro módulo herda a lista-mãe daquele: sair dos dois tem que
+            // chegar no mesmo lugar de onde o primeiro foi aberto.
+            parent: parent.or_else(|| anterior.as_mut().and_then(|a| a.parent.take())),
+            anterior,
+        }));
+    }
+
+    /// `Esc` dentro de um módulo. Uma camada por vez: primeiro o que o módulo tem aberto,
+    /// e quando ele não tem mais nada a desfazer, sai.
+    ///
+    /// **Sem confirmação.** Ela existia e não protegia nada: cada módulo já descasca as
+    /// próprias camadas no `escape()` — o formulário, a busca digitada, a conferência de
+    /// uma importação —, então o Esc só chega aqui quando não há nada em andamento. Uma
+    /// caixa perguntando «sair?» para uma tela que não tem o que perder é uma caixa que
+    /// ensina a apertar Enter sem ler.
+    pub fn module_escape(&mut self) {
+        use crate::invest::module::Escape;
+        let Focus::Module(mf) = &mut self.focus else {
+            return;
+        };
+        if mf.view.escape() == Escape::Consumido {
+            return;
+        }
+        self.leave_module();
+    }
+
+    /// Volta para a home, ou para a lista de onde veio — exatamente como ela estava.
+    pub fn leave_module(&mut self) {
+        let Focus::Module(mf) = std::mem::replace(&mut self.focus, Focus::None) else {
+            return;
+        };
+        // Uma camada por vez, de volta pelo caminho de ida: se este módulo foi aberto de
+        // dentro de outro, o Esc devolve **aquele módulo**, com o cursor e a busca onde
+        // estavam. Só quando não há mais módulo embaixo é que se sai para a lista — ou
+        // para a grade, quando se entrou pela tecla de um cartão.
+        self.focus = match mf.anterior {
+            Some(anterior) => Focus::Module(anterior),
+            None => match mf.parent {
+                Some(tf) => Focus::Table(tf),
+                None => Focus::None,
+            },
+        };
+    }
+
+    /// Uma tecla dentro de um módulo. Tudo vai para ele, menos o que o app nunca entrega
+    /// — `Ctrl+C`, `Esc` e `Tab`.
+    pub fn module_key(&mut self, key: KeyEvent) {
+        use crate::invest::module::Outcome;
+        let Some(invest) = self.invest.as_mut() else {
+            return;
+        };
+        let Focus::Module(mf) = &mut self.focus else {
+            return;
+        };
+        let resultado = {
+            let ctx = invest.ctx();
+            mf.view.key(key, &ctx)
+        };
+        match resultado {
+            Outcome::Ignorada | Outcome::Ok => {}
+            Outcome::Editar(edits) => {
+                for edit in edits {
+                    invest.aplicar(edit);
+                }
+                // Gravado na hora, e não só no ritmo do tick: uma carteira que perde a
+                // última edição por um `kill` é uma carteira em que não se confia.
+                invest.persist();
+            }
+            Outcome::Abrir { modulo, alvo } => {
+                let modulo = modulo.to_string();
+                // O módulo atual é **guardado inteiro**, não fechado: o Esc do módulo que
+                // está abrindo volta para ele com o cursor e a busca onde estavam.
+                let anterior = match std::mem::replace(&mut self.focus, Focus::None) {
+                    Focus::Module(mf) => Some(mf),
+                    outro => {
+                        self.focus = outro;
+                        None
+                    }
+                };
+                self.abrir_modulo(&modulo, alvo, anterior);
+            }
+        }
+    }
+
+    /// O tique de um módulo aberto: ele lê o retrato que as threads publicaram. Nunca faz
+    /// I/O.
+    fn tick_module(&mut self) {
+        let (Some(invest), Focus::Module(mf)) = (self.invest.as_ref(), &mut self.focus) else {
+            return;
+        };
+        let ctx = invest.ctx();
+        mf.view.tick(&ctx);
+        let alertas_na_tela = mf.module == "alertas";
+        if alertas_na_tela && let Some(invest) = self.invest.as_mut() {
+            invest.marcar_disparos_vistos();
+        }
+    }
+
     /// True while a destructive action is waiting to be confirmed. Checked before every
     /// other handler, including the rules screen's — the box sits over all of them.
     pub fn confirm_open(&self) -> bool {
@@ -4164,5 +4723,77 @@ impl App {
             map.insert(panel.monitor.id().to_string(), panel.history.values());
         }
         history::save_all(&map);
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::{Cartao, ordenar_cartoes};
+    use crate::invest::module::{Pane, Tone};
+
+    fn cartao(id: &str, destaque: u8) -> Cartao {
+        Cartao {
+            id: id.to_string(),
+            nome: id.to_string(),
+            resumo: String::new(),
+            destaque,
+            pane: Some(Pane::Facts {
+                title: String::new(),
+                rows: vec![(String::new(), String::new(), Tone::Normal); 3],
+            }),
+        }
+    }
+
+    fn ids(cartoes: &[Cartao]) -> Vec<String> {
+        cartoes.iter().map(|c| c.id.clone()).collect()
+    }
+
+    #[test]
+    fn quem_tem_mais_destaque_sobe() {
+        let mut v = vec![
+            cartao("pouco", 1),
+            cartao("muito", 5),
+            cartao("medio", 3),
+            cartao("nenhum", 0),
+        ];
+        ordenar_cartoes(&mut v);
+        assert_eq!(ids(&v), ["muito", "medio", "pouco", "nenhum"]);
+    }
+
+    #[test]
+    fn o_conteudo_do_cartao_nao_mexe_na_ordem() {
+        // O bug relatado: o cartão de Cotações crescia quando o preço chegava e pulava
+        // para cima, levando os outros junto. A ordem não pode olhar para dentro do
+        // painel — só para o número que o módulo declarou.
+        let mut cheio = cartao("a", 1);
+        cheio.pane = Some(Pane::Facts {
+            title: String::new(),
+            rows: vec![(String::new(), String::new(), Tone::Normal); 40],
+        });
+        let mut v = vec![cheio, cartao("b", 2)];
+        ordenar_cartoes(&mut v);
+        assert_eq!(ids(&v), ["b", "a"], "quarenta linhas não compram lugar");
+    }
+
+    #[test]
+    fn empate_mantem_a_ordem_de_registro() {
+        // Estável de propósito: um desempate arbitrário faria a home trocar de arranjo
+        // entre uma volta e outra, e a tecla de um cartão deixaria de ser decorável.
+        let mut v = vec![cartao("a", 3), cartao("b", 3), cartao("c", 3)];
+        ordenar_cartoes(&mut v);
+        assert_eq!(ids(&v), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn ordenar_e_uma_permutacao_e_nao_perde_nem_duplica_modulo() {
+        // O jeito de a home «perder» um módulo é ele sumir daqui: o que não está na lista
+        // não tem cartão nem tecla, e não há outra porta para ele além da busca.
+        let mut v: Vec<Cartao> = (0..28)
+            .map(|i| cartao(&format!("m{i}"), (i % 6) as u8))
+            .collect();
+        let antes: std::collections::BTreeSet<String> = ids(&v).into_iter().collect();
+        ordenar_cartoes(&mut v);
+        assert_eq!(v.len(), 28);
+        assert_eq!(antes, ids(&v).into_iter().collect());
     }
 }

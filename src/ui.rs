@@ -6,8 +6,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, RenderDirection, Row as UiRow, Sparkline, Table,
-    TableState,
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, RenderDirection,
+    Row as UiRow, Sparkline, Table, TableState, Wrap,
 };
 
 use crate::action::Gravity;
@@ -76,6 +76,8 @@ impl ShortcutMap {
                 ShortcutTarget::Table(idx) => {
                     table.insert(idx, key);
                 }
+                // A grade da aba Invest desenha os próprios badges, pela posição.
+                ShortcutTarget::Module(_) => {}
             }
         }
         Self { chart, table }
@@ -296,6 +298,18 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
             render_text_view(frame, area, view);
             return;
         }
+        // Um módulo é tela cheia de verdade: ele fica **abaixo da barra de abas**, como
+        // as outras telas, mas ocupa tudo o mais. A fita não aparece por cima dele — um
+        // módulo é onde o programa sai da frente.
+        Focus::Module(mf) => {
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(TAB_BAR_HEIGHT), Constraint::Min(0)])
+                .split(area);
+            render_tab_bar(frame, sections[0], app);
+            render_module(frame, sections[1], app, mf);
+            return;
+        }
         Focus::None => {}
     }
 
@@ -311,6 +325,7 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Containers => render_containers_tab(frame, sections[1], app),
         Tab::Tmux => render_tmux_tab(frame, sections[1], app),
         Tab::Tools => render_tools_tab(frame, sections[1], app),
+        Tab::Invest => render_invest_tab(frame, sections[1], app),
     }
 }
 
@@ -322,6 +337,12 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
 /// keystroke aimed at the screen underneath can't answer a question it never saw.
 fn render_confirm(frame: &mut Frame, area: Rect, pending: &Pending) {
     let danger = &pending.danger;
+    // Vermelha, sempre: toda pergunta que esta caixa faz é sobre perda irreversível.
+    //
+    // Houve uma amarela, para o «sair do módulo?» — e ela saiu junto com a pergunta. Uma
+    // confirmação que não protege nada ensina a apertar Enter sem ler, e é o que faz a
+    // vermelha deixar de ser lida também.
+    let cor = palette::RED;
     let width = CONFIRM_WIDTH.min(area.width);
     let text_width = (width as usize).saturating_sub(WIZARD_TEXT_MARGIN);
 
@@ -374,12 +395,10 @@ fn render_confirm(frame: &mut Frame, area: Rect, pending: &Pending) {
     let block = Block::default()
         .title(Span::styled(
             format!(" {} ", danger.title),
-            Style::default()
-                .fg(palette::RED)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(cor).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette::RED))
+        .border_style(Style::default().fg(cor))
         .title_bottom(hint_line("Enter confirmar · Esc cancelar"));
     let inner = block.inner(box_area);
     frame.render_widget(Clear, box_area);
@@ -739,6 +758,20 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(palette::DIM)
         };
         spans.push(Span::styled(format!(" {} ", tab.title()), style));
+        // O aviso de alerta mora aqui e em nenhum outro lugar: um monitor que sequestra a
+        // tela para avisar é um monitor que se fecha. Um contador na barra é o quanto de
+        // atenção isto pede.
+        if *tab == Tab::Invest
+            && let Some(invest) = &app.invest
+            && invest.disparos_novos > 0
+        {
+            spans.push(Span::styled(
+                format!("({}) ", invest.disparos_novos),
+                Style::default()
+                    .fg(palette::YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
@@ -757,6 +790,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
         // fullscreened is the sort of hint that sends someone hunting for a bug.
         let keys = match app.tab {
             Tab::Tools => "Tab/Shift+Tab alternar aba · Ctrl+C 2x sair",
+            Tab::Invest => "tecla do cartão entra · Enter todos · Tab alternar aba · Ctrl+C 2x sair",
             // A tecla que cria uma sessão só é anunciada onde ela faz alguma coisa: um
             // rodapé que promete um atalho inexistente manda procurar um bug.
             Tab::Tmux => {
@@ -1284,6 +1318,14 @@ fn table_col_widths(headers: &[&str], rows: &[TableRow]) -> Vec<Constraint> {
             Constraint::Fill(1),
             Constraint::Fill(2),
         ],
+        // A lista de módulos: o nome cabe em vinte colunas e o resumo é a coluna que
+        // tem o que dizer, então é ela que fica com a folga.
+        ["Módulo", "Resumo", "Assunto"] => vec![
+            Constraint::Length(22),
+            Constraint::Fill(3),
+            Constraint::Fill(2),
+        ],
+        ["Módulo", "Resumo"] => vec![Constraint::Length(20), Constraint::Fill(1)],
         ["User", "Host", "TTY", "Time", "Folder", "Command"] => vec![
             Constraint::Length(10),
             Constraint::Length(16),
@@ -3020,4 +3062,1269 @@ fn settle_scroll(
         }
     }
     monitor.match_index.get().filter(|&i| i < matches.len())
+}
+
+// ---------------------------------------------------------------------------
+// A aba Invest
+// ---------------------------------------------------------------------------
+
+/// A tela principal da aba: a fita, a lista de módulos, e o espaço reservado das
+/// favoritas.
+///
+/// As favoritas ficam **vazias na v1**, por decisão explícita: elas existem para o que o
+/// usuário quiser monitorar sem entrar em módulo nenhum, e essa escolha só faz sentido
+/// depois que houver módulos para escolher. O espaço fica reservado mostrando o que é —
+/// um retângulo em branco sem explicação seria pior que nada.
+/// A home da aba Invest: uma grade de cartões, um por módulo, na ordem do último
+/// acesso.
+///
+/// Não é um índice. Um índice obriga a entrar em cada módulo para descobrir se ele tem
+/// algo a dizer; aqui cada cartão já diz, e a tecla de atalho entra direto no módulo em
+/// vez de ampliar o cartão — ampliar daria o mesmo painel maior, e o que se quer é a tela
+/// que edita, importa e agrupa.
+///
+/// A grade mostra os que couberem. São 28 módulos e nenhuma tela cabe todos, então o
+/// Enter abre a lista completa, buscável, para chegar ao resto.
+fn render_invest_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let fita = invest_fita(app);
+    // Vazia, a fita não ocupa linha nenhuma. Nada de faixa em branco no topo.
+    let linhas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(u16::from(!fita.is_empty())),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    if !fita.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(fita)).style(Style::default().fg(palette::DIM)),
+            linhas[0],
+        );
+    }
+
+    let cartoes = app.invest_home();
+    render_invest_grade(frame, linhas[1], &cartoes);
+
+    // O rodapé diz as duas teclas que a grade não consegue mostrar sozinha, e cede o
+    // lugar para um problema de gravação quando há um — um erro ao salvar a carteira
+    // importa mais que uma dica que o usuário já leu.
+    let rodape = match invest_nota(app) {
+        Some(nota) => Line::styled(format!(" {nota}"), Style::default().fg(palette::YELLOW)),
+        None => Line::styled(
+            " a tecla de cada cartão entra no módulo · Enter lista todos os módulos",
+            Style::default().fg(palette::DIM),
+        ),
+    };
+    frame.render_widget(Paragraph::new(rodape), linhas[2]);
+}
+
+/// Largura e altura mínimas de um cartão. Abaixo disso ele não mostra nada além da
+/// moldura, e uma moldura vazia é pior que um cartão a menos.
+const CARTAO_MIN_L: u16 = 30;
+const CARTAO_MIN_A: u16 = 4;
+
+/// Quanto um cartão **quer** de altura: o conteúdo dele, mais as duas linhas de moldura.
+///
+/// A grade não divide a tela em partes iguais justamente por causa disto. Um cartão de
+/// «Correlação» tem uma linha a dizer e um de «Cotações» tem seis; dar doze a cada um
+/// enche a home de moldura vazia e ainda deixa metade dos módulos de fora da tela.
+fn altura_desejada(destaque: u8) -> u16 {
+    // O conteúdo **não** entra nesta conta, e é o ponto: uma altura que segue o conteúdo
+    // muda quando a cotação chega, e um cartão que muda de altura empurra todos os de
+    // baixo para outra linha. O módulo declara quanto lugar quer, e ele fica com esse
+    // lugar sempre — cheio ou vazio.
+    let dentro = match destaque {
+        // Os três de todo dia: patrimônio, posições e cotações.
+        7..=9 => 8,
+        // Índices e Agenda: listas de oito a dez linhas, das quais seis já dizem muito.
+        5..=6 => 6,
+        // O heatmap desenha células de quatro linhas de altura; menos que isso corta.
+        4 => 6,
+        // Os que têm painel e não são o centro da tela.
+        2..=3 => 5,
+        // Os que só têm um resumo. Uma moldura e a frase.
+        _ => 3,
+    };
+    (dentro + 2u16).max(CARTAO_MIN_A)
+}
+
+/// Como a grade se divide: quantas colunas, e a altura de cada faixa.
+///
+/// Empacota de cima para baixo, cada faixa alta o bastante para o cartão mais exigente
+/// dela, e para quando a tela acaba. É por isso que a home cabe mais módulos do que uma
+/// grade de células iguais caberia — e por isso um cartão nunca sai cortado no meio.
+///
+/// Fora do desenho para poder ser testada sem um terminal: é aritmética, e aritmética que
+/// erra por um deixa uma faixa morta na tela.
+fn grade_de(area: Rect, desejadas: &[u16]) -> (usize, Vec<u16>) {
+    if desejadas.is_empty() || area.width < CARTAO_MIN_L || area.height < CARTAO_MIN_A {
+        return (0, Vec::new());
+    }
+    let colunas = ((area.width / CARTAO_MIN_L) as usize)
+        .clamp(1, 4)
+        .min(desejadas.len());
+    let mut alturas = Vec::new();
+    let mut usado = 0;
+    for faixa in desejadas.chunks(colunas) {
+        let altura = faixa.iter().copied().max().unwrap_or(CARTAO_MIN_A);
+        // Uma faixa que não cabe inteira não entra pela metade: o cartão cortado mostra
+        // um número sem o rótulo dele, que é pior que não mostrar nada.
+        if usado + altura > area.height {
+            break;
+        }
+        usado += altura;
+        alturas.push(altura);
+    }
+    // Numa tela baixa demais para a primeira faixa inteira, desenha ela assim mesmo, do
+    // tamanho que houver. Um cartão apertado ainda mostra o nome e a tecla; a alternativa
+    // era uma home em branco, que não mostra nem que existem módulos.
+    if alturas.is_empty() {
+        return (colunas, vec![area.height]);
+    }
+    // A sobra é dividida por igual entre as faixas, e não jogada na última.
+    //
+    // Jogar na última dava um cartão de trinta linhas embaixo de cartões de quatro — o
+    // contrário do que esta função existe para evitar. Dividida, cada cartão fica um
+    // pouco mais folgado e a grade fecha a tela; numa tela cheia não sobra nada e esta
+    // parte não faz nada.
+    let sobra = area.height - usado;
+    let n = alturas.len() as u16;
+    for (i, altura) in alturas.iter_mut().enumerate() {
+        *altura += sobra / n + u16::from((i as u16) < sobra % n);
+    }
+    (colunas, alturas)
+}
+
+fn render_invest_grade(frame: &mut Frame, area: Rect, cartoes: &[crate::app::Cartao]) {
+    let desejadas: Vec<u16> = cartoes
+        .iter()
+        .map(|c| altura_desejada(c.destaque))
+        .collect();
+    let (colunas, alturas) = grade_de(area, &desejadas);
+    if colunas == 0 {
+        return;
+    }
+    let faixas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(alturas.iter().map(|a| Constraint::Length(*a)))
+        .split(area);
+
+    for (l, faixa) in faixas.iter().enumerate() {
+        let celulas = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(vec![Constraint::Ratio(1, colunas as u32); colunas])
+            .split(*faixa);
+        for (c, celula) in celulas.iter().enumerate() {
+            let indice = l * colunas + c;
+            let Some(cartao) = cartoes.get(indice) else {
+                return;
+            };
+            render_cartao(
+                frame,
+                *celula,
+                &cartao.nome,
+                &cartao.resumo,
+                cartao.pane.as_ref(),
+                indice,
+            );
+        }
+    }
+}
+
+/// Um cartão. O painel do módulo quando ele tem um; o resumo, quando não tem.
+fn render_cartao(
+    frame: &mut Frame,
+    area: Rect,
+    nome: &str,
+    resumo: &str,
+    pane: Option<&crate::invest::module::Pane>,
+    indice: usize,
+) {
+    match pane {
+        Some(pane) => render_pane(frame, area, pane),
+        // Sem painel o cartão ainda existe, com o resumo: o módulo continua alcançável
+        // pela tecla, e a home não ganha um buraco onde havia um nome.
+        None => {
+            let bloco = moldura(nome);
+            let dentro = bloco.inner(area);
+            frame.render_widget(bloco, area);
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    resumo.to_string(),
+                    Style::default().fg(palette::DIM),
+                ))
+                .wrap(Wrap { trim: true }),
+                dentro,
+            );
+        }
+    }
+    // A tecla vai por cima da borda, encostada no canto e não sobre ele. `render_pane`
+    // monta a própria moldura, então o crachá é desenhado depois em vez de entrar nela.
+    if let Some(badge) = shortcut_badge(crate::app::shortcut_key(indice))
+        && area.width > 2
+    {
+        frame.render_widget(
+            Paragraph::new(badge),
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width - 1,
+                height: 1,
+            },
+        );
+    }
+}
+
+/// A faixa fina do topo. Não rola nem anima: um terminal não é telão de corretora, texto
+/// que se move é texto que não se lê, e animar forçaria um redesenho constante — que é
+/// exatamente o que o laço principal foi desenhado para evitar.
+fn invest_fita(app: &App) -> Vec<Span<'static>> {
+    let Some(invest) = &app.invest else {
+        return Vec::new();
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for ativo in &invest.portfolio.fita {
+        let Some(q) = invest.market.quote(ativo) else {
+            continue;
+        };
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::default().fg(palette::DIM)));
+        }
+        spans.push(Span::styled(
+            format!("{} ", ativo.short()),
+            Style::default().fg(palette::DIM),
+        ));
+        spans.push(Span::raw(crate::invest::calc::preco(q.preco)));
+        if let Some(v) = q.variacao().filter(|_| q.grade.ao_vivo()) {
+            spans.push(Span::styled(
+                format!(" {}", crate::invest::calc::pct(v)),
+                Style::default().fg(match v >= 0.0 {
+                    true => palette::GREEN,
+                    false => palette::RED,
+                }),
+            ));
+        }
+    }
+    spans
+}
+
+/// A nota do rodapé da lista: o que houve de errado ao ler a carteira, e o que a
+/// gravação disse.
+fn invest_nota(app: &App) -> Option<String> {
+    let invest = app.invest.as_ref()?;
+    if let Some(erro) = &invest.erro_gravacao {
+        return Some(erro.clone());
+    }
+    match &invest.issue {
+        Some(crate::invest::store::LoadIssue::Corrompido {
+            salvo_em,
+            do_backup,
+        }) => Some(format!(
+            "o arquivo da carteira estava ilegível e foi guardado em {salvo_em}{}",
+            match do_backup {
+                true => " — a cópia de segurança foi carregada no lugar",
+                false => " — e não havia cópia de segurança",
+            }
+        )),
+        Some(crate::invest::store::LoadIssue::VersaoDesconhecida { arquivo, entendo }) => {
+            Some(format!(
+                "a carteira é da versão {arquivo} e este monitorzinho entende até a {entendo} — nada será gravado"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Desenha um módulo em tela cheia.
+///
+/// Aqui está o outro lado da decisão de `invest::module`: o módulo não recebe o `Frame`.
+/// Ele devolveu um `Layout` de `Pane`s, e é este arquivo — o único do programa que conhece
+/// o ratatui — que os transforma em pixels. Um módulo desenha bem porque não tem como
+/// desenhar diferente.
+fn render_module(frame: &mut Frame, area: Rect, app: &App, mf: &crate::app::ModuleFocus) {
+    use crate::invest::module::Layout as ML;
+
+    let Some(invest) = &app.invest else { return };
+    let ctx = invest.ctx();
+    let layout = mf.view.layout(&ctx);
+
+    let partes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+
+    fn desenhar(frame: &mut Frame, area: Rect, no: &ML) {
+        match no {
+            ML::Leaf(pane) => render_pane(frame, area, pane),
+            ML::Rows(partes) | ML::Cols(partes) => {
+                let vertical = matches!(no, ML::Rows(_));
+                let pesos: Vec<Constraint> = partes
+                    .iter()
+                    .map(|(peso, _)| Constraint::Fill((*peso).max(1)))
+                    .collect();
+                let areas = Layout::default()
+                    .direction(match vertical {
+                        true => Direction::Vertical,
+                        false => Direction::Horizontal,
+                    })
+                    .constraints(pesos)
+                    .split(area);
+                for ((_, filho), &area) in partes.iter().zip(areas.iter()) {
+                    desenhar(frame, area, filho);
+                }
+            }
+        }
+    }
+    desenhar(frame, partes[0], &layout);
+
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!(" {}", mf.view.hint()),
+            Style::default().fg(palette::DIM),
+        )),
+        partes[1],
+    );
+}
+
+/// A cor de um tom. Os módulos nomeiam o **significado**; a escolha do RGB é daqui, da
+/// paleta que já existe — assim uma mudança de paleta não passa por vinte módulos.
+fn tone_color(tone: crate::invest::module::Tone) -> Color {
+    use crate::invest::module::Tone;
+    match tone {
+        Tone::Normal => Color::Reset,
+        Tone::Dim => palette::DIM,
+        Tone::Bom => palette::GREEN,
+        Tone::Ruim => palette::RED,
+        Tone::Aviso => palette::YELLOW,
+        Tone::Destaque => palette::CYAN,
+    }
+}
+
+fn moldura(titulo: &str) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::DIM))
+        .title(Line::styled(
+            format!(" {titulo} "),
+            Style::default().fg(palette::CYAN),
+        ))
+}
+
+fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane) {
+    use crate::invest::module::Pane;
+    match pane {
+        Pane::Table {
+            title,
+            headers,
+            rows,
+            selected,
+            query,
+            note,
+        } => render_pane_table(
+            frame,
+            area,
+            &TabelaPane {
+                title,
+                headers,
+                rows,
+                selected: *selected,
+                query,
+                note: note.as_deref(),
+            },
+        ),
+        Pane::Chart {
+            title,
+            series,
+            format,
+            marks,
+            x_labels,
+            note,
+        } => render_pane_chart(
+            frame,
+            area,
+            &GraficoPane {
+                title,
+                series,
+                formatar: *format,
+                marks,
+                x_labels,
+                note: note.as_deref(),
+            },
+        ),
+        Pane::Facts { title, rows } => render_pane_facts(frame, area, title, rows),
+        Pane::Bars { title, rows, full } => render_pane_bars(frame, area, title, rows, *full),
+        Pane::Grid {
+            title,
+            cells,
+            selected,
+            legend,
+        } => render_pane_grid(frame, area, title, cells, *selected, legend),
+        Pane::Text {
+            title,
+            lines,
+            scroll,
+        } => {
+            let bloco = moldura(title);
+            let dentro = bloco.inner(area);
+            frame.render_widget(bloco, area);
+            let texto: Vec<Line> = lines
+                .iter()
+                .map(|(t, tone)| Line::styled(t.clone(), Style::default().fg(tone_color(*tone))))
+                .collect();
+            frame.render_widget(Paragraph::new(texto).scroll((*scroll, 0)), dentro);
+        }
+        Pane::Empty { title, note } => {
+            let bloco = moldura(title);
+            let dentro = bloco.inner(area);
+            frame.render_widget(bloco, area);
+            let linhas: Vec<Line> = std::iter::once(Line::raw(""))
+                .chain(
+                    note.lines()
+                        .map(|l| Line::styled(format!("  {l}"), Style::default().fg(palette::DIM))),
+                )
+                .collect();
+            frame.render_widget(Paragraph::new(linhas), dentro);
+        }
+        Pane::Form {
+            title,
+            fields,
+            selected,
+            error,
+            hint,
+        } => render_pane_form(
+            frame,
+            area,
+            title,
+            fields,
+            *selected,
+            error.as_deref(),
+            hint,
+        ),
+    }
+}
+
+/// As partes de um `Pane::Table` na hora de desenhar. Uma struct e não oito argumentos
+/// soltos: com oito, trocar dois de lugar por engano compila.
+struct TabelaPane<'a> {
+    title: &'a str,
+    headers: &'a [String],
+    rows: &'a [crate::invest::module::Row],
+    selected: Option<usize>,
+    query: &'a str,
+    note: Option<&'a str>,
+}
+
+fn render_pane_table(frame: &mut Frame, area: Rect, pane: &TabelaPane) {
+    let TabelaPane {
+        title,
+        headers,
+        rows,
+        selected,
+        query,
+        note,
+    } = pane;
+    let (selected, note) = (*selected, *note);
+    use crate::invest::module::Tone;
+
+    let mut titulo = title.to_string();
+    if !query.is_empty() {
+        titulo.push_str(&format!(" · buscando «{query}»"));
+    }
+    let mut bloco = moldura(&titulo);
+    if let Some(note) = note.filter(|n| !n.is_empty()) {
+        bloco = bloco.title_bottom(Line::styled(
+            format!(" {note} "),
+            Style::default().fg(palette::YELLOW),
+        ));
+    }
+    let dentro = bloco.inner(area);
+    frame.render_widget(bloco, area);
+
+    // A busca filtra: uma lista de módulos ou de posições é curta, e ver só o que casa é
+    // o que se espera dela — diferente das tabelas do sistema, onde as linhas em volta de
+    // um acerto costumam ser o assunto.
+    let needle = query.to_lowercase();
+    let visiveis: Vec<&crate::invest::module::Row> =
+        rows.iter().filter(|r| r.matches(&needle)).collect();
+
+    let ui_rows: Vec<UiRow> = visiveis
+        .iter()
+        .map(|r| {
+            let celulas: Vec<Cell> = r
+                .cells
+                .iter()
+                .enumerate()
+                .map(|(i, texto)| {
+                    let tone = r.cell_tones.get(i).copied().unwrap_or(r.tone);
+                    let texto = match (i, r.depth) {
+                        (0, d) if d > 0 => format!("{}{texto}", "  ".repeat(d)),
+                        _ => texto.clone(),
+                    };
+                    Cell::from(texto).style(Style::default().fg(tone_color(tone)))
+                })
+                .collect();
+            let linha = UiRow::new(celulas);
+            match r.tone {
+                Tone::Destaque => linha.style(Style::default().add_modifier(Modifier::BOLD)),
+                _ => linha,
+            }
+        })
+        .collect();
+
+    let larguras = larguras_de(headers, &visiveis, dentro.width);
+    let tabela = Table::new(ui_rows, larguras)
+        .header(
+            UiRow::new(
+                headers
+                    .iter()
+                    .map(|h| Cell::from(h.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .style(
+                Style::default()
+                    .fg(palette::DIM)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut estado = TableState::default();
+    estado.select(selected.filter(|s| *s < visiveis.len()));
+    frame.render_stateful_widget(tabela, dentro, &mut estado);
+}
+
+/// Larguras das colunas: o conteúdo mais largo de cada uma, com a sobra distribuída.
+///
+/// Duas coisas dão errado se isto for ingênuo, e as duas foram vistas na tela.
+///
+/// Deixar tudo em `Length` faz a tabela se encolher à esquerda e deixar metade da tela
+/// vazia — o que num terminal largo parece defeito, porque é. Mas pôr uma coluna elástica
+/// é pior: ela toma a folga inteira e abre um vão no meio da linha.
+///
+/// A saída é distribuir a sobra **em proporção ao conteúdo**: a coluna que carrega texto
+/// longo ganha mais folga que a que carrega um número de seis dígitos, e nenhuma fica com
+/// um vão. E quando o conteúdo não cabe, encolhe-se proporcionalmente em vez de deixar as
+/// últimas colunas com zero — que era o outro sintoma, o de valores que somem.
+fn larguras_de(
+    headers: &[String],
+    rows: &[&crate::invest::module::Row],
+    disponivel: u16,
+) -> Vec<Constraint> {
+    const ESPACO: usize = 2;
+    const MINIMO: usize = 5;
+    let mut larguras: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for r in rows {
+        for (i, c) in r.cells.iter().enumerate().take(larguras.len()) {
+            larguras[i] = larguras[i].max(c.chars().count() + r.depth * 2);
+        }
+    }
+    if larguras.is_empty() || disponivel == 0 {
+        return Vec::new();
+    }
+
+    let pedido: usize = larguras.iter().map(|l| l + ESPACO).sum();
+    let disponivel = disponivel as usize;
+
+    if pedido >= disponivel {
+        // Não cabe: encolhe em proporção, com um piso para nenhuma coluna sumir. Zerar as
+        // últimas — que é o que o corte simples faz — apaga justamente os valores.
+        let sobra = disponivel.saturating_sub(MINIMO * larguras.len());
+        let excedente: usize = larguras
+            .iter()
+            .map(|l| (l + ESPACO).saturating_sub(MINIMO))
+            .sum::<usize>()
+            .max(1);
+        return larguras
+            .iter()
+            .map(|l| {
+                let extra = (l + ESPACO).saturating_sub(MINIMO) * sobra / excedente;
+                Constraint::Length((MINIMO + extra) as u16)
+            })
+            .collect();
+    }
+
+    // Cabe: a folga vai para as colunas em proporção ao que cada uma carrega.
+    let folga = disponivel - pedido;
+    let total: usize = larguras.iter().sum::<usize>().max(1);
+    let mut saida: Vec<u16> = larguras
+        .iter()
+        .map(|l| (l + ESPACO + l * folga / total) as u16)
+        .collect();
+    // O arredondamento sempre sobra alguns caracteres; eles vão para a última coluna, em
+    // vez de virarem uma faixa morta na beira.
+    let distribuido: u16 = saida.iter().sum();
+    if let Some(ultima) = saida.last_mut() {
+        *ultima += (disponivel as u16).saturating_sub(distribuido);
+    }
+    saida.into_iter().map(Constraint::Length).collect()
+}
+
+/// As partes de um `Pane::Chart` na hora de desenhar. Uma struct e não oito argumentos
+/// soltos, pelo mesmo motivo de `TabelaPane`: com oito, trocar dois de lugar compila.
+struct GraficoPane<'a> {
+    title: &'a str,
+    series: &'a [f64],
+    formatar: fn(f64) -> String,
+    marks: &'a [(f64, String)],
+    x_labels: &'a [String],
+    note: Option<&'a str>,
+}
+
+fn render_pane_chart(frame: &mut Frame, area: Rect, pane: &GraficoPane) {
+    let GraficoPane {
+        title,
+        series,
+        formatar,
+        marks,
+        x_labels,
+        note,
+    } = pane;
+    let (formatar, note) = (*formatar, *note);
+    let mut titulo = title.to_string();
+    if let Some(ultimo) = series.last() {
+        titulo.push_str(&format!(" · {}", formatar(*ultimo)));
+    }
+    let mut bloco = moldura(&titulo);
+    if let Some(note) = note.filter(|n| !n.is_empty()) {
+        bloco = bloco.title_bottom(Line::styled(
+            format!(" {note} "),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    let dentro = bloco.inner(area);
+    frame.render_widget(bloco, area);
+
+    if series.len() < 2 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  sem série ainda",
+                Style::default().fg(palette::DIM),
+            )),
+            dentro,
+        );
+        return;
+    }
+
+    // Uma coluna por ponto, para uma série densa não perder as últimas semanas — ver
+    // `reamostrar`. O `Chart` do ratatui desenha qualquer quantidade, mas reamostrar
+    // mantém o custo proporcional à tela e não à série.
+    let series = reamostrar(series, dentro.width.saturating_sub(12).max(4) as usize);
+
+    // **A escala é a da janela, e ela fica escrita no eixo.**
+    //
+    // A `Sparkline` que desenhava isto antes só sabia magnitude a partir de uma base: com
+    // a base no mínimo, o menor ponto virava altura zero e o maior virava a coluna cheia
+    // — um patrimônio que andou um por cento parecia ter ido a zero e voltado. Com eixo
+    // rotulado a forma continua visível **e** o leitor vê entre que valores ela se move.
+    let minimo = series.iter().copied().fold(f64::INFINITY, f64::min);
+    let maximo = series.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // Uma folga de um vinte avos em cada ponta: sem ela a linha encosta na borda e o
+    // ponto mais alto some dentro da moldura.
+    let folga = ((maximo - minimo) / 20.0).max(f64::EPSILON);
+    let (piso, teto) = (minimo - folga, maximo + folga);
+
+    let pontos: Vec<(f64, f64)> = series
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as f64, *v))
+        .collect();
+    let mut conjuntos = vec![
+        Dataset::default()
+            .marker(ratatui::symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(palette::CYAN))
+            .data(&pontos),
+    ];
+    // As linhas de referência viram séries retas: o `Chart` não tem linha horizontal, e
+    // uma série de dois pontos na mesma altura é exatamente isso.
+    let retas: Vec<Vec<(f64, f64)>> = marks
+        .iter()
+        .map(|(v, _)| vec![(0.0, *v), ((series.len() - 1) as f64, *v)])
+        .collect();
+    for reta in &retas {
+        conjuntos.push(
+            Dataset::default()
+                .marker(ratatui::symbols::Marker::Dot)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(palette::YELLOW))
+                .data(reta),
+        );
+    }
+
+    // O eixo do tempo só ganha rótulo quando quem montou o painel disse quais são: numa
+    // série de preço de seis meses a data exata de cada coluna não é o que se lê.
+    //
+    // **Todos os rótulos que couberem**, e não só as pontas: num gráfico de sete dias ou
+    // seis meses, saber que a queda foi na quinta — e não «em algum lugar entre segunda e
+    // hoje» — é metade do que ele tem a dizer. Quantos cabem depende da largura e do
+    // tamanho do rótulo, e passar mais do que isso faz o ratatui sobrepor um no outro.
+    let x = match x_labels.len() >= 2 {
+        true => {
+            let largura = x_labels
+                .iter()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(5)
+                + 2;
+            let cabem = (dentro.width as usize / largura.max(1)).clamp(2, x_labels.len());
+            // Espaçados por igual, sempre com o primeiro e o último: um eixo que começa no
+            // segundo ponto mente sobre onde a série começa.
+            let amostrar = |n: usize| -> Vec<String> {
+                (0..n)
+                    .map(|i| x_labels[i * (x_labels.len() - 1) / (n - 1)].clone())
+                    .collect()
+            };
+            // **Sem rótulo repetido.** Num gráfico de seis meses os rótulos são `mm/aa`, e
+            // cento e vinte pregões cabem em seis meses: espaçar por igual dava
+            // «12/25 12/25 12/25 01/26 01/26». Um eixo que repete não diz onde as coisas
+            // estão — então tira-se um rótulo até que todos sejam distintos.
+            let rotulos = (2..=cabem)
+                .rev()
+                .map(amostrar)
+                .find(|r| {
+                    let unicos: std::collections::BTreeSet<&String> = r.iter().collect();
+                    unicos.len() == r.len()
+                })
+                .unwrap_or_else(|| amostrar(2));
+            Axis::default()
+                .bounds([0.0, (series.len() - 1) as f64])
+                .style(Style::default().fg(palette::DIM))
+                .labels(rotulos)
+        }
+        false => Axis::default().bounds([0.0, (series.len() - 1) as f64]),
+    };
+    let meio = (piso + teto) / 2.0;
+    let chart = Chart::new(conjuntos)
+        .x_axis(x)
+        .y_axis(
+            Axis::default()
+                .bounds([piso, teto])
+                .style(Style::default().fg(palette::DIM))
+                .labels([formatar(piso), formatar(meio), formatar(teto)]),
+        )
+        .legend_position(None);
+    frame.render_widget(chart, dentro);
+
+    // A legenda das referências no rodapé, como antes: o `Chart` nomearia cada série na
+    // legenda dele, e três nomes num painel estreito comem a área do desenho.
+    if !marks.is_empty() && dentro.height > 2 {
+        let legenda = marks
+            .iter()
+            .map(|(v, r)| format!("{r} {}", formatar(*v)))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {legenda} "),
+                Style::default().fg(palette::YELLOW),
+            ))
+            .alignment(ratatui::layout::Alignment::Right),
+            Rect {
+                x: dentro.x,
+                y: area.y + area.height - 1,
+                width: dentro.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+/// Encolhe uma série para caber em `largura` colunas, uma coluna por ponto.
+///
+/// Cada coluna vira a **média** do seu balde, e não uma amostra dele: pegar um ponto a
+/// cada N mostra um preço que existiu, mas perde a forma — dois baldes seguidos podem
+/// cair os dois num pico e sumir com o vale entre eles. A média preserva a tendência, que
+/// é o que um gráfico deste tamanho tem a dizer.
+///
+/// Séries menores que a largura passam intactas: esticar inventaria pontos.
+fn reamostrar(series: &[f64], largura: usize) -> Vec<f64> {
+    if largura == 0 || series.is_empty() {
+        return series.to_vec();
+    }
+    // **Poucos pontos são esticados, e não deixados num canto.** Sete dias num painel de
+    // oitenta colunas desenhavam sete colunas finas coladas à esquerda e setenta e três de
+    // vazio — que se lê como um gráfico que acabou, e não como uma semana. Cada ponto vira
+    // uma faixa larga, em degrau: é o desenho honesto para um valor que vale o período
+    // inteiro, como o fechamento de um dia ou de um mês.
+    if series.len() < largura {
+        return (0..largura)
+            .map(|i| series[i * series.len() / largura])
+            .collect();
+    }
+    if series.len() == largura {
+        return series.to_vec();
+    }
+    (0..largura)
+        .map(|i| {
+            let inicio = i * series.len() / largura;
+            let fim = ((i + 1) * series.len() / largura)
+                .max(inicio + 1)
+                .min(series.len());
+            let balde = &series[inicio..fim];
+            balde.iter().sum::<f64>() / balde.len() as f64
+        })
+        .collect()
+}
+
+fn render_pane_facts(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    rows: &[(String, String, crate::invest::module::Tone)],
+) {
+    let bloco = moldura(title);
+    let dentro = bloco.inner(area);
+    frame.render_widget(bloco, area);
+
+    let largura = rows
+        .iter()
+        .map(|(r, _, _)| r.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(MAX_LABEL_WIDTH);
+    let linhas: Vec<Line> = rows
+        .iter()
+        .map(|(rotulo, valor, tone)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{rotulo:<largura$}  "),
+                    Style::default().fg(palette::DIM),
+                ),
+                Span::styled(valor.clone(), Style::default().fg(tone_color(*tone))),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(linhas), dentro);
+}
+
+fn render_pane_bars(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    rows: &[crate::invest::module::Bar],
+    full: Option<f64>,
+) {
+    let bloco = moldura(title);
+    let dentro = bloco.inner(area);
+    frame.render_widget(bloco, area);
+    if rows.is_empty() || dentro.width < 20 {
+        return;
+    }
+
+    let teto = full
+        .unwrap_or_else(|| {
+            rows.iter()
+                .map(|b| b.value.max(b.target.unwrap_or(0.0)))
+                .fold(0.0, f64::max)
+        })
+        .max(f64::EPSILON);
+    let rotulo = rows
+        .iter()
+        .map(|b| b.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(MAX_LABEL_WIDTH);
+    let texto = rows
+        .iter()
+        .map(|b| b.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    let barra = (dentro.width as usize)
+        .saturating_sub(rotulo + texto + 4)
+        .max(4);
+
+    let linhas: Vec<Line> = rows
+        .iter()
+        .map(|b| {
+            let cheio = ((b.value / teto) * barra as f64).round().max(0.0) as usize;
+            let cheio = cheio.min(barra);
+            // A marca do alvo é desenhada *dentro* da barra, na posição dele. Uma barra
+            // sem a marca responde «quanto tenho»; com ela responde «quanto falta», que é
+            // a pergunta que se está fazendo.
+            let alvo = b.target.map(|t| {
+                (((t / teto) * barra as f64).round().max(0.0) as usize).min(barra.saturating_sub(1))
+            });
+            let desenho: String = (0..barra)
+                .map(|i| match (i < cheio, alvo == Some(i)) {
+                    (_, true) => '┃',
+                    (true, _) => '█',
+                    _ => '░',
+                })
+                .collect();
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<rotulo$} ", b.label),
+                    Style::default().fg(palette::DIM),
+                ),
+                Span::styled(desenho, Style::default().fg(tone_color(b.tone))),
+                Span::styled(format!(" {}", b.text), Style::default()),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(linhas), dentro);
+}
+
+fn render_pane_grid(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    cells: &[crate::invest::module::Cell],
+    selected: Option<usize>,
+    legend: &str,
+) {
+    let mut bloco = moldura(title);
+    if !legend.is_empty() {
+        // A legenda é permanente. Um mapa de cores sem legenda é um mapa que cada pessoa
+        // lê de um jeito.
+        bloco = bloco.title_bottom(Line::styled(
+            format!(" {legend} "),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    let dentro = bloco.inner(area);
+    frame.render_widget(bloco, area);
+    if cells.is_empty() || dentro.width < 10 || dentro.height < 3 {
+        return;
+    }
+
+    // Quatro linhas por célula: a moldura come duas, e sobram as duas que interessam —
+    // o nome e a variação. Com três, o valor ficava fora da moldura e a grade virava uma
+    // fileira de caixas com um nome só dentro.
+    const ALTURA: u16 = 4;
+    let por_linha = ((dentro.width / 14).max(1) as usize).min(cells.len());
+    let mut y = dentro.y;
+    for (faixa, grupo) in cells.chunks(por_linha).enumerate() {
+        if y + ALTURA > dentro.y + dentro.height {
+            break;
+        }
+        let peso_total: f64 = grupo.iter().map(|c| c.weight.max(0.05)).sum();
+        let mut x = dentro.x;
+        for (i, celula) in grupo.iter().enumerate() {
+            let fatia = ((celula.weight.max(0.05) / peso_total) * dentro.width as f64) as u16;
+            let largura = fatia.max(8).min(dentro.x + dentro.width - x);
+            if largura < 6 {
+                break;
+            }
+            let indice = faixa * por_linha + i;
+            let cor = tone_color(celula.tone);
+            let mut estilo = Style::default().fg(cor);
+            if selected == Some(indice) {
+                estilo = estilo.add_modifier(Modifier::REVERSED);
+            }
+            let area_celula = Rect {
+                x,
+                y,
+                width: largura,
+                height: ALTURA.min(dentro.y + dentro.height - y),
+            };
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(centrar(&celula.label, largura as usize), estilo),
+                    Line::styled(centrar(&celula.sub, largura as usize), estilo),
+                ])
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(cor)),
+                ),
+                area_celula,
+            );
+            x += largura;
+            if x >= dentro.x + dentro.width {
+                break;
+            }
+        }
+        y += ALTURA;
+    }
+}
+
+fn centrar(texto: &str, largura: usize) -> String {
+    let n = texto.chars().count();
+    let util = largura.saturating_sub(2);
+    if n >= util {
+        return texto.chars().take(util).collect();
+    }
+    let esquerda = (util - n) / 2;
+    format!("{}{texto}", " ".repeat(esquerda))
+}
+
+fn render_pane_form(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    fields: &[crate::invest::module::Field],
+    selected: usize,
+    error: Option<&str>,
+    hint: &str,
+) {
+    let bloco = moldura(title).title_bottom(Line::styled(
+        format!(" {hint} "),
+        Style::default().fg(palette::DIM),
+    ));
+    let dentro = bloco.inner(area);
+    frame.render_widget(bloco, area);
+
+    let largura = fields
+        .iter()
+        .map(|c| c.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(MAX_LABEL_WIDTH);
+
+    let mut linhas: Vec<Line> = vec![Line::raw("")];
+    for (i, campo) in fields.iter().enumerate() {
+        let ativo = i == selected;
+        let marca = if ativo { "▸ " } else { "  " };
+        let valor = match (campo.options.is_empty(), ativo) {
+            // O cursor só aparece onde se digita — num campo de escolha ele mentiria
+            // sobre o que a tecla faz.
+            (true, true) => format!("{}▏", campo.value),
+            (false, _) => format!("← {} →", campo.value),
+            _ => campo.value.clone(),
+        };
+        linhas.push(Line::from(vec![
+            Span::styled(
+                format!("{marca}{:<largura$}  ", campo.label),
+                Style::default().fg(match ativo {
+                    true => palette::CYAN,
+                    false => palette::DIM,
+                }),
+            ),
+            Span::styled(
+                valor,
+                Style::default().fg(match ativo {
+                    true => palette::YELLOW,
+                    false => Color::Reset,
+                }),
+            ),
+        ]));
+        // A ajuda só do campo em que se está: mostrar todas de uma vez é uma parede.
+        if ativo && !campo.help.is_empty() {
+            linhas.push(Line::styled(
+                format!("    {}", campo.help),
+                Style::default().fg(palette::DIM),
+            ));
+        }
+    }
+    if let Some(erro) = error {
+        linhas.push(Line::raw(""));
+        linhas.push(Line::styled(
+            format!("  {erro}"),
+            Style::default().fg(palette::RED),
+        ));
+    }
+    frame.render_widget(Paragraph::new(linhas), dentro);
+}
+
+#[cfg(test)]
+mod invest_tests {
+    use super::{CARTAO_MIN_A, CARTAO_MIN_L, altura_desejada, grade_de, reamostrar};
+    use ratatui::layout::Rect;
+
+    fn tela(width: u16, height: u16) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn a_grade_desiste_num_terminal_pequeno_demais_em_vez_de_desenhar_moldura_vazia() {
+        assert_eq!(grade_de(tela(CARTAO_MIN_L - 1, 60), &[5, 5]).0, 0);
+        assert_eq!(grade_de(tela(200, CARTAO_MIN_A - 1), &[5, 5]).0, 0);
+        assert_eq!(grade_de(tela(200, 60), &[]).0, 0);
+    }
+
+    #[test]
+    fn nenhuma_faixa_sai_cortada_e_a_grade_nunca_passa_da_tela() {
+        // O contrato: as faixas somam exatamente a altura da área, e cada faixa é alta o
+        // bastante para o cartão mais exigente dela. Passar de `area.height` desenha por
+        // cima do rodapé; ficar abaixo deixa um vão.
+        let desejadas: Vec<u16> = (0..28).map(|i| 4 + (i % 7) as u16).collect();
+        for largura in [CARTAO_MIN_L, 80, 120, 200, 400] {
+            for altura in [CARTAO_MIN_A, 10, 24, 50, 90] {
+                let area = tela(largura, altura);
+                let (colunas, alturas) = grade_de(area, &desejadas);
+                assert!(colunas > 0, "{largura}x{altura} desistiu");
+                assert!(area.width / colunas as u16 >= CARTAO_MIN_L);
+                assert_eq!(
+                    alturas.iter().sum::<u16>(),
+                    altura,
+                    "{largura}x{altura}: as faixas não fecham a área"
+                );
+                for (i, faixa) in alturas.iter().enumerate() {
+                    let pedido = desejadas[i * colunas..]
+                        .iter()
+                        .take(colunas)
+                        .copied()
+                        .max()
+                        .unwrap();
+                    assert!(
+                        *faixa >= pedido.min(altura),
+                        "{largura}x{altura}: faixa {i} corta um cartão"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_altura_de_um_cartao_nao_depende_do_que_ele_tem_dentro() {
+        // O bug que isto trava: a altura vinha do número de linhas do cartão, e esse
+        // número cresce quando a cotação chega. Um cartão que engorda empurra todos os de
+        // baixo para outra linha — a home se rearranjava sozinha debaixo de quem olhava.
+        // Agora ela só depende do destaque declarado, que não muda em execução.
+        assert!(
+            altura_desejada(5) > altura_desejada(1),
+            "quem tem destaque ocupa mais"
+        );
+        assert!(
+            altura_desejada(1) >= CARTAO_MIN_A,
+            "nem o menor fica sem moldura"
+        );
+        for d in 0..=5u8 {
+            assert_eq!(altura_desejada(d), altura_desejada(d), "não pode variar");
+        }
+    }
+
+    #[test]
+    fn a_ordem_e_a_altura_saem_do_mesmo_numero() {
+        // Se um cartão sobe na ordem, ele também engorda — senão a grade teria um cartão
+        // grande no meio de pequenos e as faixas ficariam com sobra no lugar errado.
+        let mut anterior = u16::MAX;
+        for d in (0..=5u8).rev() {
+            let a = altura_desejada(d);
+            assert!(a <= anterior, "destaque {d} quebrou a monotonia");
+            anterior = a;
+        }
+    }
+
+    #[test]
+    fn serie_maior_que_a_tela_e_encolhida_sem_perder_as_pontas() {
+        // 182 dias em 168 colunas: sem reamostrar, a `Sparkline` desenha os 168 primeiros
+        // e some com as duas últimas semanas — a parte que se veio ver.
+        let serie: Vec<f64> = (0..182).map(|i| i as f64).collect();
+        let saida = reamostrar(&serie, 168);
+        assert_eq!(saida.len(), 168);
+        assert!(saida[0] < 2.0, "a ponta esquerda tem que ser o começo");
+        assert!(
+            *saida.last().unwrap() > 178.0,
+            "a ponta direita tem que ser o fim, e deu {}",
+            saida.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn serie_menor_que_a_tela_e_esticada_em_degraus() {
+        // Sete pontos num painel largo não podem virar sete colunas num canto: cada ponto
+        // vale o período inteiro dele, e o gráfico tem que ocupar a largura que tem.
+        let serie: Vec<f64> = (0..7).map(|i| i as f64).collect();
+        let saida = reamostrar(&serie, 70);
+        assert_eq!(saida.len(), 70);
+        assert_eq!(saida[0], 0.0, "começa no primeiro ponto");
+        assert_eq!(saida[69], 6.0, "termina no último");
+        // Em degrau: cada valor aparece repetido, e nenhum valor novo é inventado entre
+        // dois pontos — interpolar mostraria um preço que não existiu.
+        assert!(saida.iter().all(|v| serie.contains(v)));
+        assert_eq!(
+            reamostrar(&serie, 7),
+            serie,
+            "do tamanho exato, passa intacta"
+        );
+        assert!(reamostrar(&[], 70).is_empty());
+    }
+
+    #[test]
+    fn serie_do_tamanho_da_tela_passa_intacta() {
+        let serie = vec![1.0, 2.0, 3.0];
+        assert_eq!(reamostrar(&serie, 3), serie);
+    }
+
+    #[test]
+    fn nenhum_balde_fica_vazio() {
+        // Um balde vazio viraria NaN na média, e NaN desenha um buraco no meio do gráfico.
+        for n in 1..300usize {
+            for largura in 1..120usize {
+                let serie: Vec<f64> = (0..n).map(|i| i as f64 + 1.0).collect();
+                for v in reamostrar(&serie, largura) {
+                    assert!(v.is_finite(), "n={n} largura={largura} deu {v}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_media_preserva_o_vale_entre_dois_picos() {
+        // Pegar um ponto a cada N poderia cair nos dois picos e sumir com o vale.
+        let serie = vec![10.0, 0.0, 10.0, 0.0, 10.0, 0.0, 10.0, 0.0];
+        let saida = reamostrar(&serie, 4);
+        assert!(
+            saida.iter().all(|v| (*v - 5.0).abs() < 1e-9),
+            "deu {saida:?}"
+        );
+    }
+
+    #[test]
+    fn largura_zero_nao_estoura() {
+        assert!(reamostrar(&[1.0, 2.0], 0).len() == 2);
+    }
+}
+
+#[cfg(test)]
+mod sparkline_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{RenderDirection, Sparkline};
+
+    /// Desenha uma série constante e conta quantas colunas ficaram em branco.
+    ///
+    /// Existe porque um gráfico de seis meses aparecia com um vão largo no meio onde havia
+    /// dado — e a diferença entre «a série está errada» e «o desenho está errado» só se
+    /// resolve desenhando.
+    fn colunas_vazias(dados: &[u64], largura: u16) -> usize {
+        let mut terminal = Terminal::new(TestBackend::new(largura, 6)).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    Sparkline::default()
+                        .data(dados)
+                        .max(1000)
+                        .direction(RenderDirection::LeftToRight),
+                    Rect::new(0, 0, largura, 6),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..largura)
+            .filter(|&x| (0..6).all(|y| buffer[(x, y)].symbol().trim().is_empty()))
+            .count()
+    }
+
+    #[test]
+    fn uma_serie_sem_zeros_nao_deixa_coluna_em_branco() {
+        let dados: Vec<u64> = (0..80).map(|i| 200 + (i % 7) * 30).collect();
+        assert_eq!(
+            colunas_vazias(&dados, 80),
+            0,
+            "toda coluna com dado tem que desenhar alguma coisa"
+        );
+    }
+
+    #[test]
+    fn mais_dados_que_colunas_nao_some_com_o_fim() {
+        // 182 pontos em 80 colunas. Sem reamostrar, a `Sparkline` descarta o excedente.
+        let dados: Vec<u64> = (0..182).map(|_| 500).collect();
+        assert_eq!(colunas_vazias(&dados, 80), 0);
+    }
+}
+
+/// Desenha um `Pane` isolado, para os testes de largura poderem olhar o resultado.
+#[cfg(test)]
+pub fn render_pane_teste(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane) {
+    render_pane(frame, area, pane);
 }

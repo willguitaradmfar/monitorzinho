@@ -55,3 +55,56 @@ pub fn find_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
     find_ci(haystack, needle, 0).is_some()
 }
+
+/// Minúsculas e sem acento, para uma busca digitada por gente.
+///
+/// Separado de `find_ci`, que dobra por byte de propósito: aquele percorre logs que
+/// redesenham várias vezes por segundo e não pode alocar. Este roda sobre células de
+/// tabela quando alguém digita, onde uma alocação por linha não é medida por ninguém — e
+/// onde acertar «sessao» → «sessão» é a diferença entre achar e não achar.
+pub fn fold(text: &str) -> String {
+    // A caixa cai **antes** da dobra do acento. Na ordem inversa, «Ã» não casaria com
+    // nenhum braço (a tabela é minúscula), passaria intacto, e só então viraria «ã» — o
+    // que deixaria «SESSÃO» sem dobrar enquanto «sessão» dobrava.
+    text.chars()
+        .flat_map(|c| c.to_lowercase())
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            c => c,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::fold;
+
+    #[test]
+    fn acento_e_caixa_somem() {
+        assert_eq!(fold("Câmbio"), "cambio");
+        assert_eq!(
+            fold("SESSÃO"),
+            "sessao",
+            "maiúscula acentuada tem que dobrar igual"
+        );
+        assert_eq!(fold("Ação"), "acao");
+        assert_eq!(fold("Imposto de renda"), "imposto de renda");
+    }
+
+    #[test]
+    fn o_que_casava_antes_continua_casando() {
+        // A dobra é estritamente mais permissiva: nada que casava deixa de casar.
+        for (texto, busca) in [("PETR4", "petr"), ("docker-proxy", "proxy")] {
+            assert!(fold(texto).contains(&fold(busca)));
+        }
+        // E agora também casa sem acento.
+        assert!(fold("Câmbio").contains(&fold("camb")));
+        assert!(fold("Posições").contains(&fold("posicoes")));
+    }
+}
