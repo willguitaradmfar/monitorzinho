@@ -136,10 +136,9 @@ Com a medição rodando, espere o `máx` subir, saia com `Ctrl+C` duas vezes e a
 de novo. A execução volta (como toda execução salva) e o painel volta **com o
 histórico**:
 
-```
-python3 -c "
-import json;d=json.load(open('$HOME/.local/share/monitorzinho/history.json'))
-print('ping:1.1.1.1' in d, len(d.get('ping:1.1.1.1',[])))"
+```sh
+sqlite3 ~/.local/share/monitorzinho/db/padrao.db \
+  "SELECT serie, count(*) FROM historico WHERE serie = 'ping:1.1.1.1' GROUP BY serie"
 ```
 
 ### 9. Ela conversa com o resto

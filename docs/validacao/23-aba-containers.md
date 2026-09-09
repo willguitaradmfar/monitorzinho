@@ -36,7 +36,7 @@ container legíveis. Uma quarta aba permanentemente vazia num laptop é ruído.
 
 `ContainerEngine` é um trait; Docker é `docker.rs`, a primeira implementação.
 Nada acima de `src/container/` menciona Docker — os painéis falam `Container`,
-`Volume`, `Image`, `Network`. Os ids que vão para o `marks.json` são
+`Volume`, `Image`, `Network`. Os ids que vão para a tabela `marca` são
 `containers`/`volumes`/`images`/`networks`: trocar de engine não pode invalidar as
 marcas de quem já usa.
 

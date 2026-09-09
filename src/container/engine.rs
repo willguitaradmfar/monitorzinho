@@ -10,14 +10,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use super::cgroup;
 use super::http::Endpoint;
 use super::{
     Action, ActionKey, Container, Image, LogSource, Network, StatsSource, Subject, Usage, Volume,
 };
-use crate::history;
 
 /// Quem respondeu, e por onde.
 #[derive(Clone, Debug)]
@@ -106,30 +103,28 @@ pub trait ContainerEngine: Send + Sync {
 
 /// O endereço escolhido à mão, quando há um.
 ///
-/// Fica ao lado de `tools.json`, pelo mesmo mecanismo e pela mesma razão: é
-/// configuração, e configuração sobrevive ao fechamento do app.
-#[derive(Clone, Default, Serialize, Deserialize)]
+/// Fica no banco junto do resto, pelo mesmo mecanismo e pela mesma razão de antes: é
+/// configuração, e configuração sobrevive ao fechamento do app. São dois escalares, e
+/// dois escalares não merecem uma tabela — moram em `config`, com a chave dizendo de
+/// quem eles são.
+#[derive(Clone, Default)]
 pub struct Settings {
     /// Vazio significa «descubra sozinho», que é o padrão.
-    #[serde(default)]
     pub endpoint: String,
 }
 
-fn settings_path() -> PathBuf {
-    history::data_file("engine.json")
-}
+/// A chave em `config`. Prefixada pelo dono, para `SELECT * FROM config` dizer de onde
+/// cada linha veio.
+const CHAVE_ENDPOINT: &str = "container.endpoint";
 
 pub fn load_settings() -> Settings {
-    match fs::read_to_string(settings_path()) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => Settings::default(),
+    Settings {
+        endpoint: crate::db::config_ler(CHAVE_ENDPOINT).unwrap_or_default(),
     }
 }
 
 pub fn save_settings(settings: &Settings) {
-    if let Ok(text) = serde_json::to_string_pretty(settings) {
-        let _ = fs::write(settings_path(), text);
-    }
+    crate::db::config_gravar(CHAVE_ENDPOINT, &settings.endpoint);
 }
 
 /// Todo endereço que vale a pena tentar, na ordem em que vale.

@@ -1,6 +1,6 @@
 [package]
 name = "monitorzinho"
-version = "0.37.0"
+version = "0.38.0"
 edition = "2024"
 description = "A lightweight terminal system monitor: CPU, memory, disk, network, and GPU"
 license = "MIT"
@@ -14,6 +14,11 @@ regex = "1.13.1"
 # Already here through rustls; named directly for the one thing rustls does not
 # expose — a SHA-256 of a certificate, which is the fingerprint everyone compares.
 ring = "0.17.14"
+# Tudo que o programa guarda mora num arquivo SQLite só — ver `src/db.rs`. `bundled`
+# compila o SQLite junto em vez de procurar um do sistema: o binário publicado tem que
+# rodar numa máquina que não tem libsqlite3, e um monitor que não abre porque falta uma
+# biblioteca não é um monitor.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8.4"
 serde = { version = "1.0.229", features = ["derive"] }

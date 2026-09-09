@@ -1,136 +1,415 @@
-//! O que fica em disco, e as duas regras que não se negociam.
+//! O que fica no banco, e as duas regras que não se negociam.
 //!
-//! **Escrita atômica.** Um `history.json` truncado por queda de energia é um gráfico
-//! feio; um `invest.json` truncado é o registro do patrimônio de alguém. Grava-se num
-//! temporário ao lado, chama-se `sync_all`, e só então `rename` por cima — que no mesmo
-//! sistema de arquivos é atômico: ou o arquivo velho está inteiro, ou o novo está.
+//! **A gravação é atômica.** Um histórico de gráfico truncado por queda de energia é um
+//! gráfico feio; uma carteira truncada é o registro do patrimônio de alguém. Antes isso
+//! era temporário ao lado, `fsync` e `rename` por cima, à mão. Agora é uma transação:
+//! ou as onze tabelas da carteira mudaram juntas, ou nenhuma mudou — e a garantia passou
+//! a valer para cada uma delas, e não só para o arquivo inteiro de uma vez.
 //!
-//! **Arquivo ruim não vira carteira vazia.** O resto do programa trata JSON inválido como
-//! «comece do zero», e ali isso custa um histórico de gráfico. Aqui custaria a carteira,
-//! então um arquivo ilegível é renomeado para `.corrompido`, o `.bak` é tentado, e nada é
-//! gravado por cima até alguém resolver.
+//! **A estrutura é estrutura, e não um JSON numa coluna.** Uma posição tem colunas de
+//! posição, um provento tem colunas de provento. O que isso compra é a pergunta: quanto
+//! entrou de provento por ativo neste ano, que linhas estão sem preço médio informado,
+//! quais alertas já dispararam — tudo `SELECT`, sem passar por este arquivo.
+//!
+//! **O preço médio continua informado, nunca calculado.** Não há nada aqui que o derive
+//! de lançamentos, e a coluna `preco_medio` só recebe o que a importação ou a edição
+//! puseram nela. Ver `docs/invest/03`.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::history;
-use crate::invest::model::{Portfolio, VERSAO_ATUAL};
+use crate::db;
+use crate::invest::model::{
+    Alerta, AlvoCarteira, AssetId, Carteira, Lancamento, Moeda, Portfolio, Position, Provento,
+};
 
-pub fn agora() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+pub use crate::db::agora;
 
-fn caminho(nome: &str) -> PathBuf {
-    history::data_file(nome)
-}
-
-/// O que deu errado ao ler a carteira, para a tela poder dizer em vez de só mostrar vazio.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LoadIssue {
-    /// Não existe ainda. Não é problema: é a primeira execução.
-    Novo,
-    /// JSON inválido. O arquivo foi posto de lado e o `.bak` entrou no lugar.
-    Corrompido { salvo_em: String, do_backup: bool },
-    /// Escrito por uma versão que este programa não entende. **Nada é gravado por cima.**
-    VersaoDesconhecida { arquivo: u32, entendo: u32 },
-}
-
-/// A carteira lida, e o que houve de errado ao lê-la.
+/// A carteira lida, e em que condições ela foi lida.
 pub struct Loaded {
     pub portfolio: Portfolio,
-    pub issue: Option<LoadIssue>,
-    /// Quando `true`, gravar está proibido: é a trava que impede uma versão futura de ser
-    /// sobrescrita por esta, que não sabe o que há dentro dela.
+    /// Quando `true`, gravar está proibido porque o arquivo do perfil não aceita escrita
+    /// — um pendrive montado somente para leitura, um `chmod` de quem foi fazer backup.
+    /// A tela diz isso em vez de deixar alguém editar durante meia hora e descobrir
+    /// depois que nada foi gravado.
     pub somente_leitura: bool,
 }
 
-const ARQUIVO: &str = "invest.json";
-const BACKUP: &str = "invest.json.bak";
+const CHAVE_MOEDA_BASE: &str = "invest.moeda_base";
 
 pub fn load() -> Loaded {
-    let path = caminho(ARQUIVO);
-    let texto = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => {
-            return Loaded {
-                portfolio: Portfolio::default(),
-                issue: Some(LoadIssue::Novo),
-                somente_leitura: false,
-            };
-        }
+    let portfolio = db::ler(Portfolio::default(), ler_portfolio);
+    Loaded {
+        portfolio,
+        somente_leitura: db::somente_leitura(),
+    }
+}
+
+fn ler_portfolio(conn: &Connection) -> rusqlite::Result<Portfolio> {
+    let mut p = Portfolio {
+        moeda_base: db::config_de(conn, CHAVE_MOEDA_BASE)
+            .and_then(|m| Moeda::parse(&m))
+            .unwrap_or(Moeda::Brl),
+        ..Portfolio::default()
     };
 
-    match serde_json::from_str::<Portfolio>(&texto) {
-        Ok(p) if p.versao > VERSAO_ATUAL => Loaded {
-            portfolio: Portfolio::default(),
-            issue: Some(LoadIssue::VersaoDesconhecida {
-                arquivo: p.versao,
-                entendo: VERSAO_ATUAL,
-            }),
-            // A trava: uma versão futura não pode ser sobrescrita por esta.
-            somente_leitura: true,
-        },
-        Ok(p) => Loaded {
-            portfolio: p,
-            issue: None,
-            somente_leitura: false,
-        },
-        Err(_) => {
-            // Põe o arquivo ruim de lado com um nome que diz o que é, e tenta o backup.
-            let quarentena = caminho(&format!("invest.json.corrompido.{}", agora()));
-            let _ = fs::rename(&path, &quarentena);
-            let (portfolio, do_backup) = match fs::read_to_string(caminho(BACKUP))
-                .ok()
-                .and_then(|t| serde_json::from_str::<Portfolio>(&t).ok())
-            {
-                Some(p) => (p, true),
-                None => (Portfolio::default(), false),
+    // Uma linha cujo ativo este binário não sabe ler — um mercado que só existe numa
+    // versão mais nova — é pulada, e não derruba a leitura das outras. É a mesma regra
+    // que o JSON seguia com um campo desconhecido: uma atualização nunca rejeita o
+    // arquivo antigo por inteiro, e um downgrade não pode custar a carteira.
+    let mut posicoes = conn.prepare(
+        "SELECT fonte, conta, ativo, classe, quantidade, preco_medio, moeda,
+                preco_manual, preco_manual_em, atualizado_em, carteira
+         FROM posicao ORDER BY id",
+    )?;
+    p.posicoes = posicoes
+        .query_map([], |row| {
+            let Some(ativo) = AssetId::parse(&row.get::<_, String>(2)?).ok() else {
+                return Ok(None);
             };
-            Loaded {
-                portfolio,
-                issue: Some(LoadIssue::Corrompido {
-                    salvo_em: quarentena.display().to_string(),
-                    do_backup,
-                }),
-                somente_leitura: false,
+            let (Some(classe), Some(moeda)) = (
+                db::do_codigo(&row.get::<_, String>(3)?),
+                db::do_codigo(&row.get::<_, String>(6)?),
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(Position {
+                fonte: row.get(0)?,
+                conta: row.get(1)?,
+                ativo,
+                classe,
+                quantidade: row.get(4)?,
+                preco_medio: row.get(5)?,
+                moeda,
+                preco_manual: row.get(7)?,
+                preco_manual_em: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                atualizado_em: row.get::<_, i64>(9)? as u64,
+                carteira: row.get(10)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut watchlist = conn.prepare("SELECT ativo FROM watchlist ORDER BY ordem")?;
+    p.watchlist = watchlist
+        .query_map([], |row| Ok(AssetId::parse(&row.get::<_, String>(0)?).ok()))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut alvos = conn.prepare("SELECT classe, percentual FROM alvo")?;
+    p.alvos = alvos
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut setores = conn.prepare("SELECT ativo, setor FROM setor")?;
+    p.setores = setores
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut feeds = conn.prepare("SELECT url FROM feed ORDER BY ordem")?;
+    p.feeds = feeds
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut mapeamentos = conn.prepare("SELECT fonte, campo, coluna FROM mapeamento")?;
+    for linha in mapeamentos.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (fonte, campo, coluna) = linha?;
+        p.mapeamentos
+            .entry(fonte)
+            .or_default()
+            .insert(campo, coluna);
+    }
+
+    let mut proventos = conn.prepare(
+        "SELECT ativo, tipo, pago_em, bruto, retido, moeda, quantidade
+         FROM provento ORDER BY id",
+    )?;
+    p.proventos = proventos
+        .query_map([], |row| {
+            let (Ok(ativo), Some(tipo), Some(moeda)) = (
+                AssetId::parse(&row.get::<_, String>(0)?),
+                db::do_codigo(&row.get::<_, String>(1)?),
+                db::do_codigo(&row.get::<_, String>(5)?),
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(Provento {
+                ativo,
+                tipo,
+                pago_em: row.get::<_, i64>(2)? as u64,
+                bruto: row.get(3)?,
+                retido: row.get(4)?,
+                moeda,
+                quantidade: row.get(6)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut lancamentos = conn.prepare(
+        "SELECT em, tipo, ativo, quantidade, preco, taxas, valor, moeda, nota
+         FROM lancamento ORDER BY id",
+    )?;
+    p.lancamentos = lancamentos
+        .query_map([], |row| {
+            let Some(tipo) = db::do_codigo(&row.get::<_, String>(1)?) else {
+                return Ok(None);
+            };
+            Ok(Some(Lancamento {
+                em: row.get::<_, i64>(0)? as u64,
+                tipo,
+                ativo: row
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|t| AssetId::parse(&t).ok()),
+                quantidade: row.get(3)?,
+                preco: row.get(4)?,
+                taxas: row.get(5)?,
+                valor: row.get(6)?,
+                moeda: row
+                    .get::<_, Option<String>>(7)?
+                    .and_then(|m| db::do_codigo(&m)),
+                nota: row.get(8)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut alertas = conn.prepare(
+        "SELECT ativo, regra, valor, ligado, armado, ultimo_disparo FROM alerta ORDER BY id",
+    )?;
+    p.alertas = alertas
+        .query_map([], |row| {
+            let (Ok(ativo), Some(regra)) = (
+                AssetId::parse(&row.get::<_, String>(0)?),
+                db::do_codigo(&row.get::<_, String>(1)?),
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(Alerta {
+                ativo,
+                regra,
+                valor: row.get(2)?,
+                ligado: row.get::<_, i64>(3)? != 0,
+                armado: row.get::<_, i64>(4)? != 0,
+                ultimo_disparo: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut carteiras = conn.prepare("SELECT nome FROM carteira ORDER BY ordem")?;
+    let nomes: Vec<String> = carteiras
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut itens = conn.prepare(
+        "SELECT ativo, ordem, percentual, teto FROM carteira_alvo
+         WHERE carteira = ?1 ORDER BY ordem, id",
+    )?;
+    for nome in nomes {
+        let alvos: Vec<AlvoCarteira> = itens
+            .query_map([&nome], |row| {
+                let Ok(ativo) = AssetId::parse(&row.get::<_, String>(0)?) else {
+                    return Ok(None);
+                };
+                Ok(Some(AlvoCarteira {
+                    ativo,
+                    ordem: row.get::<_, i64>(1)? as u32,
+                    percentual: row.get(2)?,
+                    teto: row.get(3)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        p.carteiras.push(Carteira { nome, alvos });
+    }
+
+    Ok(p)
+}
+
+/// Grava a carteira inteira, numa transação só.
+///
+/// As tabelas são reescritas do zero em vez de comparadas linha a linha. São dezenas ou
+/// centenas de linhas dentro de uma transação — microssegundos —, e o que se ganha é que
+/// não existe caminho pelo qual o banco fique diferente do que está na memória: o que
+/// está na memória é o que está no banco, sempre, e não «o que está na memória mais as
+/// diferenças que alguém lembrou de aplicar».
+pub fn save(portfolio: &Portfolio) -> Result<(), String> {
+    match db::escrever(|conn| gravar_em(conn, portfolio)) {
+        true => Ok(()),
+        false => Err("não deu para gravar a carteira no banco do perfil".to_string()),
+    }
+}
+
+/// O corpo da gravação, contra uma conexão qualquer — é o que deixa o teste de ida e
+/// volta rodar contra um banco em memória em vez de contra o do usuário.
+fn gravar_em(conn: &Connection, portfolio: &Portfolio) -> rusqlite::Result<()> {
+    {
+        db::config_por(conn, CHAVE_MOEDA_BASE, portfolio.moeda_base.code())?;
+
+        for tabela in [
+            "posicao",
+            "watchlist",
+            "alvo",
+            "setor",
+            "feed",
+            "mapeamento",
+            "provento",
+            "lancamento",
+            "alerta",
+            "carteira_alvo",
+            "carteira",
+        ] {
+            db::limpar(conn, tabela)?;
+        }
+
+        let mut posicao = conn.prepare(
+            "INSERT INTO posicao (id, fonte, conta, ativo, classe, quantidade, preco_medio,
+                                  moeda, preco_manual, preco_manual_em, atualizado_em, carteira)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        )?;
+        for (i, p) in portfolio.posicoes.iter().enumerate() {
+            posicao.execute((
+                i as i64 + 1,
+                &p.fonte,
+                &p.conta,
+                p.ativo.to_string(),
+                db::codigo(&p.classe),
+                p.quantidade,
+                p.preco_medio,
+                db::codigo(&p.moeda),
+                p.preco_manual,
+                p.preco_manual_em.map(|v| v as i64),
+                p.atualizado_em as i64,
+                p.carteira.as_deref(),
+            ))?;
+        }
+
+        let mut watchlist =
+            conn.prepare("INSERT OR REPLACE INTO watchlist (ativo, ordem) VALUES (?1, ?2)")?;
+        for (i, ativo) in portfolio.watchlist.iter().enumerate() {
+            watchlist.execute((ativo.to_string(), i as i64))?;
+        }
+
+        let mut alvo = conn.prepare("INSERT INTO alvo (classe, percentual) VALUES (?1, ?2)")?;
+        for (classe, pct) in &portfolio.alvos {
+            alvo.execute((classe, pct))?;
+        }
+
+        let mut setor = conn.prepare("INSERT INTO setor (ativo, setor) VALUES (?1, ?2)")?;
+        for (ativo, nome) in &portfolio.setores {
+            setor.execute((ativo, nome))?;
+        }
+
+        let mut feed = conn.prepare("INSERT OR REPLACE INTO feed (url, ordem) VALUES (?1, ?2)")?;
+        for (i, url) in portfolio.feeds.iter().enumerate() {
+            feed.execute((url, i as i64))?;
+        }
+
+        let mut mapeamento =
+            conn.prepare("INSERT INTO mapeamento (fonte, campo, coluna) VALUES (?1, ?2, ?3)")?;
+        for (fonte, campos) in &portfolio.mapeamentos {
+            for (campo, coluna) in campos {
+                mapeamento.execute((fonte, campo, coluna))?;
             }
         }
-    }
-}
 
-/// Grava a carteira. Guarda a versão anterior em `.bak` antes, e escreve atomicamente.
-pub fn save(portfolio: &Portfolio) -> Result<(), String> {
-    let path = caminho(ARQUIVO);
-    let texto = serde_json::to_string_pretty(portfolio).map_err(|e| e.to_string())?;
+        let mut provento = conn.prepare(
+            "INSERT INTO provento (id, ativo, tipo, pago_em, bruto, retido, moeda, quantidade)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for (i, v) in portfolio.proventos.iter().enumerate() {
+            provento.execute((
+                i as i64 + 1,
+                v.ativo.to_string(),
+                db::codigo(&v.tipo),
+                v.pago_em as i64,
+                v.bruto,
+                v.retido,
+                db::codigo(&v.moeda),
+                v.quantidade,
+            ))?;
+        }
 
-    // A versão anterior, antes de qualquer coisa. Custa um arquivo pequeno e é a
-    // diferença entre um susto e uma perda.
-    if path.exists() {
-        let _ = fs::copy(&path, caminho(BACKUP));
-    }
-    escrever_atomico(&path, texto.as_bytes())
-}
+        let mut lancamento = conn.prepare(
+            "INSERT INTO lancamento (id, em, tipo, ativo, quantidade, preco, taxas, valor,
+                                     moeda, nota)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+        for (i, l) in portfolio.lancamentos.iter().enumerate() {
+            lancamento.execute((
+                i as i64 + 1,
+                l.em as i64,
+                db::codigo(&l.tipo),
+                l.ativo.as_ref().map(|a| a.to_string()),
+                l.quantidade,
+                l.preco,
+                l.taxas,
+                l.valor,
+                l.moeda.as_ref().map(db::codigo),
+                &l.nota,
+            ))?;
+        }
 
-/// Temporário ao lado, `sync_all`, `rename` por cima. O `rename` é a parte atômica; o
-/// `sync_all` é o que garante que os bytes chegaram ao disco antes de o nome apontar
-/// para eles — sem ele, uma queda de energia pode deixar o nome novo apontando para um
-/// arquivo vazio, que é exatamente o que se estava tentando evitar.
-fn escrever_atomico(path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    {
-        let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        f.write_all(bytes).map_err(|e| e.to_string())?;
-        f.sync_all().map_err(|e| e.to_string())?;
+        let mut alerta = conn.prepare(
+            "INSERT INTO alerta (id, ativo, regra, valor, ligado, armado, ultimo_disparo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for (i, a) in portfolio.alertas.iter().enumerate() {
+            alerta.execute((
+                i as i64 + 1,
+                a.ativo.to_string(),
+                db::codigo(&a.regra),
+                a.valor,
+                a.ligado as i64,
+                a.armado as i64,
+                a.ultimo_disparo.map(|v| v as i64),
+            ))?;
+        }
+
+        let mut carteira =
+            conn.prepare("INSERT OR REPLACE INTO carteira (nome, ordem) VALUES (?1, ?2)")?;
+        let mut item = conn.prepare(
+            "INSERT INTO carteira_alvo (id, carteira, ativo, ordem, percentual, teto)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        let mut proximo_alvo = 0i64;
+        for (i, c) in portfolio.carteiras.iter().enumerate() {
+            carteira.execute((&c.nome, i as i64))?;
+            for a in &c.alvos {
+                proximo_alvo += 1;
+                item.execute((
+                    proximo_alvo,
+                    &c.nome,
+                    a.ativo.to_string(),
+                    a.ordem as i64,
+                    a.percentual,
+                    a.teto,
+                ))?;
+            }
+        }
+
+        Ok(())
     }
-    fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -139,21 +418,26 @@ fn escrever_atomico(path: &PathBuf, bytes: &[u8]) -> Result<(), String> {
 
 pub type Mru = BTreeMap<String, u64>;
 
-const ARQUIVO_MRU: &str = "invest-mru.json";
-
-/// Perder isto custa a ordem da lista até o próximo uso, e nada mais — por isso a leitura
-/// engole qualquer erro, e a gravação é simples, sem `fsync`.
+/// Perder isto custa a ordem da lista até o próximo uso, e nada mais.
 pub fn load_mru() -> Mru {
-    fs::read_to_string(caminho(ARQUIVO_MRU))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    db::ler(Mru::new(), |conn| {
+        let mut stmt = conn.prepare("SELECT id, aberto_em FROM modulo_mru")?;
+        let linhas = stmt.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))?;
+        linhas.collect()
+    })
 }
 
 pub fn save_mru(mru: &Mru) {
-    if let Ok(t) = serde_json::to_string_pretty(mru) {
-        let _ = fs::write(caminho(ARQUIVO_MRU), t);
-    }
+    db::escrever(|conn| {
+        let mut stmt = conn.prepare(
+            "INSERT INTO modulo_mru (id, aberto_em) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET aberto_em = excluded.aberto_em",
+        )?;
+        for (id, em) in mru {
+            stmt.execute((id, *em as i64))?;
+        }
+        Ok(())
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -174,70 +458,6 @@ pub struct CachedQuote {
 
 pub type Cache = BTreeMap<String, CachedQuote>;
 
-/// O calendário econômico já buscado.
-///
-/// Gravado porque a home mostra a agenda e **a home não busca nada**: sem isto ela
-/// ficaria vazia até alguém abrir o módulo, e voltaria a ficar vazia no próximo início.
-/// Um calendário econômico muda uma vez por mês; relê-lo do disco é grátis.
-const ARQUIVO_AGENDA: &str = "invest-agenda.json";
-
-pub fn load_agenda() -> Vec<crate::invest::calendario::Evento> {
-    fs::read_to_string(caminho(ARQUIVO_AGENDA))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_agenda(eventos: &[crate::invest::calendario::Evento]) {
-    if eventos.is_empty() {
-        return;
-    }
-    if let Ok(t) = serde_json::to_string_pretty(eventos) {
-        let _ = fs::write(caminho(ARQUIVO_AGENDA), t);
-    }
-}
-
-/// As manchetes já lidas. Gravadas pelo mesmo motivo do calendário: o cartão da home as
-/// mostra e nasceria vazio a cada início.
-const ARQUIVO_NOTICIAS: &str = "invest-noticias.json";
-
-pub fn load_noticias() -> Vec<(String, crate::invest::rss::Item)> {
-    fs::read_to_string(caminho(ARQUIVO_NOTICIAS))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_noticias(itens: &[(String, crate::invest::rss::Item)]) {
-    if itens.is_empty() {
-        return;
-    }
-    if let Ok(t) = serde_json::to_string_pretty(itens) {
-        let _ = fs::write(caminho(ARQUIVO_NOTICIAS), t);
-    }
-}
-
-/// Os proventos anunciados já buscados. Gravados pelo mesmo motivo dos outros caches: a
-/// lista de sugestões nasce cheia em vez de esperar dez buscas.
-const ARQUIVO_ANUNCIADOS: &str = "invest-anunciados.json";
-
-pub fn load_anunciados() -> Vec<crate::invest::provento::Anunciado> {
-    fs::read_to_string(caminho(ARQUIVO_ANUNCIADOS))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_anunciados(v: &[crate::invest::provento::Anunciado]) {
-    if v.is_empty() {
-        return;
-    }
-    if let Ok(t) = serde_json::to_string_pretty(v) {
-        let _ = fs::write(caminho(ARQUIVO_ANUNCIADOS), t);
-    }
-}
-
-const ARQUIVO_CACHE: &str = "invest-cache.json";
 /// A partir de que idade um **preço** em cache deixa de informar e passa a enganar.
 pub const CACHE_MAX_IDADE: u64 = 24 * 60 * 60;
 
@@ -271,34 +491,239 @@ pub fn validade(grade: &str) -> u64 {
 }
 
 /// Lê o cache, **descartando o que está velho demais** — pelo critério de cada tipo de
-/// dado, ver `validade`.
+/// dado, ver `validade`. O descarte é no `WHERE`, e não numa passada depois: uma linha
+/// vencida não chega a virar objeto.
 pub fn load_cache() -> Cache {
-    let agora = agora();
-    fs::read_to_string(caminho(ARQUIVO_CACHE))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Cache>(&t).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, q)| agora.saturating_sub(q.em) <= validade(&q.grade))
-        .collect()
+    let agora = agora() as i64;
+    db::ler(Cache::new(), |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT ativo, preco, anterior, em, grade, moeda FROM cotacao
+             WHERE ?1 - em <= CASE grade WHEN 'fechamento' THEN ?2 ELSE ?3 END",
+        )?;
+        // Os dois tetos vêm de `validade`, e não repetidos aqui: o `CASE` do SQL escolhe
+        // qual dos dois se aplica, mas quanto vale cada um continua sendo decidido num
+        // lugar só.
+        let linhas = stmt.query_map(
+            (
+                agora,
+                validade("fechamento") as i64,
+                validade("ao_vivo") as i64,
+            ),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    CachedQuote {
+                        preco: row.get(1)?,
+                        anterior: row.get(2)?,
+                        em: row.get::<_, i64>(3)? as u64,
+                        grade: row.get(4)?,
+                        moeda: row.get(5)?,
+                    },
+                ))
+            },
+        )?;
+        linhas.collect()
+    })
 }
 
 pub fn save_cache(cache: &Cache) {
-    if let Ok(t) = serde_json::to_string_pretty(cache) {
-        let _ = fs::write(caminho(ARQUIVO_CACHE), t);
+    db::escrever(|conn| {
+        let mut stmt = conn.prepare(
+            "INSERT INTO cotacao (ativo, preco, anterior, em, grade, moeda)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(ativo) DO UPDATE SET
+                 preco = excluded.preco, anterior = excluded.anterior,
+                 em = excluded.em, grade = excluded.grade, moeda = excluded.moeda",
+        )?;
+        for (ativo, q) in cache {
+            if !q.preco.is_finite() {
+                continue;
+            }
+            stmt.execute((
+                ativo,
+                q.preco,
+                q.anterior.filter(|v| v.is_finite()),
+                q.em as i64,
+                &q.grade,
+                &q.moeda,
+            ))?;
+        }
+        Ok(())
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Os caches que existem porque a home mostra e a home não busca nada
+// ---------------------------------------------------------------------------
+
+/// O calendário econômico já buscado.
+///
+/// Gravado porque a home mostra a agenda e **a home não busca nada**: sem isto ela
+/// ficaria vazia até alguém abrir o módulo, e voltaria a ficar vazia no próximo início.
+/// Um calendário econômico muda uma vez por mês; relê-lo do banco é grátis.
+pub fn load_agenda() -> Vec<crate::invest::calendario::Evento> {
+    use crate::invest::calendario::Evento;
+    use crate::invest::tempo::Data;
+    db::ler(Vec::new(), |conn| {
+        let mut stmt = conn
+            .prepare("SELECT ano, mes, dia, pais, titulo, peso, origem FROM agenda ORDER BY id")?;
+        let linhas = stmt.query_map([], |row| {
+            let Some(origem) = db::do_codigo(&row.get::<_, String>(6)?) else {
+                return Ok(None);
+            };
+            Ok(Some(Evento {
+                data: Data {
+                    ano: row.get::<_, i64>(0)? as i32,
+                    mes: row.get::<_, i64>(1)? as u32,
+                    dia: row.get::<_, i64>(2)? as u32,
+                },
+                pais: row.get(3)?,
+                titulo: row.get(4)?,
+                peso: row.get::<_, i64>(5)? as u8,
+                origem,
+            }))
+        })?;
+        Ok(linhas
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    })
+}
+
+pub fn save_agenda(eventos: &[crate::invest::calendario::Evento]) {
+    // Vazio não apaga o que já está lá: uma busca que não trouxe nada é uma busca que
+    // falhou, e ela não pode custar o calendário que a home mostra.
+    if eventos.is_empty() {
+        return;
     }
+    db::escrever(|conn| {
+        db::limpar(conn, "agenda")?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO agenda (id, ano, mes, dia, pais, titulo, peso, origem)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for (i, e) in eventos.iter().enumerate() {
+            stmt.execute((
+                i as i64 + 1,
+                e.data.ano as i64,
+                e.data.mes as i64,
+                e.data.dia as i64,
+                &e.pais,
+                &e.titulo,
+                e.peso as i64,
+                db::codigo(&e.origem),
+            ))?;
+        }
+        Ok(())
+    });
+}
+
+/// As manchetes já lidas. Gravadas pelo mesmo motivo do calendário: o cartão da home as
+/// mostra e nasceria vazio a cada início.
+pub fn load_noticias() -> Vec<(String, crate::invest::rss::Item)> {
+    use crate::invest::rss::Item;
+    db::ler(Vec::new(), |conn| {
+        let mut stmt =
+            conn.prepare("SELECT fonte, titulo, link, data, resumo, em FROM noticia ORDER BY id")?;
+        let linhas = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Item {
+                    titulo: row.get(1)?,
+                    link: row.get(2)?,
+                    data: row.get(3)?,
+                    resumo: row.get(4)?,
+                    em: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                },
+            ))
+        })?;
+        linhas.collect()
+    })
+}
+
+pub fn save_noticias(itens: &[(String, crate::invest::rss::Item)]) {
+    if itens.is_empty() {
+        return;
+    }
+    db::escrever(|conn| {
+        db::limpar(conn, "noticia")?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO noticia (id, fonte, titulo, link, data, resumo, em)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for (i, (fonte, item)) in itens.iter().enumerate() {
+            stmt.execute((
+                i as i64 + 1,
+                fonte,
+                &item.titulo,
+                &item.link,
+                &item.data,
+                &item.resumo,
+                item.em.map(|v| v as i64),
+            ))?;
+        }
+        Ok(())
+    });
+}
+
+/// Os proventos anunciados já buscados. Gravados pelo mesmo motivo dos outros caches: a
+/// lista de sugestões nasce cheia em vez de esperar dez buscas.
+pub fn load_anunciados() -> Vec<crate::invest::provento::Anunciado> {
+    use crate::invest::provento::Anunciado;
+    db::ler(Vec::new(), |conn| {
+        let mut stmt = conn.prepare("SELECT ativo, em, por_cota, dy FROM anunciado ORDER BY id")?;
+        let linhas = stmt.query_map([], |row| {
+            let Ok(ativo) = AssetId::parse(&row.get::<_, String>(0)?) else {
+                return Ok(None);
+            };
+            Ok(Some(Anunciado {
+                ativo,
+                em: row.get::<_, i64>(1)? as u64,
+                por_cota: row.get(2)?,
+                dy: row.get(3)?,
+            }))
+        })?;
+        Ok(linhas
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    })
+}
+
+pub fn save_anunciados(v: &[crate::invest::provento::Anunciado]) {
+    if v.is_empty() {
+        return;
+    }
+    db::escrever(|conn| {
+        db::limpar(conn, "anunciado")?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO anunciado (id, ativo, em, por_cota, dy) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (i, a) in v.iter().enumerate() {
+            stmt.execute((
+                i as i64 + 1,
+                a.ativo.to_string(),
+                a.em as i64,
+                a.por_cota,
+                a.dy,
+            ))?;
+        }
+        Ok(())
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::invest::model::{AssetId, Classe, Moeda, Position};
+    use crate::invest::model::{Classe, RegraAlerta, TipoLancamento, TipoProvento};
 
-    fn portfolio_com_uma_posicao() -> Portfolio {
+    fn portfolio_cheio() -> Portfolio {
         let mut p = Portfolio::default();
         p.posicoes.push(Position {
-            fonte: "t".into(),
-            conta: String::new(),
+            fonte: "corretora-x".into(),
+            conta: "12345-6".into(),
             ativo: AssetId::parse("B3/PETR4").unwrap(),
             classe: Classe::Acao,
             quantidade: 100.0,
@@ -306,80 +731,253 @@ mod tests {
             moeda: Moeda::Brl,
             preco_manual: None,
             preco_manual_em: None,
-            atualizado_em: 0,
+            atualizado_em: 7,
+            carteira: Some("dividendos".into()),
+        });
+        // Sem preço médio: uma posição legítima, e o `None` tem que sobreviver à ida e
+        // volta — um zero no lugar dele seria um custo inventado.
+        p.posicoes.push(Position {
+            fonte: "manual".into(),
+            conta: String::new(),
+            ativo: AssetId::parse("BINANCE/BTCBRL").unwrap(),
+            classe: Classe::Cripto,
+            quantidade: 0.5,
+            preco_medio: None,
+            moeda: Moeda::Brl,
+            preco_manual: Some(512340.0),
+            preco_manual_em: Some(99),
+            atualizado_em: 8,
             carteira: None,
+        });
+        p.watchlist = vec![AssetId::parse("B3/IBOV").unwrap()];
+        p.alvos.insert("acao".into(), 40.0);
+        p.setores.insert("B3/PETR4".into(), "petróleo e gás".into());
+        p.feeds = vec!["https://exemplo/rss".into()];
+        p.mapeamentos.insert(
+            "corretora-x".into(),
+            BTreeMap::from([("ativo".to_string(), "Papel".to_string())]),
+        );
+        p.proventos.push(Provento {
+            ativo: AssetId::parse("B3/PETR4").unwrap(),
+            tipo: TipoProvento::Jcp,
+            pago_em: 1000,
+            bruto: 120.0,
+            retido: 18.0,
+            moeda: Moeda::Brl,
+            quantidade: Some(100.0),
+        });
+        p.lancamentos.push(Lancamento {
+            em: 2000,
+            tipo: TipoLancamento::Compra,
+            ativo: Some(AssetId::parse("B3/PETR4").unwrap()),
+            quantidade: 100.0,
+            preco: 31.4,
+            taxas: 2.5,
+            valor: 0.0,
+            moeda: Some(Moeda::Brl),
+            nota: "primeira".into(),
+        });
+        p.alertas.push(Alerta {
+            ativo: AssetId::parse("B3/PETR4").unwrap(),
+            regra: RegraAlerta::Acima,
+            valor: 40.0,
+            ligado: false,
+            armado: true,
+            ultimo_disparo: Some(3000),
+        });
+        p.carteiras.push(Carteira {
+            nome: "dividendos".into(),
+            alvos: vec![AlvoCarteira {
+                ordem: 1,
+                ativo: AssetId::parse("B3/BBAS3").unwrap(),
+                percentual: 12.5,
+                teto: Some(28.0),
+            }],
         });
         p
     }
 
+    /// A carteira inteira dá a volta pelo banco sem perder nada — que é a única coisa
+    /// que importa numa mudança de formato de armazenamento.
     #[test]
-    fn escrita_atomica_deixa_o_arquivo_inteiro() {
-        let dir = std::env::temp_dir().join(format!("mz-invest-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("x.json");
-        let texto = serde_json::to_vec_pretty(&portfolio_com_uma_posicao()).unwrap();
-        escrever_atomico(&path, &texto).unwrap();
-        let lido: Portfolio = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(lido.posicoes.len(), 1);
-        // Nenhum temporário sobrou ao lado.
-        let sobras: Vec<_> = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
-            .collect();
-        assert!(sobras.is_empty(), "o temporário tem que sumir no rename");
-        let _ = fs::remove_dir_all(&dir);
+    fn a_carteira_inteira_sobrevive_a_ida_e_volta() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migracoes::aplicar(&conn).unwrap();
+        let original = portfolio_cheio();
+
+        // Grava pelo mesmo caminho de `save`, mas nesta conexão de teste.
+        gravar_em(&conn, &original).unwrap();
+        let lido = ler_portfolio(&conn).unwrap();
+
+        assert_eq!(lido.moeda_base, original.moeda_base);
+        assert_eq!(lido.posicoes.len(), 2);
+        assert_eq!(lido.posicoes[0].ativo.to_string(), "B3/PETR4");
+        assert_eq!(lido.posicoes[0].preco_medio, Some(31.4));
+        assert_eq!(lido.posicoes[0].conta, "12345-6");
+        assert_eq!(lido.posicoes[0].carteira.as_deref(), Some("dividendos"));
+        // O `None` continua `None`, e não virou zero.
+        assert_eq!(lido.posicoes[1].preco_medio, None);
+        assert_eq!(lido.posicoes[1].preco_manual, Some(512340.0));
+        assert_eq!(lido.watchlist.len(), 1);
+        assert_eq!(lido.alvos.get("acao"), Some(&40.0));
+        assert_eq!(
+            lido.setores.get("B3/PETR4").map(String::as_str),
+            Some("petróleo e gás")
+        );
+        assert_eq!(lido.feeds, original.feeds);
+        assert_eq!(lido.mapeamentos["corretora-x"]["ativo"], "Papel");
+        assert_eq!(lido.proventos.len(), 1);
+        assert_eq!(lido.proventos[0].tipo, TipoProvento::Jcp);
+        assert_eq!(lido.proventos[0].retido, 18.0);
+        assert_eq!(lido.lancamentos.len(), 1);
+        assert_eq!(lido.lancamentos[0].nota, "primeira");
+        assert_eq!(lido.lancamentos[0].moeda, Some(Moeda::Brl));
+        assert_eq!(lido.alertas.len(), 1);
+        // Desligado continua desligado depois de reiniciar.
+        assert!(!lido.alertas[0].ligado);
+        assert!(lido.alertas[0].armado);
+        assert_eq!(lido.alertas[0].ultimo_disparo, Some(3000));
+        assert_eq!(lido.carteiras.len(), 1);
+        assert_eq!(lido.carteiras[0].alvos[0].teto, Some(28.0));
+        assert_eq!(lido.carteiras[0].alvos[0].ordem, 1);
     }
 
+    /// Gravar duas vezes não duplica: as tabelas são reescritas, não acrescentadas.
     #[test]
-    fn versao_futura_trava_a_gravacao() {
-        // Um arquivo de uma versão que não entendemos não pode ser sobrescrito por esta.
-        let json = r#"{"versao": 999, "moeda_base": "BRL", "posicoes": []}"#;
-        let p: Portfolio = serde_json::from_str(json).unwrap();
-        assert!(p.versao > VERSAO_ATUAL);
+    fn gravar_de_novo_nao_duplica_linha_nenhuma() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migracoes::aplicar(&conn).unwrap();
+        let p = portfolio_cheio();
+        gravar_em(&conn, &p).unwrap();
+        gravar_em(&conn, &p).unwrap();
+        let lido = ler_portfolio(&conn).unwrap();
+        assert_eq!(lido.posicoes.len(), 2);
+        assert_eq!(lido.proventos.len(), 1);
+        assert_eq!(lido.carteiras.len(), 1);
+        assert_eq!(lido.carteiras[0].alvos.len(), 1);
+    }
+
+    /// Uma linha que este binário não sabe ler é pulada, e as outras continuam vindo.
+    /// É a regra que o JSON já seguia: uma atualização — ou um downgrade — nunca custa a
+    /// carteira inteira por causa de um campo.
+    #[test]
+    fn uma_linha_ilegivel_nao_derruba_a_leitura_das_outras() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migracoes::aplicar(&conn).unwrap();
+        gravar_em(&conn, &portfolio_cheio()).unwrap();
+        conn.execute(
+            "INSERT INTO posicao (id, fonte, conta, ativo, classe, quantidade, moeda)
+             VALUES (99, 'x', '', 'MARTE/XPTO3', 'acao', 1, 'BRL')",
+            [],
+        )
+        .unwrap();
+        let lido = ler_portfolio(&conn).unwrap();
+        assert_eq!(
+            lido.posicoes.len(),
+            2,
+            "a de mercado desconhecido foi pulada"
+        );
+    }
+
+    /// Dois anúncios do mesmo papel com a mesma data-com são duas linhas.
+    ///
+    /// Não é hipótese: uma carteira de verdade tinha 445 anúncios com 399 pares
+    /// `(ativo, data-com)` distintos — um papel anuncia dividendo **e** JCP com a mesma
+    /// data, com valores por cota diferentes. Uma chave composta teria comido 46 deles
+    /// sem dizer nada, e o que sumiria era dinheiro.
+    #[test]
+    fn dois_anuncios_do_mesmo_papel_no_mesmo_dia_sao_duas_linhas() {
+        use crate::invest::provento::Anunciado;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migracoes::aplicar(&conn).unwrap();
+        let ativo = AssetId::parse("B3/VALE3").unwrap();
+        let anuncios = [
+            Anunciado {
+                ativo: ativo.clone(),
+                em: 1786406400,
+                por_cota: 0.46,
+                dy: 0.6384,
+            },
+            Anunciado {
+                ativo,
+                em: 1786406400,
+                por_cota: 1.57,
+                dy: 2.1676,
+            },
+        ];
+        let mut stmt = conn
+            .prepare("INSERT INTO anunciado (id, ativo, em, por_cota, dy) VALUES (?1,?2,?3,?4,?5)")
+            .unwrap();
+        for (i, a) in anuncios.iter().enumerate() {
+            stmt.execute((
+                i as i64 + 1,
+                a.ativo.to_string(),
+                a.em as i64,
+                a.por_cota,
+                a.dy,
+            ))
+            .unwrap();
+        }
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM anunciado", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 2,
+            "o segundo anúncio do dia não pode sobrescrever o primeiro"
+        );
     }
 
     #[test]
     fn cache_velho_e_descartado_na_leitura() {
-        let mut cache = Cache::new();
-        cache.insert(
-            "B3/PETR4".into(),
-            CachedQuote {
-                preco: 38.0,
-                em: agora() - CACHE_MAX_IDADE - 10,
-                anterior: None,
-                grade: "manual".into(),
-                moeda: "BRL".into(),
-            },
-        );
-        cache.insert(
-            "B3/VALE3".into(),
-            CachedQuote {
-                preco: 61.0,
-                em: agora(),
-                anterior: None,
-                grade: "ao_vivo".into(),
-                moeda: "BRL".into(),
-            },
-        );
-        let agora = agora();
-        let vivos: Cache = cache
-            .into_iter()
-            .filter(|(_, q)| agora.saturating_sub(q.em) <= CACHE_MAX_IDADE)
-            .collect();
-        assert_eq!(vivos.len(), 1);
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migracoes::aplicar(&conn).unwrap();
+        let agora = agora() as i64;
+        conn.execute(
+            "INSERT INTO cotacao (ativo, preco, em, grade, moeda) VALUES
+                ('B3/PETR4', 38.0, ?1, 'manual', 'BRL'),
+                ('B3/VALE3', 61.0, ?2, 'ao_vivo', 'BRL'),
+                ('BCB/IPCA', 4.5,  ?3, 'fechamento', 'BRL')",
+            (
+                agora - CACHE_MAX_IDADE as i64 - 10,
+                agora,
+                // Trinta dias: velho para um preço, corrente para uma série publicada.
+                agora - 30 * 24 * 60 * 60,
+            ),
+        )
+        .unwrap();
+        let vivos: Cache = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ativo, preco, anterior, em, grade, moeda FROM cotacao
+                     WHERE ?1 - em <= CASE grade WHEN 'fechamento' THEN ?2 ELSE ?3 END",
+                )
+                .unwrap();
+            stmt.query_map(
+                (agora, CACHE_MAX_IDADE_SERIE as i64, CACHE_MAX_IDADE as i64),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        CachedQuote {
+                            preco: row.get(1)?,
+                            anterior: row.get(2)?,
+                            em: row.get::<_, i64>(3)? as u64,
+                            grade: row.get(4)?,
+                            moeda: row.get(5)?,
+                        },
+                    ))
+                },
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        assert_eq!(vivos.len(), 2);
         assert!(vivos.contains_key("B3/VALE3"));
-    }
-
-    #[test]
-    fn campo_novo_ausente_vale_o_padrao() {
-        // Uma atualização do programa nunca rejeita um arquivo antigo por inteiro —
-        // mesma regra de `tools::persist::restore_params`.
-        let json = r#"{"posicoes": [], "watchlist": []}"#;
-        let p: Portfolio = serde_json::from_str(json).unwrap();
-        assert_eq!(p.versao, VERSAO_ATUAL);
-        assert_eq!(p.moeda_base, Moeda::Brl);
-        assert!(p.alertas.is_empty());
+        assert!(
+            vivos.contains_key("BCB/IPCA"),
+            "uma série publicada não expira como um preço"
+        );
+        assert!(!vivos.contains_key("B3/PETR4"));
     }
 }
 

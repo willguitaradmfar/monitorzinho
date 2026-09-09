@@ -63,11 +63,10 @@ build mais tudo que ele lançou.
 estrela continua lá, onde quer que a linha tenha ido parar.
 
 ```sh
-cat ~/.local/share/monitorzinho/marks.json
+sqlite3 ~/.local/share/monitorzinho/db/padrao.db "SELECT * FROM marca"
 ```
-```json
-[ { "table": "ports", "kind": "porta", "value": "5432", "subtree": false,
-    "color": "amarelo" } ]
+```
+1|ports|porta|5432|0|amarelo
 ```
 
 **Feche e reabra o app:** a estrela tem que voltar, inclusive **no painel
@@ -96,8 +95,8 @@ seguido de fim). Teste os dois valores e compare.
 
 ### 5. Remoção
 
-`Ctrl+E` sobre uma linha marcada: a estrela some, e o `marks.json` perde a
-entrada. (`Ctrl+G` → `Del` remove pela lista, sem precisar achar a linha de novo.) Se várias marcas casarem com a mesma linha, todas saem — é o que
+`Ctrl+E` sobre uma linha marcada: a estrela some, e a tabela `marca` perde a
+linha. (`Ctrl+G` → `Del` remove pela lista, sem precisar achar a linha de novo.) Se várias marcas casarem com a mesma linha, todas saem — é o que
 "pare de seguir isto" quer dizer.
 
 ### 6. Onde a tecla não é oferecida

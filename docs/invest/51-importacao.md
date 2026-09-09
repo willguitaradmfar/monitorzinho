@@ -151,4 +151,5 @@ O último é importante: uma importação de arquivo vazio que "sincronizasse" a
 * CSV em Latin-1: acentos certos.
 * Arquivo com uma linha a menos: a remoção aparece destacada na conferência, e só acontece
   se for confirmada.
-* `Esc` na conferência: `invest.json` não foi tocado. Confere com o `mtime`.
+* `Esc` na conferência: nada foi gravado. Confere contando as linhas de `posicao` antes
+  e depois.

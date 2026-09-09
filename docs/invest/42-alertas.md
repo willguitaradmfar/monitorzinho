@@ -91,7 +91,7 @@ de outra natureza.
 
 ## 7. Persistência
 
-`invest-alertas.json`, no formato de `ExecutionSpec`: qual regra, com que parâmetros, e se
+a tabela `alerta`, com a mesma ideia de `ExecutionSpec`: qual regra, com que valor, e se
 está ligada. Desligado continua desligado depois de reiniciar — a mesma decisão que
 `tools::persist` documenta, e pela mesma razão: voltar fazendo o que alguém desligou é o
 oposto do que foi pedido.

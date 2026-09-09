@@ -145,7 +145,7 @@ coisa. Interessam: Selic (diária e a meta anualizada), CDI, IPCA e IGP-M.
 
 ### 3.4 Manual — B3 e US na v1
 
-Não faz rede. Devolve o preço que está em `invest.json`, com o carimbo de quando foi
+Não faz rede. Devolve o preço que está na coluna `posicao.preco_manual`, com o carimbo de quando foi
 escrito. `grade()` = `Manual`.
 
 Não é um provedor de mentira nem um espaço reservado: é o provedor **correto** para uma
@@ -320,7 +320,7 @@ Igual ao `container::store::Store`, pelo mesmo motivo: a UI nunca espera por um 
 
 ## 9. O cache
 
-`invest-cache.json`, detalhado em [03 — Armazenamento](03-armazenamento.md). Existe para
+a tabela `cotacao`, detalhada em [03 — Armazenamento](03-armazenamento.md). Existe para
 uma coisa só: **abrir a aba mostrando números, e não traços.** Sempre desenhado com a
 idade ao lado, nunca apresentado como atual.
 

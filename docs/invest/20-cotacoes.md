@@ -15,7 +15,7 @@ A watchlist: o que eu acompanho, esteja ou não na carteira.
 
 ## 2. A watchlist é separada da carteira, e as duas se encontram aqui
 
-A lista de acompanhados vive em `invest.json` (`"watchlist"`) e é independente das
+A lista de acompanhados vive na tabela `watchlist` e é independente das
 posições. O que se acompanha e o que se possui são conjuntos diferentes — acompanha-se o
 que se pensa em comprar, e o índice que serve de referência, e o dólar.
 

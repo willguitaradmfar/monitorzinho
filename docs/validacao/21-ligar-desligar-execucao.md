@@ -71,16 +71,14 @@ Crie um **Scanner de portas**, desligue com espaço e aperte `Enter`. O log most
 Com a execução desligada, feche (`Ctrl+C` duas vezes) e abra de novo. Ela volta
 **desligada**, riscada, e a porta continua livre:
 
-```
+```sh
 curl -s -m 2 -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8901/   # 000
-python3 -c "
-import json;d=json.load(open('$HOME/.local/share/monitorzinho/tools.json'))
-print([(e['tool'], e.get('enabled')) for e in d])"
+sqlite3 ~/.local/share/monitorzinho/db/padrao.db "SELECT ferramenta, ligada FROM execucao"
 ```
 
-O arquivo guarda `\"enabled\": false`. Um `tools.json` escrito por uma versão
-anterior não tem esse campo e é lido como ligado — que é o que toda execução dele
-era.
+A coluna guarda `ligada = 0`. Uma execução restaurada de um `tools.json` de antes
+do banco, que não tinha o campo, foi lida como ligada — que é o que toda execução
+dele era.
 
 ### 6. Editar não liga sozinho
 

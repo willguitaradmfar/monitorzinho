@@ -151,17 +151,17 @@ fechados, a cada tick da aba. Um `summary()` que abrisse socket transformaria a 
 lugar mais caro do programa.
 
 Onde um resumo precisa de um número que só a rede sabe, ele lê o cache
-(`invest-cache.json`, carregado em memória) e mostra a idade junto. É a mesma regra do
+(a tabela `cotacao`, carregada em memória) e mostra a idade junto. É a mesma regra do
 `measured_at` dos tamanhos de container.
 
 ## 9. Como validar
 
 * Abrir o monitorzinho e não entrar na aba: `strace`/`lsof` não devem mostrar leitura de
-  `invest.json`. Nada da Invest existe até a aba ser visitada.
+  o banco. Nada da Invest existe até a aba ser visitada.
 * Entrar na aba: a lista aparece preenchida no **primeiro** desenho, não no segundo.
 * `1`, digitar `posi`, `Enter`: entra em Posições.
 * `Esc`, `Enter`: volta com `posi` ainda na caixa de busca e o cursor na mesma linha.
 * Voltar depois de abrir três módulos diferentes: os três estão no topo, na ordem inversa
   de abertura.
-* Apagar `invest-mru.json` com o programa aberto: nada quebra; a ordem volta a ser a de
+* Esvaziar `modulo_mru` com o programa aberto: nada quebra; a ordem volta a ser a de
   registro na próxima leitura.

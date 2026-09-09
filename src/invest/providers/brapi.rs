@@ -46,19 +46,17 @@ pub const ARQUIVO_TOKEN: &str = "brapi.token";
 
 /// O token, se houver. Ambiente primeiro, arquivo depois.
 ///
-/// **Nunca em `invest.json`.** Aquele arquivo é a carteira: ele é copiado para o `.bak` a
-/// cada gravação, é o que alguém manda junto ao pedir ajuda, e é o que vai num backup.
-/// Uma credencial ali sai de casa sem ninguém perceber.
-///
-/// O arquivo alternativo é lido do diretório de dados e **não é criado pelo programa** —
-/// quem o escreve escolhe as permissões dele.
+/// **Nem no banco do perfil.** O arquivo do perfil é o que se copia para outra máquina e
+/// o que vai num backup; uma credencial dentro dele sai de casa sem ninguém perceber. Por
+/// isso o token continua sendo um arquivo solto ao lado, lido do diretório de dados e
+/// **não criado pelo programa** — quem o escreve escolhe as permissões dele.
 pub fn token() -> Option<String> {
     if let Ok(t) = std::env::var(VAR_TOKEN)
         && !t.trim().is_empty()
     {
         return Some(t.trim().to_string());
     }
-    std::fs::read_to_string(crate::history::data_file(ARQUIVO_TOKEN))
+    std::fs::read_to_string(crate::db::dados_dir().join(ARQUIVO_TOKEN))
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())

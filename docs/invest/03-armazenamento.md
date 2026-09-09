@@ -1,10 +1,10 @@
 # 03 — Armazenamento
 
-**Grupo:** infraestrutura · **Estado:** planejado · **Fase:** 1
+**Grupo:** infraestrutura · **Estado:** entregue · **Fase:** 1
 **Depende de:** [00 — Arquitetura](00-arquitetura.md)
-**Arquivo novo:** `src/invest/store.rs`
+**Arquivo:** `src/invest/store.rs` · **Estrutura:** [docs/banco.md](../banco.md)
 
-O que fica em disco, em que formato, e as duas regras que não se negociam.
+O que fica gravado, em que formato, e as duas regras que não se negociam.
 
 ---
 
@@ -24,70 +24,70 @@ parciais daria um número errado e sobrescreveria o certo.
 Consequências, todas registradas nos módulos que sofrem com elas:
 
 * [15 — Lançamentos](15-lancamentos.md) é histórico opcional e **não escreve no PM**.
-* [50 — Imposto de renda](50-imposto-de-renda.md) só consegue **estimar**, e diz isso.
 * Editar quantidade e PM à mão é fluxo normal, não escotilha de emergência.
+
+Na estrutura, isso é a coluna `posicao.preco_medio`: escrita pela importação e pela
+edição, e por mais nada. Não existe função em `store.rs` que a calcule.
 
 ### 1.2 A carteira é gravada atomicamente
 
-`history.json` truncado por queda de energia é um gráfico feio. `invest.json` truncado é o
-registro do patrimônio da pessoa.
+Um histórico de gráfico truncado por queda de energia é um gráfico feio. Um registro do
+patrimônio de alguém truncado é outra coisa.
 
-Então, diferente de todo o resto do programa: arquivo temporário ao lado, `fsync`,
-`rename` por cima. O `rename` no mesmo sistema de arquivos é atômico — ou o arquivo velho
-está inteiro, ou o novo está inteiro, e nunca há um estado intermediário no disco.
+Isto já foi «arquivo temporário ao lado, `fsync`, `rename` por cima», feito à mão. Agora é
+uma **transação**: ou as onze tabelas da carteira mudaram juntas, ou nenhuma mudou. A
+garantia passou a valer para cada uma delas, e não só para o arquivo todo de uma vez —
+com `synchronous = FULL`, porque o que se ganharia afrouxando isso é tempo que ninguém
+sente, e o que se perde numa queda de energia é a última edição.
 
-Além disso, `invest.json.bak`: a versão anterior, guardada antes de cada gravação. Custa um
-arquivo pequeno e é a diferença entre um susto e uma perda.
+---
 
 ## 2. Onde
 
-`~/.local/share/monitorzinho/`, via `history::data_file` — o mesmo lugar de
-`history.json`, `tools.json` e `marks.json`, e a mesma função, para não haver uma segunda
-noção de "onde a gente guarda coisa".
+`~/.local/share/monitorzinho/db/<perfil>.db`, junto de tudo o que o programa guarda: o
+histórico dos gráficos, as ferramentas, as marcas. Um arquivo por perfil, e nada de
+segunda noção de «onde a gente guarda coisa».
 
-| Arquivo | Conteúdo | Gravado |
+A estrutura completa, a engine de migrations, os perfis e o backup estão em
+[docs/banco.md](../banco.md). Aqui ficam só as tabelas desta aba.
+
+| Tabela | Conteúdo | Gravada |
 | --- | --- | --- |
-| `invest.json` | posições, watchlist, alvos, configuração | ao editar, e a cada `SAVE_EVERY_N_TICKS` |
-| `invest-mru.json` | id → epoch da última abertura | ao abrir um módulo |
-| `invest-cache.json` | último retrato bom de cada série de mercado | ao sair da aba, e a cada 60 s |
+| `posicao` | a carteira, uma linha por `(fonte, conta, ativo)` | ao editar, e a cada `SAVE_EVERY_N_TICKS` |
+| `watchlist`, `alvo`, `setor`, `feed`, `mapeamento` | o resto do que é do usuário | idem |
+| `provento`, `lancamento`, `alerta` | histórico e regras | idem |
+| `carteira`, `carteira_alvo` | as carteiras recomendadas | idem |
+| `patrimonio` | a série diária, um ponto por dia | ao sair da aba, e ao fechar |
+| `cotacao` | último retrato bom de cada série de mercado | ao sair da aba, e a cada 60 s |
+| `agenda`, `noticia`, `anunciado` | o que a home mostra e a home não busca | quando a busca volta |
+| `modulo_mru` | id → epoch da última abertura | ao abrir um módulo |
 
-Três arquivos e não um, porque têm vidas diferentes: um é do usuário e é precioso, um é
-preferência descartável, e um é dado que se pode buscar de novo. Apagar o terceiro não
-custa nada; apagar o primeiro custa a carteira. Separá-los deixa isso óbvio para quem for
-mexer, e permite as regras de gravação diferentes do §1.2.
+A separação entre elas continua tendo o mesmo sentido que os três arquivos JSON tinham:
+umas são do usuário e são preciosas, uma é preferência descartável, e as últimas são dado
+que se pode buscar de novo. Apagar `cotacao` não custa nada; apagar `posicao` custa a
+carteira.
 
-## 3. `invest.json`
+---
 
-```jsonc
-{
-  "versao": 1,
-  "moeda_base": "BRL",
-  "posicoes": [
-    {
-      "fonte": "corretora-x",           // de onde esta linha veio
-      "conta": "12345-6",               // qual conta, dentro da fonte
-      "ativo": "B3/PETR4",              // mercado/símbolo — ver AssetId em 02
-      "classe": "acao",
-      "quantidade": 300,
-      "preco_medio": 32.1,              // INFORMADO. Nunca escrito pelo programa.
-      "moeda": "BRL",
-      "preco_manual": 38.42,            // usado quando não há provedor ao vivo
-      "preco_manual_em": 1757308800,    // quando esse preço foi informado
-      "atualizado_em": 1757308800       // quando a linha inteira foi importada/editada
-    }
-  ],
-  "watchlist": ["BINANCE/BTCBRL", "B3/IBOV"],
-  "alvos": { "acao": 40.0, "fii": 20.0, "cripto": 10.0, "renda_fixa": 30.0 },
-  "provedores": { "ordem": ["binance", "awesomeapi", "bcb", "manual"] }
-}
+## 3. A carteira, coluna a coluna
+
+```sql
+CREATE TABLE posicao (
+    id              INTEGER PRIMARY KEY,  -- guarda a ordem da lista
+    fonte           TEXT NOT NULL,        -- de onde esta linha veio
+    conta           TEXT NOT NULL,        -- qual conta, dentro da fonte
+    ativo           TEXT NOT NULL,        -- 'B3/PETR4' — ver AssetId em 02
+    classe          TEXT NOT NULL,        -- 'acao', 'fii', 'renda_fixa'…
+    quantidade      REAL NOT NULL,
+    preco_medio     REAL,                 -- INFORMADO. Nunca escrito pelo programa.
+    moeda           TEXT NOT NULL,
+    preco_manual    REAL,                 -- usado quando não há provedor ao vivo
+    preco_manual_em INTEGER,              -- quando esse preço foi informado
+    atualizado_em   INTEGER NOT NULL,     -- quando a linha inteira foi importada/editada
+    carteira        TEXT                  -- a carteira recomendada de que participa
+);
+CREATE INDEX posicao_chave ON posicao(fonte, conta, ativo);
 ```
-
-### `versao`
-
-Presente desde a primeira gravação. Um arquivo de carteira vai sobreviver a mudanças de
-formato, e migrar sem saber de onde se está migrando é adivinhação. A leitura de uma versão
-desconhecida **recusa e avisa**, em vez de interpretar por conta própria — o contrário do
-que `tools::persist` faz, onde ignorar um campo estranho é barato.
 
 ### `fonte` e `conta` são parte da identidade
 
@@ -97,6 +97,9 @@ e não toca em mais nada.
 
 O mesmo ativo em duas corretoras dá **duas linhas**, com preços médios diferentes, e as
 duas ficam visíveis. Consolidar apaga de onde veio o número, que é informação real.
+
+Ela é um **índice e não uma restrição**, de propósito. Recusar uma linha na hora de gravar
+perderia a linha; o lugar de reclamar de uma duplicata é a tela que a criou.
 
 ### O total consolidado, quando o mesmo ativo aparece duas vezes
 
@@ -111,85 +114,117 @@ programa. O preço manual é a última cotação conhecida — um valor de merca
 foi informado à mão porque não há provedor. Quando um provedor ao vivo passar a cobrir o
 ativo, `preco_manual` é ignorado e nada mais precisa mudar.
 
-## 4. `invest-mru.json`
+### `preco_medio` é `NULL` de verdade
 
-```json
-{ "posicoes": 1757308800, "correlacao": 1757305200 }
+Uma posição sem preço médio é legítima: quem acompanha um ativo sem lembrar quanto pagou.
+A coluna é anulável e o `None` sobrevive à ida e volta — um zero no lugar dele seria um
+custo inventado, e um custo inventado contamina P&L, alocação, yield on cost e imposto sem
+deixar rastro. O que depende dele simplesmente **não é calculado**.
+
+E dá para perguntar quais são:
+
+```sql
+SELECT fonte, conta, ativo, quantidade FROM posicao WHERE preco_medio IS NULL;
 ```
 
-Id do módulo → epoch em segundos da última abertura. Só isso.
+---
 
-Escrito no momento em que o módulo abre. Gravação simples, sem `fsync`: perder isto custa
-a ordem da lista até o próximo uso, e nada mais. Um id desconhecido — de um módulo que
-sumiu numa atualização — é ignorado na leitura, sem erro.
+## 4. O cache de cotações
 
-## 5. `invest-cache.json`
-
-Último retrato bom por série, com o carimbo de quando foi obtido:
-
-```jsonc
-{
-  "BINANCE/BTCBRL": { "preco": 512340.0, "em": 1757308791, "grade": "ao_vivo" },
-  "BCB/CDI":        { "preco": 10.4,     "em": 1757222400, "grade": "fechamento" }
-}
+```sql
+CREATE TABLE cotacao (
+    ativo TEXT PRIMARY KEY, preco REAL NOT NULL, anterior REAL,
+    em INTEGER NOT NULL, grade TEXT NOT NULL, moeda TEXT NOT NULL
+) WITHOUT ROWID;
 ```
 
 **Sempre desenhado com a idade ao lado**, nunca apresentado como atual. É a mesma regra que
 o retrato de tamanhos dos containers já segue com `measured_at`: um número de quatro
 minutos atrás é útil; um número de quatro minutos atrás apresentado como agora não é.
 
-Uma entrada mais velha que 24 h é descartada na leitura em vez de mostrada — a partir de
-certa idade o número deixa de informar e passa a enganar, e um preço de ontem numa tela de
-mercado é dessa categoria.
+O descarte por idade acontece no `WHERE` da leitura, e não numa passada depois — uma linha
+vencida não chega a virar objeto:
+
+```sql
+WHERE ?agora - em <= CASE grade WHEN 'fechamento' THEN ?serie ELSE ?preco END
+```
+
+**Dois tetos, e não um.** A regra ser única era um bug: uma série do Banco Central não
+envelhece como um preço. O IPCA de julho é o IPCA corrente até o de agosto sair, e ele
+nasce com semanas de idade porque o carimbo é o **primeiro dia do mês de referência**, não
+o da busca. Com o teto de 24 h as quatro linhas do BCB eram descartadas em toda abertura e
+voltavam a «buscando…» por dezenas de segundos. Um preço vale 24 h; uma série publicada,
+120 dias — ver `CACHE_MAX_IDADE_SERIE`, onde o número está justificado com a medição.
 
 Apagável a qualquer momento sem consequência. A única perda é a aba abrir com traços na
 primeira vez.
 
-## 6. Carregar e falhar
+---
+
+## 5. Carregar e falhar
 
 | O que acontece | O que o programa faz |
 | --- | --- |
-| arquivo não existe | carteira vazia, lista de módulos completa, tudo abre |
-| JSON inválido | **não sobrescreve**. Renomeia para `.corrompido`, avisa na tela, segue com o `.bak` |
-| `versao` desconhecida | recusa, avisa qual versão o arquivo tem e qual o programa entende, e **não grava por cima** |
-| campo novo, ausente no arquivo antigo | vale o padrão — igual a `restore_params` faz com as ferramentas |
-| campo que não existe mais | ignorado na leitura, sumindo na próxima gravação |
+| o perfil é novo | carteira vazia, lista de módulos completa, tudo abre |
+| uma linha que este binário não sabe ler | **pulada**, e as outras continuam vindo |
+| coluna nova, ausente no banco antigo | uma migration a acrescenta com o padrão |
+| coluna que não existe mais | fica lá até uma migration a tirar; a leitura a ignora |
+| o arquivo do perfil não aceita escrita | a tela diz na hora, e a edição não finge que gravou |
+| o banco é de uma versão futura | **não abre**, e a tela diz até onde ele foi |
 
-A regra que os dois últimos casos seguem é a de `tools::persist::restore_params`: uma
-atualização do programa nunca rejeita um arquivo antigo por inteiro.
+A regra do segundo caso é a que `tools::persist::restore_params` já seguia: uma
+atualização do programa nunca rejeita o que veio antes por inteiro. Um mercado que só
+existe numa versão mais nova faz aquela linha ser pulada, e não a carteira inteira ser
+perdida — o que vale para um downgrade tanto quanto para um upgrade.
 
-Os dois primeiros casos são o contrário do resto do programa, que trata arquivo ruim como
-"comece do zero". Aqui, começar do zero é apagar a carteira, e isso não pode ser o
+Os dois últimos casos são o contrário do resto do programa, que trata dado ruim como
+«comece do zero». Aqui, começar do zero é apagar a carteira, e isso não pode ser o
 comportamento de recuperação.
 
-## 7. Quando grava
+---
+
+## 6. Quando grava
 
 * **Ao editar** — uma posição alterada é gravada na hora. Uma carteira que perde a última
-  edição por um `kill` é uma carteira que não se confia.
+  edição por um `kill` é uma carteira em que não se confia.
 * **A cada `SAVE_EVERY_N_TICKS`** — o mesmo ritmo com que o app já salva histórico e
   ferramentas, para o que muda sozinho.
-* **Ao sair da aba** — o cache, para a próxima abertura ser rápida.
-* **Ao fechar o programa** — em `App::persist()`, junto do que já é salvo lá.
+* **Ao sair da aba** — o cache e a série do patrimônio, para a próxima abertura ser rápida.
+* **Ao fechar o programa** — em `App::persist_invest()`, junto do que já é salvo lá.
 
-## 8. O que este arquivo deliberadamente não guarda
+As coleções são **reescritas do zero** em vez de comparadas linha a linha. São dezenas ou
+centenas de linhas dentro de uma transação, o que custa microssegundos, e o que se ganha é
+que não existe caminho pelo qual o banco fique diferente do que está na memória.
 
-* **Credencial de provedor.** Nenhum provedor da v1 tem chave. Quando tiver, a decisão de
-  onde a chave mora é própria e não é aqui — um arquivo de configuração legível junto da
-  carteira é o lugar errado.
-* **Histórico de preço.** Isso é cache, é grande, e se busca de novo. O cache guarda o
+A exceção é `patrimonio`: ali é `UPSERT` por dia e **nenhum `DELETE`**. O dia de hoje é
+reescrito enquanto ele é hoje; um dia passado nunca é reescrito, e um dia que não está na
+lista da memória continua no banco em vez de sumir.
+
+---
+
+## 7. O que isto deliberadamente não guarda
+
+* **Credencial de provedor.** O arquivo do perfil é o que se copia para outra máquina e o
+  que vai num backup; uma credencial dentro dele sai de casa sem ninguém perceber. O token
+  da brapi é um arquivo solto ao lado, lido e nunca escrito pelo programa.
+* **Histórico de preço.** Isso é cache, é grande, e se busca de novo. `cotacao` guarda o
   último ponto, não a série.
 * **Nada derivado.** P&L, alocação, risco e correlação são calculados de novo a cada
   abertura. Guardar derivado é criar duas verdades sobre a mesma coisa, e um dia elas
   discordam.
 
-## 9. Como validar
+---
 
-* Matar o programa com `kill -9` durante a gravação, em laço, algumas centenas de vezes:
-  `invest.json` está sempre inteiro, ou é o anterior. Nunca meio.
-* Corromper `invest.json` à mão: o programa abre, avisa, e o `.bak` salva a carteira.
+## 8. Como validar
+
+* Matar o programa com `kill -9` durante a gravação, em laço, algumas centenas de vezes: a
+  carteira está sempre inteira, ou é a anterior. Nunca meio.
 * Reimportar a mesma corretora duas vezes: o número de linhas não muda.
 * Importar duas corretoras com o mesmo ativo: duas linhas, ambas visíveis, e o consolidado
   com a média ponderada.
-* Apagar `invest-cache.json`: nada quebra, a aba só abre com traços na primeira volta.
-* Editar `preco_medio` à mão no arquivo e reabrir: o número está lá, intacto. Nada o
+* Apagar as linhas de `cotacao`: nada quebra, a aba só abre com traços na primeira volta.
+* Editar `preco_medio` à mão com o `sqlite3` e reabrir: o número está lá, intacto. Nada o
   recalculou.
+* `chmod 444` no `.db`: a aba diz que está somente para leitura, e a edição não finge.
+* Uma linha com um mercado inventado (`INSERT INTO posicao ... 'MARTE/XPTO3' ...`): ela é
+  pulada, e as outras continuam aparecendo.

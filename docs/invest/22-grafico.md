@@ -64,9 +64,9 @@ Uma série buscada fica em memória enquanto o módulo está aberto, por `(ativo
 Andar entre períodos já visitados não gera requisição. Trocar de ativo descarta o que não
 é mais visível, com um teto de algumas séries.
 
-A série **não** vai para `invest-cache.json`: aquele cache guarda o último ponto de cada
+A série **não** vai para a tabela `cotacao`: aquele cache guarda o último ponto de cada
 ativo para a aba abrir com números, não séries inteiras — ver
-[03 §5](03-armazenamento.md#5-invest-cachejson).
+[03 §4](03-armazenamento.md#4-o-cache-de-cotações).
 
 ## 7. Teclas
 

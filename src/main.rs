@@ -12,10 +12,13 @@ use ratatui::backend::CrosstermBackend;
 mod action;
 mod app;
 mod container;
+mod db;
 mod format;
 mod history;
 mod invest;
+mod legado;
 mod monitor;
+mod perfil;
 mod tmux;
 mod tools;
 mod ui;
@@ -41,22 +44,52 @@ fn install_panic_hook() {
     }));
 }
 
-/// The two flags a program is expected to answer before it does anything else. There is
-/// no configuration on the command line — everything monitorzinho does is decided from
-/// inside it — but "which version is installed" is a question asked by installers,
+/// The flags a program is expected to answer before it does anything else. There is
+/// almost no configuration on the command line — everything monitorzinho does is decided
+/// from inside it — but "which version is installed" is a question asked by installers,
 /// scripts and bug reports alike, and a program that can only answer it by opening a
 /// full-screen interface is a program that cannot answer it.
-fn handle_flags() -> bool {
+///
+/// `--perfil` is the exception, and it has to be one: which database to open is decided
+/// *before* there is a program to decide it from inside of. `None` means the flag was
+/// answered here and there is nothing left to run.
+fn handle_flags() -> Option<perfil::Pedido> {
     let Some(flag) = std::env::args().nth(1) else {
-        return false;
+        return Some(perfil::Pedido::Automatico);
     };
     match flag.as_str() {
+        // Sem nome, abre a tela de escolha mesmo havendo um perfil só — que é como se
+        // cria o segundo. Com nome, vai direto, criando se não existir: é o que serve
+        // para um atalho ou um script.
+        "--perfil" | "-p" => {
+            return Some(match std::env::args().nth(2) {
+                Some(nome) => perfil::Pedido::Nomeado(nome),
+                None => perfil::Pedido::Escolher,
+            });
+        }
+        "--perfis" => {
+            let perfis = db::perfis();
+            if perfis.is_empty() {
+                println!("nenhum perfil ainda em {}", db::perfis_dir().display());
+            }
+            for p in perfis {
+                println!("{}\t{}", p.nome, p.caminho.display());
+            }
+        }
         "--version" | "-V" => println!("monitorzinho {}", env!("CARGO_PKG_VERSION")),
         // A stopwatch on the work that happens when you press Tab. Switching tabs
         // samples synchronously — the point is to show a filled screen rather than an
         // empty one — so anything slow in that path is felt as lag, and guessing which
         // part is slow on somebody else's machine is how the wrong thing gets optimised.
-        "--bench" => app::bench(),
+        "--bench" => {
+            // Precisa de um banco como qualquer outra execução, e não pode abrir tela
+            // para perguntar qual: mede-se o perfil que uma execução sem flag abriria.
+            if let Err(erro) = perfil::abrir_sem_tela() {
+                eprintln!("monitorzinho: {erro}");
+                std::process::exit(1);
+            }
+            app::bench()
+        }
         "--help" | "-h" => {
             println!("monitorzinho {}", env!("CARGO_PKG_VERSION"));
             println!();
@@ -69,9 +102,18 @@ fn handle_flags() -> bool {
             println!("certificado, receptor de requisições e seguidor de arquivo.");
             println!();
             println!("uso: monitorzinho [--version] [--help] [--bench]");
+            println!("               [--perfil [nome]] [--perfis]");
             println!();
             println!("--bench mede o custo de uma amostragem de cada aba, que é o que");
             println!("acontece ao trocar de aba, e imprime onde o tempo foi.");
+            println!();
+            println!("Tudo que o programa guarda — histórico, ferramentas, marcas, a");
+            println!("carteira — fica num arquivo SQLite por perfil, em");
+            println!("~/.local/share/monitorzinho/db/. Copiar o arquivo é o backup;");
+            println!("pôr o arquivo na mesma pasta de outra máquina é a restauração.");
+            println!("Havendo mais de um perfil, o programa pergunta qual abrir.");
+            println!("--perfis lista os que existem; --perfil abre a tela de escolha,");
+            println!("que é onde se cria um novo; --perfil <nome> abre aquele direto.");
             println!();
             println!("Não há opções de configuração na linha de comando: tudo é escolhido");
             println!("de dentro, e as teclas de cada tela estão no rodapé dela. Tab troca");
@@ -84,13 +126,13 @@ fn handle_flags() -> bool {
             std::process::exit(2);
         }
     }
-    true
+    None
 }
 
 fn main() -> io::Result<()> {
-    if handle_flags() {
+    let Some(pedido) = handle_flags() else {
         return Ok(());
-    }
+    };
     // A full-screen interface needs somewhere to draw. Without this the failure is
     // `Os { code: 6, kind: Uncategorized }` from deep inside the terminal setup, which
     // tells a person piping the output nothing at all about what they did wrong.
@@ -107,7 +149,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, pedido);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -172,7 +214,32 @@ fn open_attach(
     Ok(())
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    pedido: perfil::Pedido,
+) -> io::Result<()> {
+    // Antes de tudo, porque tudo depende disto: `App::new` lê o histórico, as
+    // ferramentas, as marcas e a carteira, e todos eles vêm do banco do perfil.
+    let aberto = match perfil::abrir(terminal, pedido)? {
+        Some(aberto) => aberto,
+        // Esc na tela de escolha. Sair sem ter aberto nada é o que ele significa.
+        None => return Ok(()),
+    };
+    match aberto {
+        // A importação dos arquivos da versão anterior acontece uma vez na vida da
+        // instalação, e move a carteira de alguém de lugar. Ela é mostrada e esperada:
+        // uma linha de rodapé que some no primeiro tick não é onde isso se conta.
+        perfil::Aberto::Pronto {
+            legado: Some(resumo),
+        } if resumo.houve_algo() => {
+            perfil::mostrar_legado(terminal, &resumo)?;
+        }
+        perfil::Aberto::Pronto { .. } => {}
+        perfil::Aberto::Falhou { caminho, erro } => {
+            return perfil::mostrar_falha(terminal, &caminho, &erro);
+        }
+    }
+
     let mut app = App::new();
     app.tick();
     let mut last_tick = Instant::now();

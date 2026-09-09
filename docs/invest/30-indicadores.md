@@ -33,7 +33,7 @@ Cinco, escolhidos por serem os que quase todo mundo usa e por caberem na tela:
 | MACD | painel próprio, embaixo | 12, 26, 9 |
 
 Cada um pode ser ligado, desligado, e ter o período trocado. A configuração é por ativo e
-fica em `invest.json`: quem olha um gráfico diário e um de cinco anos não quer a mesma
+fica no banco: quem olha um gráfico diário e um de cinco anos não quer a mesma
 média.
 
 ## 4. As contas, e onde elas erram

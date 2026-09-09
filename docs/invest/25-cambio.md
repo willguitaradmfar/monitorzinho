@@ -46,7 +46,7 @@ silenciosamente exclui posições é ruim; um total que silenciosamente inclui p
 convertidas por um câmbio de três dias atrás é pior, porque parece exato.
 
 Um câmbio de até 24 h **é** usado, com a idade visível. O corte é o mesmo do cache em
-[03 §5](03-armazenamento.md#5-invest-cachejson).
+[03 §4](03-armazenamento.md#4-o-cache-de-cotações).
 
 ## 4. A tela
 

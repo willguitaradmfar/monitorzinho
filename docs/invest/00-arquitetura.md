@@ -52,10 +52,10 @@ Quatro regras, em ordem de importância:
    e nasce `None`. Abrir o monitorzinho para olhar CPU não pode ler arquivo de carteira,
    nem resolver DNS, nem alocar um cache de cotação.
 
-2. **Entrar na aba constrói o estado; sair não o destrói.** A construção é: ler
-   `invest.json` e `invest-mru.json` do disco, montar o registro de módulos. É I/O de
-   dois arquivos pequenos e alocação — dezenas de microssegundos, não milissegundos.
-   Nada de rede acontece aqui.
+2. **Entrar na aba constrói o estado; sair não o destrói.** A construção é: ler a
+   carteira e a ordem dos módulos do banco do perfil, montar o registro de módulos. São
+   algumas consultas em tabelas pequenas e alocação — dezenas de microssegundos, não
+   milissegundos. Nada de rede acontece aqui.
 
 3. **Nenhuma thread de rede nasce ao entrar na aba.** Ela nasce quando um módulo que
    precisa dela é **aberto**, e morre quando o último módulo que a usava é fechado. Isto
@@ -155,7 +155,7 @@ nada o lê nesta tabela.
 A lista é ordenada por **quando cada módulo foi aberto pela última vez**, do mais
 recente para o mais antigo. Módulos nunca abertos vêm depois, na ordem de registro.
 
-Isso é escrito em `invest-mru.json` (§8) no momento em que o módulo abre, não quando
+Isso é escrito em `modulo_mru` (§8) no momento em que o módulo abre, não quando
 fecha: abrir é o gesto que expressa interesse, e um módulo que ficou aberto por engano
 por dois segundos ainda foi o último que a pessoa quis ver.
 
@@ -406,26 +406,31 @@ regra 3 do §3. Nada disso é escrito agora.
 
 ## 8. O que fica em disco
 
-Em `~/.local/share/monitorzinho/` (via `history::data_file`, junto de `history.json`,
-`tools.json` e `marks.json`).
+No banco do perfil — `~/.local/share/monitorzinho/db/<perfil>.db` —, junto de tudo o que
+o resto do programa guarda. Ver [docs/banco.md](../banco.md) para o arquivo, os perfis e
+as migrations; aqui só as tabelas desta aba.
 
-| Arquivo | O que é | Escrito quando |
+| Tabela | O que é | Escrita quando |
 | --- | --- | --- |
-| `invest.json` | posições, watchlist, alvos de alocação, configuração | ao editar, e a cada `SAVE_EVERY_N_TICKS` |
-| `invest-mru.json` | `{ "posicoes": 1757308800, … }` — id → epoch da última abertura | ao abrir um módulo |
-| `invest-cache.json` | último retrato bom de cada série de mercado | ao fechar a aba, e a cada 60 s |
+| `posicao` + `watchlist`, `alvo`, `setor`, `feed`, `mapeamento` | a carteira e o resto do que é do usuário | ao editar, e a cada `SAVE_EVERY_N_TICKS` |
+| `provento`, `lancamento`, `alerta` | histórico e regras | idem |
+| `carteira`, `carteira_alvo` | as carteiras recomendadas | idem |
+| `modulo_mru` | id do módulo → epoch da última abertura | ao abrir um módulo |
+| `patrimonio` | a série diária, um ponto por dia | ao fechar a aba, e ao sair |
+| `cotacao` | último retrato bom de cada série de mercado | ao fechar a aba, e a cada 60 s |
+| `agenda`, `noticia`, `anunciado` | o que a home mostra e a home não busca | quando a busca volta |
 
-`invest-cache.json` existe por uma razão só: **abrir a aba mostrando números, e não
-traços**. A primeira volta de rede leva de centenas de milissegundos a segundos; sem
-cache, a aba abre vazia toda vez. O cache é sempre desenhado com a idade ao lado
-("há 4 min"), nunca apresentado como atual — a mesma regra que o retrato de tamanhos dos
-containers já segue com `measured_at`.
+`cotacao` existe por uma razão só: **abrir a aba mostrando números, e não traços**. A
+primeira volta de rede leva de centenas de milissegundos a segundos; sem cache, a aba abre
+vazia toda vez. O cache é sempre desenhado com a idade ao lado ("há 4 min"), nunca
+apresentado como atual — a mesma regra que o retrato de tamanhos dos containers já segue
+com `measured_at`.
 
-Um arquivo corrompido custa o que estava nele e nunca o programa abrir, que é o
-comportamento de `tools::persist::load` e de `history::load_all` hoje. Com uma diferença
-que a carteira exige: `invest.json` é gravado com **escrita atômica** — arquivo temporário
-ao lado, `fsync`, depois `rename`. Um histórico de gráfico truncado por queda de energia
-é um gráfico feio; uma carteira truncada é o registro do patrimônio da pessoa.
+Uma linha ilegível custa aquela linha e nunca o programa abrir, que é o comportamento de
+`tools::persist::load` e de `history::load_all`. Com uma diferença que a carteira exige: a
+gravação é uma **transação**, e não onze gravações que podem parar no meio. Um histórico de
+gráfico truncado por queda de energia é um gráfico feio; uma carteira truncada é o registro
+do patrimônio da pessoa.
 
 O detalhamento está em [03 — Armazenamento](03-armazenamento.md).
 

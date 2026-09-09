@@ -34,7 +34,7 @@ O que o programa calcula, e só isso:
 
 ## 3. Os dados
 
-Vêm de `invest.json` (posições) e do retrato de cotações do `ProviderSet`. Nada mais.
+Vêm da tabela `posicao` e do retrato de cotações do `ProviderSet`. Nada mais.
 
 A identidade de uma linha é `(fonte, conta, ativo)` — o mesmo ativo em duas corretoras dá
 duas linhas, e as duas ficam visíveis. Consolidar apagaria de onde veio o número.

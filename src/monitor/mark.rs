@@ -15,12 +15,10 @@
 //! Marks are per machine and survive restarts — the whole reason they exist is to
 //! outlast the list.
 
-use std::fs;
-
 use serde::{Deserialize, Serialize};
 
 use super::TableRow;
-use crate::history;
+use crate::db;
 
 /// One thing a table can be asked to watch for.
 ///
@@ -160,13 +158,29 @@ pub struct Marks {
 
 impl Marks {
     pub fn load() -> Self {
-        let all = match fs::read_to_string(path()) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+        let all = db::ler(Vec::new(), |conn| {
+            let mut stmt =
+                conn.prepare("SELECT tabela, tipo, valor, subarvore, cor FROM marca ORDER BY id")?;
+            let linhas = stmt.query_map([], |row| {
+                Ok(Mark {
+                    table: row.get(0)?,
+                    kind: row.get(1)?,
+                    value: row.get(2)?,
+                    subtree: row.get::<_, i64>(3)? != 0,
+                    // A colour this build doesn't know reads back as the default, the
+                    // same way a file written before colours existed used to.
+                    color: db::do_codigo(&row.get::<_, String>(4)?).unwrap_or_default(),
+                })
+            })?;
+            linhas.collect()
+        });
         Self { all }
     }
 
+    /// The whole table, rewritten. `id` is what keeps the order the list screen shows,
+    /// so it is reassigned from scratch on every save rather than patched — a handful of
+    /// rows inside one transaction, and no way for the order in memory to drift from the
+    /// order on disk.
     fn save(&self) {
         // Never from a test. The list operations below are worth testing and every one
         // of them saves; writing over the marks of whoever is running `cargo test` is
@@ -174,9 +188,31 @@ impl Marks {
         if cfg!(test) {
             return;
         }
-        if let Ok(content) = serde_json::to_string_pretty(&self.all) {
-            let _ = fs::write(path(), content);
-        }
+        db::escrever(|conn| {
+            db::limpar(conn, "marca")?;
+            let mut stmt = conn.prepare(
+                "INSERT INTO marca (id, tabela, tipo, valor, subarvore, cor)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (i, mark) in self.all.iter().enumerate() {
+                stmt.execute((
+                    i as i64 + 1,
+                    &mark.table,
+                    &mark.kind,
+                    &mark.value,
+                    mark.subtree as i64,
+                    db::codigo(&mark.color),
+                ))?;
+            }
+            Ok(())
+        });
+    }
+
+    /// Replaces the whole set with `all`. The one caller is the import of the old
+    /// `marks.json`, which has a list and needs it in the table exactly as it is.
+    pub fn overwrite(&mut self, all: Vec<Mark>) {
+        self.all = all;
+        self.save();
     }
 
     /// Every mark, in the order they were written — which is the order the list screen
@@ -295,8 +331,9 @@ impl Mark {
     }
 }
 
-fn path() -> std::path::PathBuf {
-    history::data_file("marks.json")
+/// Writes a whole set of marks, for the one-off import of the old `marks.json`.
+pub fn gravar_todas(all: Vec<Mark>) {
+    Marks::default().overwrite(all);
 }
 
 #[cfg(test)]

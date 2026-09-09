@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::invest::model::{AssetId, Portfolio};
 use crate::invest::module::{Ctx, Estado, Group, InvestModule, Need};
 use crate::invest::provider::{MarketSnapshot, ProviderSet};
-use crate::invest::store::{Cache, LoadIssue, Mru};
+use crate::invest::store::{Cache, Mru};
 
 pub mod b3;
 pub mod calc;
@@ -51,7 +51,9 @@ pub mod tempo;
 /// Tudo que a aba tem. Nasce na primeira vez que alguém entra nela, e não antes.
 pub struct InvestState {
     pub portfolio: Portfolio,
-    pub issue: Option<LoadIssue>,
+    /// Gravar está proibido porque o arquivo do perfil não aceita escrita. A tela diz
+    /// isso na hora — deixar alguém editar por meia hora e só depois descobrir que nada
+    /// foi gravado seria pior que não abrir.
     pub somente_leitura: bool,
     pub mru: Mru,
     pub cache: Cache,
@@ -120,7 +122,6 @@ impl InvestState {
 
         let state = Self {
             portfolio: carregado.portfolio,
-            issue: carregado.issue,
             somente_leitura: carregado.somente_leitura,
             mru: store::load_mru(),
             cache,
@@ -375,9 +376,8 @@ impl InvestState {
             return;
         }
         if self.somente_leitura {
-            self.erro_gravacao = Some(
-                "o arquivo é de uma versão mais nova do monitorzinho — nada foi gravado".into(),
-            );
+            self.erro_gravacao =
+                Some("o arquivo deste perfil está somente para leitura — nada foi gravado".into());
             self.sujo = false;
             return;
         }
@@ -586,7 +586,6 @@ mod tests {
             fundamentos: Default::default(),
             anunciados: Default::default(),
             portfolio: Portfolio::default(),
-            issue: None,
             somente_leitura: false,
             mru: Mru::new(),
             cache,

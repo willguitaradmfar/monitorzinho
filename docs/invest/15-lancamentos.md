@@ -95,10 +95,17 @@ Isso não é redundante com a documentação. É a tela onde a expectativa contr
 
 ## 7. Armazenamento
 
-Arquivo próprio, `invest-lancamentos.json`, com as mesmas garantias de
-[03](03-armazenamento.md): escrita atômica e `.bak`. É um registro que só cresce, e ele é
-separado de `invest.json` para que a gravação frequente das posições não reescreva um
-arquivo grande a cada edição.
+Tabela própria, `lancamento`, com as mesmas garantias de [03](03-armazenamento.md):
+gravação em transação, no banco do perfil. É um registro que só cresce, e ele é uma tabela
+separada de `posicao` — o que antes custava um arquivo grande reescrito a cada edição hoje
+não custa nada, porque o lançamento e a posição não se tocam.
+
+E, sendo tabela, o histórico passou a responder a pergunta que ele existe para responder:
+
+```sql
+SELECT strftime('%Y-%m', em, 'unixepoch') AS mes, sum(valor)
+FROM lancamento WHERE tipo = 'aporte' GROUP BY mes;
+```
 
 ## 8. Fica de fora na v1
 

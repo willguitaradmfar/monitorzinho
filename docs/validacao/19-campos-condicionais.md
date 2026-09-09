@@ -100,5 +100,5 @@ mentirinha que os campos: pequena, repetida toda vez, e desnecessária.
 
 O valor de um campo escondido **continua guardado** e segue sendo salvo — voltar
 o modo para trás traz o que você tinha digitado. As validações também ficam:
-`start` continua recusando um proxy com TLS, por exemplo, porque um `tools.json`
-editado à mão não passa por formulário nenhum.
+`start` continua recusando um proxy com TLS, por exemplo, porque uma execução
+restaurada do banco não passa por formulário nenhum.

@@ -64,7 +64,7 @@ Um ponto **por dia**, gravado no primeiro tick da aba em cada dia novo. Não por
 patrimônio amostrado a cada dois segundos é trezentos pontos de ruído intradiário para uma
 grandeza que se lê em meses.
 
-A série vive em `invest-patrimonio.json` (arquivo próprio — é a única coisa da aba que só
+A série vive na tabela `patrimonio` (tabela própria — é a única coisa da aba que só
 cresce), com `{ data, total_brl, aporte, retirada, proventos }` por dia.
 
 **A série é histórica e não se recalcula.** O patrimônio de 12 de março foi o que foi, com

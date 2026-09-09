@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+
+use crate::db;
 
 // Sized to still fill a wide fullscreened panel (each sample is one column) rather than
 // just the overview grid's narrower one-of-three-columns panels.
@@ -54,32 +55,41 @@ impl History {
     }
 }
 
-/// Path of one of monitorzinho's state files, creating the directory if needed. Shared
-/// with `tools::persist` — this module happens to own the "where we keep things on
-/// disk" logic, and a second copy of it would be one more place to get wrong.
-pub fn data_file(name: &str) -> PathBuf {
-    let mut dir = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
-    dir.push("monitorzinho");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.push(name);
-    dir
-}
-
-fn data_file_path() -> PathBuf {
-    data_file("history.json")
-}
-
+/// The saved series, as they were left. A series the current build no longer draws
+/// stays in the table on purpose — downgrading and coming back shouldn't have thrown
+/// away the history of a panel that still exists in the other version.
 pub fn load_all() -> HistoryMap {
-    let path = data_file_path();
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => HistoryMap::new(),
-    }
+    db::ler(HistoryMap::new(), |conn| {
+        let mut stmt = conn.prepare("SELECT serie, valor FROM historico ORDER BY serie, pos")?;
+        let mut linhas = stmt.query([])?;
+        let mut map = HistoryMap::new();
+        while let Some(linha) = linhas.next()? {
+            let serie: String = linha.get(0)?;
+            let valor: f64 = linha.get(1)?;
+            map.entry(serie).or_default().push(valor);
+        }
+        Ok(map)
+    })
 }
 
+/// One row per sample, the whole table rewritten. It is a few thousand rows every ten
+/// seconds inside one transaction — a millisecond or two — and what it buys is that
+/// `SELECT` sees the same shape the panels do, instead of an opaque array of numbers.
 pub fn save_all(map: &HistoryMap) {
-    let path = data_file_path();
-    if let Ok(content) = serde_json::to_string_pretty(map) {
-        let _ = std::fs::write(path, content);
-    }
+    db::escrever(|conn| {
+        db::limpar(conn, "historico")?;
+        let mut stmt =
+            conn.prepare("INSERT INTO historico (serie, pos, valor) VALUES (?1, ?2, ?3)")?;
+        for (serie, valores) in map {
+            for (pos, valor) in valores.iter().enumerate() {
+                // A NaN in a chart is a gap, and SQLite has no NaN: it would come back
+                // as NULL and fail the read of every series after it.
+                if !valor.is_finite() {
+                    continue;
+                }
+                stmt.execute((serie, pos as i64, *valor))?;
+            }
+        }
+        Ok(())
+    });
 }

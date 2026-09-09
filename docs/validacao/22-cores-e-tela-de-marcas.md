@@ -110,10 +110,10 @@ a herança está pegando a cor errada.
 ### 4. Compatibilidade com o que já estava salvo
 
 ```sh
-cat ~/.local/share/monitorzinho/marks.json
+sqlite3 ~/.local/share/monitorzinho/db/padrao.db "SELECT tabela, tipo, valor, cor FROM marca"
 ```
 
-Um `marks.json` escrito por uma versão anterior **não tem** o campo `color`.
+Uma marca vinda de um `marks.json` anterior às cores **não tinha** o campo `color`.
 Abra o app: as marcas antigas têm que voltar, todas amarelas — que é exatamente a
 cor que elas já tinham. Nenhuma marca pode sumir.
 
@@ -142,7 +142,7 @@ apagar e criar. Se ela pular para o fim, o `replace` virou `add`.
 ### 8. Remover pela lista
 
 `Del` na última marca da lista. **Esperado:** ela some, o cursor fica numa linha
-que existe (não fora do fim), e o `marks.json` perde a entrada. Apague todas: a
+que existe (não fora do fim), e a tabela `marca` perde a linha. Apague todas: a
 tela mostra "Nenhuma marca ainda" e o rodapé passa a oferecer só `Esc`.
 
 ### 9. `Ctrl+G` não vira `g`

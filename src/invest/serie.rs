@@ -7,15 +7,11 @@
 //! com os preços daquele dia; recalcular com o preço de hoje daria outro número e apagaria
 //! o registro. É a mesma família de decisão do preço médio informado.
 
-use std::fs;
-
 use serde::{Deserialize, Serialize};
 
-use crate::history;
+use crate::db;
 use crate::invest::store;
 use crate::invest::tempo::{self, Data};
-
-const ARQUIVO: &str = "invest-patrimonio.json";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Ponto {
@@ -46,21 +42,47 @@ pub fn chave_dia(agora: u64) -> String {
     format!("{}-{:02}-{:02}", d.ano, d.mes, d.dia)
 }
 
+/// A série inteira, do dia mais antigo ao mais novo. `ORDER BY dia` porque a chave é
+/// `2026-09-08` — que ordena alfabeticamente na ordem certa, e é metade da razão de o dia
+/// ser guardado assim e não como um epoch.
 pub fn load() -> Vec<Ponto> {
-    fs::read_to_string(history::data_file(ARQUIVO))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Vec<Ponto>>(&t).ok())
-        .map(|mut v| {
-            v.sort_by(|a, b| a.dia.cmp(&b.dia));
-            v
-        })
-        .unwrap_or_default()
+    db::ler(Vec::new(), |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT dia, total_brl, aporte, retirada, proventos FROM patrimonio ORDER BY dia",
+        )?;
+        let linhas = stmt.query_map([], |row| {
+            Ok(Ponto {
+                dia: row.get(0)?,
+                total_brl: row.get(1)?,
+                aporte: row.get(2)?,
+                retirada: row.get(3)?,
+                proventos: row.get(4)?,
+            })
+        })?;
+        linhas.collect()
+    })
 }
 
+/// Grava a série. Um `UPSERT` por dia e nenhum `DELETE`: o dia de hoje é reescrito
+/// enquanto ele é hoje, e um dia que não está na lista da memória — porque este binário
+/// leu a série antes de alguma coisa acrescentar a ele — continua no banco em vez de
+/// sumir. **O passado não se reescreve, e aqui ele também não se apaga.**
 pub fn save(pontos: &[Ponto]) {
-    if let Ok(t) = serde_json::to_string_pretty(pontos) {
-        let _ = fs::write(history::data_file(ARQUIVO), t);
-    }
+    db::escrever(|conn| {
+        let mut stmt = conn.prepare(
+            "INSERT INTO patrimonio (dia, total_brl, aporte, retirada, proventos)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(dia) DO UPDATE SET
+                 total_brl = excluded.total_brl,
+                 aporte    = excluded.aporte,
+                 retirada  = excluded.retirada,
+                 proventos = excluded.proventos",
+        )?;
+        for p in pontos {
+            stmt.execute((&p.dia, p.total_brl, p.aporte, p.retirada, p.proventos))?;
+        }
+        Ok(())
+    });
 }
 
 /// Grava o ponto de hoje, se ainda não houver um.

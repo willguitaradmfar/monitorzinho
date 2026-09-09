@@ -38,7 +38,9 @@ const MIN_VALUE_WIDTH: usize = 8;
 
 /// A muted, low-saturation palette (One Dark-inspired) instead of the harsh basic
 /// ANSI 16 colors — easier on the eyes and still clearly distinguishable per group.
-mod palette {
+/// As cores do programa. Pública porque a tela de escolha de perfil — que roda antes de
+/// haver um `App` — desenha com as mesmas.
+pub mod palette {
     use ratatui::style::Color;
 
     pub const BLUE: Color = Color::Rgb(0x61, 0xAF, 0xEF);
@@ -745,7 +747,16 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Qual perfil está aberto, à esquerda de tudo: é uma identidade e não uma dica, e o
+    // canto direito é do rodapé de atalhos, que já enche a linha num terminal estreito.
+    // Só aparece havendo mais de um — com um perfil só, o nome dele não informa nada.
     let mut spans = vec![Span::raw(" ")];
+    if crate::db::varios_perfis() {
+        spans.push(Span::styled(
+            format!("⟨{}⟩ ", crate::db::perfil_atual()),
+            Style::default().fg(palette::PURPLE),
+        ));
+    }
     for (i, tab) in app.tabs().iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("   "));
@@ -3271,24 +3282,12 @@ fn invest_nota(app: &App) -> Option<String> {
     if let Some(erro) = &invest.erro_gravacao {
         return Some(erro.clone());
     }
-    match &invest.issue {
-        Some(crate::invest::store::LoadIssue::Corrompido {
-            salvo_em,
-            do_backup,
-        }) => Some(format!(
-            "o arquivo da carteira estava ilegível e foi guardado em {salvo_em}{}",
-            match do_backup {
-                true => " — a cópia de segurança foi carregada no lugar",
-                false => " — e não havia cópia de segurança",
-            }
-        )),
-        Some(crate::invest::store::LoadIssue::VersaoDesconhecida { arquivo, entendo }) => {
-            Some(format!(
-                "a carteira é da versão {arquivo} e este monitorzinho entende até a {entendo} — nada será gravado"
-            ))
-        }
-        _ => None,
+    if invest.somente_leitura {
+        return Some(
+            "o arquivo deste perfil está somente para leitura — nada será gravado".to_string(),
+        );
     }
+    None
 }
 
 /// Desenha um módulo em tela cheia.

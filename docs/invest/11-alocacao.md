@@ -33,7 +33,7 @@ que um setor em branco, porque leva a uma conclusão sobre concentração.
 
 ## 4. Alvo × real
 
-Os alvos ficam em `invest.json` (`"alvos"`), por classe na v1. Uma dimensão sem alvo
+Os alvos ficam na tabela `alvo`, por classe na v1. Uma dimensão sem alvo
 mostra só a distribuição real, sem coluna de desvio.
 
 ```

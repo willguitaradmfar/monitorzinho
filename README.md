@@ -29,8 +29,16 @@ A lightweight terminal system monitor, written in Rust.
   directly, and checks propagation across public resolvers; and a network
   sweep that finds what's alive on the LAN and hands the addresses straight to
   the port scanner.
-- History is persisted to disk and restored on restart, so the charts aren't
-  empty on launch. Tools come back running too.
+- **One file for everything.** History, running tools, table marks, rewrite rules
+  and the whole Invest tab live in a single SQLite database per profile, in
+  `~/.local/share/monitorzinho/db/`. Copying that file is the backup; dropping it
+  into the same folder on another machine is the restore. More than one file
+  there means more than one profile — separate history, separate tools, separate
+  wallet — and the program asks which one to open. Schema changes ship as
+  versioned migrations, applied on startup from a table that records what already
+  ran. See [docs/banco.md](docs/banco.md).
+- History is persisted and restored on restart, so the charts aren't empty on
+  launch. Tools come back running too.
 - Small, fast, no garbage collector: a single ~5 MB binary with no runtime to
   install, starting instantly.
 - Built to grow: adding a metric, a table, or a tool is implementing one trait
@@ -77,7 +85,22 @@ cargo build --release
 or just `cargo run --release` during development.
 
 `monitorzinho --version` prints the installed version and `--help` a short
-description; everything else is chosen from inside the program.
+description. The only real option is `--perfil`, and it has to be one: which
+database to open is decided *before* there is a program to decide it from inside
+of.
+
+```sh
+monitorzinho                 # asks only when there is more than one profile
+monitorzinho --perfis        # lists them, opening nothing
+monitorzinho --perfil        # the picker — where a new profile is created
+monitorzinho --perfil casa   # opens that one, creating it if needed
+```
+
+Everything else is chosen from inside the program.
+
+Upgrading from a version that kept its state in JSON files needs no action: the
+first launch reads them, writes them into the database, and moves the originals
+into `legado/` rather than deleting them, telling you on screen what it did.
 
 ## Tabs
 
@@ -758,7 +781,7 @@ So a parameter can declare what it depends on (`only_when`, chained when it take
 more than one thing to be true), and the wizard skips the rest — drawing,
 navigating and confirming. Values of hidden fields are kept, so changing a mode
 back brings back what was typed, and `Tool::start` still validates everything,
-since a hand-edited `tools.json` never passes through a form.
+since parameters restored from the database never pass through a form.
 
 #### Repetir requisição
 
@@ -953,6 +976,15 @@ Three small traits drive everything:
   `src/container/` mentions it, and the panels are written against `Container`,
   `Volume`, `Image` and `Network` alone.
 
+Everything any of them wants to remember goes through `src/db`, which owns the
+one SQLite file per profile — nothing else in the tree opens a path of its own.
+Structure changes are versioned migrations under `src/db/migracoes/`, embedded
+with `include_str!` so the binary stays a single file that reads nothing from
+disk to start; the runner consults the `migracao` table on every launch and
+applies whatever that particular file has not run yet. Writes go through one
+`escrever` that wraps them in a transaction, so a half-written wallet isn't a
+state that exists. See [docs/banco.md](docs/banco.md).
+
 A table says which tab it lives on with `TableMonitor::tab()`, defaulting to
 Processos — where every table lived when there was only one place for them. So
 an existing table says nothing and a new one says it only when it isn't there.
@@ -1029,13 +1061,36 @@ byte by byte.
 Under `~/.local/share/monitorzinho/` (or your platform's equivalent data
 directory):
 
-| File | What |
+| Path | What |
 | --- | --- |
-| `history.json` | chart history, so the sparklines survive a restart — including the ones a tool feeds, keyed by what they measure |
-| `tools.json` | the executions to bring back on launch, and their parameters |
-| `rewrites.json` | every rewrite rule ever written, offered as suggestions |
-| `marks.json` | the rows you asked to keep an eye on, per table |
-| `engine.json` | where to reach the container engine, when you pointed it somewhere by hand |
+| `db/<profile>.db` | everything the program remembers. One SQLite file per profile — copy it to back it up, drop it into another machine's `db/` to restore it |
+| `brapi.token` | the brapi API token, deliberately *outside* the database: the database is what leaves the house in a backup, and a credential inside it leaves with it. Read, never written |
+| `legado/` | the JSON files a pre-database version wrote, kept rather than deleted after they were imported |
+
+Inside the database, one table per thing rather than a blob per file:
+`historico` (chart history, including the series a tool feeds, keyed by what they
+measure), `execucao` and `execucao_param` (the executions to bring back on launch,
+and their parameters), `regra` (every rewrite rule ever written, offered as
+suggestions), `marca` (the rows you asked to keep an eye on, per table), `config`
+(where to reach the container engine, when you pointed it somewhere by hand), and
+the Invest tab's own — `posicao`, `provento`, `lancamento`, `alerta`, `carteira`,
+`patrimonio` and the caches. So the questions that used to need a program are a
+query:
+
+```sh
+sqlite3 ~/.local/share/monitorzinho/db/padrao.db \
+  "SELECT ativo, sum(bruto - retido) FROM provento
+   WHERE pago_em > strftime('%s','2026-01-01') GROUP BY ativo ORDER BY 2 DESC"
+```
+
+The journal mode is SQLite's default (`DELETE`) rather than `WAL`, on purpose:
+WAL is faster and leaves two sibling files next to the database, and a backup
+that copies only the `.db` of a WAL database copies one missing its latest
+transactions. Here the process is single and the writes are tiny — WAL's speed
+buys nothing, and the standalone file buys exactly what was wanted.
+
+Full details, including how migrations work and how to write one:
+[docs/banco.md](docs/banco.md).
 
 ## License
 

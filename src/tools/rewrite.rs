@@ -15,13 +15,11 @@
 //!   protocol that already announced it — rewriting a body without fixing
 //!   `Content-Length` is on the person who wrote the rule.
 
-use std::fs;
-
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::{Direction, Recorder};
-use crate::history;
+use crate::db;
 
 /// The pattern/replacement pair as the user typed it, which is also exactly what gets
 /// saved — both in the execution and in the shared history.
@@ -115,17 +113,23 @@ fn complaint(err: &regex::Error) -> String {
     last.strip_prefix("error: ").unwrap_or(last).to_string()
 }
 
-fn path() -> std::path::PathBuf {
-    history::data_file("rewrites.json")
-}
-
 /// Every rule ever written, newest first, shared by every execution. The point is that
 /// a rule is annoying to get right once and unbearable to get right twice.
 pub fn history() -> Vec<Rule> {
-    match fs::read_to_string(path()) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
+    db::ler(Vec::new(), |conn| {
+        // `id DESC` breaks the tie: two rules filed in the same second come back in the
+        // order they were filed, newest first, rather than in whichever order the page
+        // happened to hold them.
+        let mut stmt = conn
+            .prepare("SELECT padrao, troca FROM regra ORDER BY usada_em DESC, id DESC LIMIT ?1")?;
+        let linhas = stmt.query_map([HISTORY_LIMIT as i64], |row| {
+            Ok(Rule {
+                find: row.get(0)?,
+                replace: row.get(1)?,
+            })
+        })?;
+        linhas.collect()
+    })
 }
 
 /// Files `rule` at the front of the history, moving it there if it already existed so
@@ -134,23 +138,35 @@ pub fn remember(rule: &Rule) {
     if rule.find.is_empty() {
         return;
     }
-    let mut saved = history();
-    saved.retain(|existing| existing != rule);
-    saved.insert(0, rule.clone());
-    saved.truncate(HISTORY_LIMIT);
-    if let Ok(content) = serde_json::to_string_pretty(&saved) {
-        let _ = fs::write(path(), content);
-    }
+    db::escrever(|conn| {
+        // One row per (pattern, replacement), so re-filing an existing rule moves it
+        // instead of adding a second copy of itself.
+        conn.execute(
+            "INSERT INTO regra (padrao, troca, usada_em) VALUES (?1, ?2, ?3)
+             ON CONFLICT(padrao, troca) DO UPDATE SET usada_em = excluded.usada_em",
+            (&rule.find, &rule.replace, db::agora() as i64),
+        )?;
+        // Old enough entries fall off the end rather than growing a table nobody prunes.
+        conn.execute(
+            "DELETE FROM regra WHERE id NOT IN (
+                 SELECT id FROM regra ORDER BY usada_em DESC, id DESC LIMIT ?1
+             )",
+            [HISTORY_LIMIT as i64],
+        )?;
+        Ok(())
+    });
 }
 
 /// Drops one rule from the shared history. Removing it from an execution leaves it
 /// here on purpose — this is the only way it actually goes away.
 pub fn forget(rule: &Rule) {
-    let mut saved = history();
-    saved.retain(|existing| existing != rule);
-    if let Ok(content) = serde_json::to_string_pretty(&saved) {
-        let _ = fs::write(path(), content);
-    }
+    db::escrever(|conn| {
+        conn.execute(
+            "DELETE FROM regra WHERE padrao = ?1 AND troca = ?2",
+            (&rule.find, &rule.replace),
+        )?;
+        Ok(())
+    });
 }
 
 /// Applies the execution's rules to one chunk and writes it down, borrowing `original`
