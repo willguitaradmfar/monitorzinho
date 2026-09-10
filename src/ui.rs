@@ -6,8 +6,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, RenderDirection,
-    Row as UiRow, Sparkline, Table, TableState, Wrap,
+    Axis, Block, BorderType, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph,
+    RenderDirection, Row as UiRow, Sparkline, Table, TableState, Wrap,
 };
 
 use crate::action::Gravity;
@@ -4151,6 +4151,126 @@ struct GradePane<'a> {
     legend: &'a str,
 }
 
+/// Um *treemap* «squarified»: reparte um retângulo em pedaços cuja **área** é
+/// proporcional ao peso de cada um, e o mais quadrados que der.
+///
+/// Isto substituiu uma grade de fileiras de `n` células em que só a **largura** seguia o
+/// peso. Ela era infiel por três motivos ao mesmo tempo: cada fileira tinha o mesmo
+/// número de células e não o mesmo peso, então uma fileira de dois papéis grandes ocupava
+/// a mesma altura que uma de cinco pequenos; a altura era fixa, então a área não seguia o
+/// peso entre fileiras; e havia um piso de oito colunas por célula, que dava aos menores
+/// mais espaço do que o peso deles pedia. Uma posição de 0,5% aparecia do tamanho de uma
+/// de 3%, que é o oposto do que um heatmap existe para mostrar.
+///
+/// O algoritmo é o de Bruls, Huizing e van Wijk: as fileiras crescem enquanto a pior
+/// razão de aspecto da fileira **melhora**, e fecham quando ela piora. É o que evita as
+/// tiras compridas e finas de um treemap ingênuo.
+///
+/// Espera os pesos **em ordem decrescente** — é o que o algoritmo assume — e todos
+/// positivos. Fora do desenho para poder ser testado sem um terminal: é geometria, e
+/// geometria que erra por um deixa buraco ou sobreposição na tela.
+fn treemap(area: Rect, pesos: &[f64]) -> Vec<Rect> {
+    let total: f64 = pesos.iter().sum();
+    if pesos.is_empty() || total <= 0.0 || area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    // Os pesos passam a valer **células da tela**, para a soma deles ser exatamente a
+    // área disponível e as contas de espessura saírem em unidades de tela.
+    let escala = (area.width as f64 * area.height as f64) / total;
+    let valores: Vec<f64> = pesos.iter().map(|p| p * escala).collect();
+
+    let mut saida: Vec<Rect> = Vec::with_capacity(valores.len());
+    let (mut x, mut y) = (area.x as f64, area.y as f64);
+    let (mut w, mut h) = (area.width as f64, area.height as f64);
+    let mut i = 0;
+
+    while i < valores.len() {
+        let lado = w.min(h);
+        if lado <= 0.0 {
+            break;
+        }
+        // A fileira cresce enquanto a pior razão de aspecto dela não piorar.
+        let (mut fim, mut soma) = (i + 1, valores[i]);
+        let (mut maior, mut menor) = (valores[i], valores[i]);
+        let mut pior = razao(maior, menor, soma, lado);
+        while fim < valores.len() {
+            let v = valores[fim];
+            let nova = soma + v;
+            let novo_pior = razao(maior.max(v), menor.min(v), nova, lado);
+            if novo_pior > pior {
+                break;
+            }
+            soma = nova;
+            maior = maior.max(v);
+            menor = menor.min(v);
+            pior = novo_pior;
+            fim += 1;
+        }
+
+        // A fileira ocupa `espessura` do lado maior e o lado menor inteiro. Os limites
+        // são arredondados a partir das **coordenadas acumuladas**, e não do tamanho de
+        // cada peça: assim o fim de uma peça é o começo exato da seguinte, e a grade
+        // fecha sem buraco nem sobreposição.
+        let espessura = soma / lado;
+        let deitada = w >= h;
+        // A espessura também vem de coordenada acumulada, e não do arredondamento do
+        // próprio tamanho: senão a fileira seguinte começa onde esta terminou *em ponto
+        // flutuante* e as duas se desencontram por um caractere de vez em quando.
+        let (grosso_de, grosso_ate) = match deitada {
+            true => (x.round() as u16, (x + espessura).round() as u16),
+            false => (y.round() as u16, (y + espessura).round() as u16),
+        };
+        let grossura = grosso_ate.saturating_sub(grosso_de).max(1);
+        let fino_de = match deitada {
+            true => y.round() as u16,
+            false => x.round() as u16,
+        };
+        let mut andado = 0.0f64;
+        for v in &valores[i..fim] {
+            let de = andado.round() as u16;
+            andado += v / soma * lado;
+            let ate = andado.round() as u16;
+            saida.push(match deitada {
+                true => Rect {
+                    x: grosso_de,
+                    y: fino_de + de,
+                    width: grossura,
+                    height: ate.saturating_sub(de),
+                },
+                false => Rect {
+                    x: fino_de + de,
+                    y: grosso_de,
+                    width: ate.saturating_sub(de),
+                    height: grossura,
+                },
+            });
+        }
+
+        match deitada {
+            true => {
+                x += espessura;
+                w -= espessura;
+            }
+            false => {
+                y += espessura;
+                h -= espessura;
+            }
+        }
+        i = fim;
+    }
+    saida
+}
+
+/// A pior razão de aspecto de uma fileira — o critério que decide quando fechá-la.
+fn razao(maior: f64, menor: f64, soma: f64, lado: f64) -> f64 {
+    if soma <= 0.0 || menor <= 0.0 {
+        return f64::INFINITY;
+    }
+    let s2 = soma * soma;
+    let l2 = lado * lado;
+    (l2 * maior / s2).max(s2 / (l2 * menor))
+}
+
 fn render_pane_grid(
     frame: &mut Frame,
     area: Rect,
@@ -4179,77 +4299,103 @@ fn render_pane_grid(
     }
     let dentro = bloco.inner(area);
     frame.render_widget(bloco, area);
-    if cells.is_empty() || dentro.width < 10 || dentro.height < 3 {
+    if cells.is_empty() || dentro.width < MIN_L || dentro.height < MIN_A {
         return;
     }
 
-    // Quatro linhas por célula: a moldura come duas, e sobram as duas que interessam —
-    // o nome e a variação. Com três, o valor ficava fora da moldura e a grade virava uma
-    // fileira de caixas com um nome só dentro.
-    const ALTURA: u16 = 4;
-    let por_linha = ((dentro.width / 14).max(1) as usize).min(cells.len());
-    let mut y = dentro.y;
-    for (faixa, grupo) in cells.chunks(por_linha).enumerate() {
-        if y + ALTURA > dentro.y + dentro.height {
-            break;
+    // As peças saem em ordem decrescente de peso — é o que o treemap espera, e é o que
+    // torna «tirar a menor» a coisa certa a fazer quando ela não cabe.
+    let mut ordem: Vec<usize> = (0..cells.len()).collect();
+    ordem.sort_by(|a, b| cells[*b].weight.total_cmp(&cells[*a].weight));
+    ordem.retain(|i| cells[*i].weight > 0.0);
+
+    // As menores saem até todas as que ficam serem legíveis, e **não** ganham um piso de
+    // tamanho. Um piso é o que fazia a grade antiga mentir: dava a uma posição de 0,5% a
+    // caixa de uma de 3%. Melhor uma caixa a menos do que uma caixa do tamanho errado.
+    let (pecas, ordem) = loop {
+        if ordem.is_empty() {
+            return;
         }
-        let peso_total: f64 = grupo.iter().map(|c| c.weight.max(0.05)).sum();
-        let mut x = dentro.x;
-        for (i, celula) in grupo.iter().enumerate() {
-            let fatia = ((celula.weight.max(0.05) / peso_total) * dentro.width as f64) as u16;
-            let largura = fatia.max(8).min(dentro.x + dentro.width - x);
-            if largura < 6 {
-                break;
-            }
-            let indice = faixa * por_linha + i;
-            let cor = tone_color(celula.tone);
-            // A cor de dentro é o dado — verde sobe, vermelho desce — e mantê-la é o
-            // ponto do mapa. A marca vai na **moldura** da célula: a variação continua
-            // legível e o papel que se segue é achado de longe.
-            let moldura_cor = match pintor.rotulo(&[&celula.label, &celula.sub]) {
-                Some(marca) => mark_color(marca),
-                None => cor,
-            };
-            let mut estilo = Style::default().fg(cor);
-            if selected == Some(indice) {
-                estilo = estilo.add_modifier(Modifier::REVERSED);
-            }
-            let area_celula = Rect {
-                x,
-                y,
-                width: largura,
-                height: ALTURA.min(dentro.y + dentro.height - y),
-            };
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::styled(centrar(&celula.label, largura as usize), estilo),
-                    Line::styled(centrar(&celula.sub, largura as usize), estilo),
-                ])
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(moldura_cor)),
-                ),
-                area_celula,
-            );
-            x += largura;
-            if x >= dentro.x + dentro.width {
-                break;
-            }
+        let pesos: Vec<f64> = ordem.iter().map(|i| cells[*i].weight).collect();
+        let pecas = treemap(dentro, &pesos);
+        if pecas.iter().all(|p| p.width >= MIN_L && p.height >= MIN_A) {
+            break (pecas, ordem);
         }
-        y += ALTURA;
+        ordem.pop();
+    };
+
+    for (peca, indice) in pecas.iter().zip(ordem) {
+        let celula = &cells[indice];
+        let cor = tone_color(celula.tone);
+        // A cor de dentro é o dado — verde sobe, vermelho desce — e mantê-la é o
+        // ponto do mapa. A marca vai na **moldura** da célula: a variação continua
+        // legível e o papel que se segue é achado de longe.
+        let moldura_cor = match pintor.rotulo(&[&celula.label, &celula.sub]) {
+            Some(marca) => mark_color(marca),
+            None => cor,
+        };
+        let estilo = Style::default().fg(cor);
+        let largura = peca.width as usize;
+        // Quanto cabe dentro da moldura da célula. O nome sempre; a variação a partir de
+        // duas linhas; a grandeza que decidiu o tamanho a partir de três — as caixas
+        // grandes têm lugar, e é nelas que a pergunta «quanto é isso?» aparece.
+        let dentro_a = peca.height.saturating_sub(2);
+        // Só cortado, sem preencher: quem centra é o `Paragraph`, e um texto já
+        // preenchido com espaços seria centrado duas vezes e sairia torto.
+        let cortar = |t: &str| -> String { t.chars().take(largura.saturating_sub(2)).collect() };
+        let mut linhas = vec![Line::styled(
+            cortar(&celula.label),
+            estilo.add_modifier(Modifier::BOLD),
+        )];
+        if dentro_a >= 2 {
+            linhas.push(Line::styled(cortar(&celula.sub), estilo));
+        }
+        // A grandeza **some** quando não cabe inteira, em vez de aparecer cortada: um
+        // número cortado não é um número aproximado, é outro número.
+        if dentro_a >= 3
+            && !celula.detalhe.is_empty()
+            && celula.detalhe.chars().count() <= largura.saturating_sub(2)
+        {
+            linhas.push(Line::styled(
+                celula.detalhe.clone(),
+                Style::default().fg(palette::DIM),
+            ));
+        }
+        // Centrado na vertical: numa caixa de vinte linhas, três linhas de texto
+        // encostadas no topo deixam a caixa parecendo vazia e o rótulo longe do que ele
+        // nomeia.
+        let sobra = (peca.height as usize).saturating_sub(2 + linhas.len());
+        for _ in 0..sobra / 2 {
+            linhas.insert(0, Line::raw(""));
+        }
+        // O cursor é a **moldura**, grossa: inverter o fundo de uma caixa que ocupa meia
+        // tela pinta meia tela, e o que era para ser um cursor vira um bloco de cor que
+        // parece defeito. Uma borda grossa marca a caixa sem apagar o que há dentro.
+        let escolhida = selected == Some(indice);
+        let mut bloco = Block::default()
+            .borders(Borders::ALL)
+            .border_style(match escolhida {
+                true => Style::default()
+                    .fg(moldura_cor)
+                    .add_modifier(Modifier::BOLD),
+                false => Style::default().fg(moldura_cor),
+            });
+        if escolhida {
+            bloco = bloco.border_type(BorderType::Thick);
+        }
+        frame.render_widget(
+            Paragraph::new(linhas)
+                .alignment(Alignment::Center)
+                .block(bloco),
+            *peca,
+        );
     }
 }
 
-fn centrar(texto: &str, largura: usize) -> String {
-    let n = texto.chars().count();
-    let util = largura.saturating_sub(2);
-    if n >= util {
-        return texto.chars().take(util).collect();
-    }
-    let esquerda = (util - n) / 2;
-    format!("{}{texto}", " ".repeat(esquerda))
-}
+/// O menor retângulo em que uma célula ainda diz alguma coisa: a moldura come duas
+/// colunas e duas linhas, e o que sobra tem que caber um ticker.
+const MIN_L: u16 = 8;
+const MIN_A: u16 = 3;
 
 fn render_pane_form(
     frame: &mut Frame,
@@ -4330,6 +4476,102 @@ mod invest_tests {
             y: 0,
             width,
             height,
+        }
+    }
+
+    /// O contrato do treemap: as peças **cobrem** o retângulo, não se sobrepõem, e a
+    /// área de cada uma segue o peso dela. Conferido célula a célula, que é a única
+    /// forma de pegar um erro de arredondamento de um caractere.
+    #[test]
+    fn o_treemap_cobre_a_area_sem_buraco_nem_sobreposicao() {
+        use super::treemap;
+        let casos: [&[f64]; 5] = [
+            &[1.0],
+            &[3.0, 1.0],
+            &[40.0, 20.0, 15.0, 10.0, 6.0, 5.0, 3.0, 1.0],
+            &[1.0; 12],
+            &[100.0, 1.0, 1.0, 1.0],
+        ];
+        for pesos in casos {
+            for (largura, altura) in [(80u16, 20u16), (200, 40), (37, 11), (120, 30)] {
+                let area = Rect {
+                    x: 3,
+                    y: 5,
+                    width: largura,
+                    height: altura,
+                };
+                let pecas = treemap(area, pesos);
+                assert_eq!(pecas.len(), pesos.len(), "{pesos:?} em {largura}x{altura}");
+
+                let mut mapa = vec![0u8; (largura as usize) * (altura as usize)];
+                for p in &pecas {
+                    assert!(
+                        p.x >= area.x
+                            && p.y >= area.y
+                            && p.x + p.width <= area.x + area.width
+                            && p.y + p.height <= area.y + area.height,
+                        "{p:?} saiu de {area:?}"
+                    );
+                    for cy in p.y..p.y + p.height {
+                        for cx in p.x..p.x + p.width {
+                            let i =
+                                (cy - area.y) as usize * largura as usize + (cx - area.x) as usize;
+                            mapa[i] += 1;
+                        }
+                    }
+                }
+                assert!(
+                    mapa.iter().all(|n| *n == 1),
+                    "{pesos:?} em {largura}x{altura}: {} células fora de conta",
+                    mapa.iter().filter(|n| **n != 1).count()
+                );
+            }
+        }
+    }
+
+    /// O que a grade antiga errava: uma posição de 0,5% aparecia do tamanho de uma de
+    /// 3%. Aqui a área tem que seguir o peso, com folga só para o arredondamento.
+    #[test]
+    fn a_area_de_cada_peca_segue_o_peso_dela() {
+        use super::treemap;
+        let pesos = [40.0, 20.0, 15.0, 10.0, 6.0, 5.0, 3.0, 1.0];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 40,
+        };
+        let total_peso: f64 = pesos.iter().sum();
+        let total_area = (area.width as f64) * (area.height as f64);
+        for (peso, peca) in pesos.iter().zip(treemap(area, &pesos)) {
+            let esperada = peso / total_peso * total_area;
+            let obtida = (peca.width as f64) * (peca.height as f64);
+            let erro = (obtida - esperada).abs() / esperada;
+            assert!(
+                erro < 0.15,
+                "peso {peso}: esperava ~{esperada:.0} células, deu {obtida:.0}"
+            );
+        }
+    }
+
+    /// E o maior é o maior. Sem isto, um treemap «certo na soma» ainda pode inverter a
+    /// leitura que o mapa existe para dar.
+    #[test]
+    fn a_ordem_dos_tamanhos_e_a_ordem_dos_pesos() {
+        use super::treemap;
+        let pesos = [40.0, 20.0, 15.0, 10.0, 6.0, 5.0, 3.0, 1.0];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 36,
+        };
+        let areas: Vec<u32> = treemap(area, &pesos)
+            .iter()
+            .map(|p| p.width as u32 * p.height as u32)
+            .collect();
+        for par in areas.windows(2) {
+            assert!(par[0] >= par[1], "{areas:?} não está em ordem decrescente");
         }
     }
 

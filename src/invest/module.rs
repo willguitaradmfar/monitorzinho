@@ -277,7 +277,12 @@ pub struct Bar {
 pub struct Cell {
     pub label: String,
     pub sub: String,
-    /// Quanto espaço ela pede, relativo às outras. `1.0` é a fatia média.
+    /// Uma terceira linha, mostrada **só quando a célula é alta o bastante**. É onde vai
+    /// a grandeza que decidiu o tamanho — num treemap o tamanho é metade da informação, e
+    /// as caixas grandes têm lugar de sobra para dizer quanto valem.
+    pub detalhe: String,
+    /// A **área** que ela pede, relativa às outras. Não é largura: o desenho reparte o
+    /// retângulo por área, e um peso duas vezes maior ocupa duas vezes mais tela.
     pub weight: f64,
     pub tone: Tone,
 }

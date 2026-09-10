@@ -31,6 +31,29 @@ pub fn moeda(valor: f64) -> String {
 
 /// Preço, que precisa de mais casas que dinheiro: um câmbio de 5,4210 e uma cripto de
 /// 0,00004120 perdem o que interessa com duas casas.
+/// Um valor em reais **curto o bastante para caber numa caixa**: `1,2 mi`, `747,9 mil`,
+/// `930`.
+///
+/// Existe por causa de um perigo concreto no heatmap: cortar `R$ 30.291,00` na largura da
+/// caixa dava `R$ 30.29`, que não é um número truncado — é **outro número**, e se lê como
+/// trinta reais e vinte e nove centavos. Uma grandeza abreviada diz menos; uma grandeza
+/// cortada mente.
+pub fn moeda_curta(valor: f64) -> String {
+    if !valor.is_finite() {
+        return "—".to_string();
+    }
+    let (sinal, v) = match valor < 0.0 {
+        true => ("-", -valor),
+        false => ("", valor),
+    };
+    match v {
+        v if v >= 1e9 => format!("{sinal}{} bi", virgula(v / 1e9, 1)),
+        v if v >= 1e6 => format!("{sinal}{} mi", virgula(v / 1e6, 1)),
+        v if v >= 1e3 => format!("{sinal}{} mil", virgula(v / 1e3, 1)),
+        v => format!("{sinal}{}", virgula(v, 0)),
+    }
+}
+
 pub fn preco(valor: f64) -> String {
     if !valor.is_finite() {
         return "—".to_string();
@@ -417,6 +440,38 @@ pub fn macd(
             Some((linha[i], sig, linha[i] - sig))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests_moeda_curta {
+    use super::moeda_curta;
+
+    /// O perigo que ela existe para evitar: `R$ 30.291,00` cortado na largura da caixa
+    /// virava `R$ 30.29`, que se lê como trinta reais. Abreviar diz menos; cortar mente.
+    #[test]
+    fn cabe_em_dez_caracteres_em_qualquer_ordem_de_grandeza() {
+        for v in [0.0, 9.5, 930.0, 30_291.0, 747_860.78, 1_983_599.89, 4.2e9] {
+            let texto = moeda_curta(v);
+            assert!(
+                texto.chars().count() <= 10,
+                "{v} deu «{texto}», que não cabe"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ordem_de_grandeza_vai_junto() {
+        assert_eq!(moeda_curta(930.0), "930");
+        assert_eq!(moeda_curta(30_291.0), "30,3 mil");
+        assert_eq!(moeda_curta(747_860.78), "747,9 mil");
+        assert_eq!(moeda_curta(1_983_599.89), "2,0 mi");
+    }
+
+    #[test]
+    fn o_sinal_sobrevive() {
+        assert_eq!(moeda_curta(-30_291.0), "-30,3 mil");
+        assert_eq!(moeda_curta(-0.0), "0");
+    }
 }
 
 #[cfg(test)]
