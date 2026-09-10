@@ -751,7 +751,14 @@ impl ProviderSet {
                 };
                 // A hora em que **esta** resposta foi aceita. Marcada aqui e não no
                 // provedor porque só aqui se sabe que ela venceu a disputa de origem.
-                s.recebido.insert(q.ativo.clone(), agora);
+                //
+                // **Preço informado não conta como leitura.** O provedor local responde
+                // a cada duas voltas sem falar com ninguém, e a coluna dizia «há 17 s»
+                // sobre um número que alguém digitou semana passada — a mesma mentira
+                // que `conta_como_busca` desfez no selo do painel.
+                if q.grade != Grade::Manual {
+                    s.recebido.insert(q.ativo.clone(), agora);
+                }
                 s.quotes.insert(q.ativo.clone(), q);
             }
             // Uma fonte que não falou nesta volta mantém o que disse na anterior: sumir

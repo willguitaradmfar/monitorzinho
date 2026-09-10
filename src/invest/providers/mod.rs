@@ -7,6 +7,7 @@ pub mod cambio;
 pub mod fred;
 pub mod kinvo;
 pub mod manual;
+pub mod tesouro;
 pub mod yahoo;
 
 use std::collections::HashMap;
@@ -37,6 +38,7 @@ pub fn todos(manuais: Arc<Mutex<HashMap<AssetId, (f64, u64)>>>) -> Vec<Box<dyn P
         Box::new(cambio::Cambio),
         Box::new(bcb::Bcb),
         Box::new(fred::Fred),
+        Box::new(tesouro::Tesouro),
         Box::new(manual::Manual::new(manuais)),
     ]
 }

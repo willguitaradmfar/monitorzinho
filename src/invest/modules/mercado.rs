@@ -152,13 +152,13 @@ pub fn linha(
         // Do cache **com a idade**: o valor veio do disco e ainda não foi rebuscado
         // nesta execução, e o que se quer saber é se aquele disco é de uma hora ou de
         // uma semana.
-        match (
-            ctx.market.idade_da_leitura(ativo, agora),
-            q.fonte == "cache",
-        ) {
-            (Some(s), true) => format!("do cache · {}", tempo::idade(s)),
-            (Some(s), false) => tempo::idade(s),
-            (None, _) => "do cache".into(),
+        match (ctx.market.idade_da_leitura(ativo, agora), q.fonte, q.grade) {
+            // Informado nunca foi lido de lugar nenhum, e a coluna fica calada em vez de
+            // inventar uma leitura. A idade do número está colada no preço.
+            (_, _, Grade::Manual) => String::new(),
+            (Some(s), "cache", _) => format!("do cache · {}", tempo::idade(s)),
+            (Some(s), _, _) => tempo::idade(s),
+            (None, _, _) => "do cache".into(),
         },
     ])
     .with_cell_tones(vec![
