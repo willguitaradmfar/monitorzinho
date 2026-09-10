@@ -13,8 +13,8 @@ use crate::invest::carteira::{self, Linha};
 use crate::invest::model::AssetId;
 use crate::invest::model::Classe;
 use crate::invest::module::{
-    Bar, Ctx, Edit, Escape, Field, Group, InvestModule, Layout, ModuleView, Need, Outcome, Pane,
-    Tone,
+    Bar, Ctx, Edit, Escape, Field, Group, InvestModule, Layout, Marcavel, ModuleView, Need,
+    Outcome, Pane, Tone,
 };
 use crate::invest::modules::comum::{Formulario, Lista, hint};
 
@@ -93,6 +93,11 @@ impl InvestModule for Alocacao {
     }
     fn group(&self) -> Group {
         Group::Carteira
+    }
+
+    /// Divide a lista de marcas dos ativos: as barras são classes, e classe é um dos tipos de marca da lista de ativos.
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn needs(&self) -> &'static [Need] {
         // Consolida em BRL: sem câmbio, um ativo estrangeiro fica fora da distribuição.
@@ -281,7 +286,7 @@ impl ModuleView for Vista {
             }
             None if self.dimensao.tem_alvo() => fatos.push((
                 "sem alvo".into(),
-                "Ctrl+E define quanto você quer em cada classe".into(),
+                "Ctrl+A define quanto você quer em cada classe".into(),
                 Tone::Dim,
             )),
             None => fatos.push((
@@ -353,7 +358,9 @@ impl ModuleView for Vista {
                 self.lista.selecionado = 0;
                 Outcome::Ok
             }
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // `Ctrl+A` de alvos — o `Ctrl+E` que era virou a tecla de marcar, em toda
+            // tela do programa.
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.form = Some(Formulario::novo(
                     "Alvos de alocação (%)",
                     Classe::ALL
@@ -392,7 +399,7 @@ impl ModuleView for Vista {
     }
 
     fn hint(&self) -> String {
-        hint(&["←/→ dimensão", "Ctrl+E alvos", "r rebalancear", "Esc sair"])
+        hint(&["←/→ dimensão", "Ctrl+A alvos", "r rebalancear", "Esc sair"])
     }
 }
 

@@ -36,6 +36,7 @@ pub mod feed;
 pub mod fundamento;
 pub mod gzip;
 pub mod historico;
+pub mod marcas;
 pub mod model;
 pub mod module;
 pub mod modules;
@@ -165,6 +166,19 @@ impl InvestState {
         self.modulos
             .iter()
             .find(|m| m.id() == id)
+            .map(|m| m.as_ref())
+    }
+
+    /// O módulo dono de uma tabela marcável, pelo id com que as marcas dela são gravadas.
+    ///
+    /// É o caminho de volta que a lista de marcas precisa: ela guarda o id da tabela, e
+    /// quem lê a lista quer o nome do módulo. Procurar pelo id da *tabela* e não pelo do
+    /// módulo é o que deixa os dois livres para diferir — e eles diferem, porque um id de
+    /// tabela vive no mesmo espaço de nomes dos das abas de sistema.
+    pub fn modulo_da_tabela(&self, tabela: &str) -> Option<&dyn InvestModule> {
+        self.modulos
+            .iter()
+            .find(|m| m.marcavel().is_some_and(|alvo| alvo.tabela == tabela))
             .map(|m| m.as_ref())
     }
 

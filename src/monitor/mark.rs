@@ -26,6 +26,7 @@ use crate::db;
 /// compared as a number against every number in the cell — so `443` matches the port
 /// column and not the `4433` beside it — while everything else is a substring, or a
 /// regular expression when the value looks like one.
+#[derive(Clone)]
 pub struct MarkKind {
     pub name: &'static str,
     pub column: usize,

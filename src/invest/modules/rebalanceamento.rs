@@ -12,7 +12,7 @@ use crate::invest::carteira;
 use crate::invest::model::AssetId;
 use crate::invest::model::Classe;
 use crate::invest::module::{
-    Ctx, Escape, Group, InvestModule, Layout, ModuleView, Need, Outcome, Pane, Row, Tone,
+    Ctx, Escape, Group, InvestModule, Layout, Marcavel, ModuleView, Need, Outcome, Pane, Row, Tone,
 };
 use crate::invest::modules::alocacao::{self, Dimensao};
 use crate::invest::modules::comum::hint;
@@ -40,6 +40,11 @@ impl InvestModule for Rebalanceamento {
     }
     fn group(&self) -> Group {
         Group::Carteira
+    }
+
+    /// Divide a lista de marcas dos ativos: o que aportar e resgatar por classe.
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn needs(&self) -> &'static [Need] {
         &[Need::Posicoes]
@@ -186,7 +191,7 @@ impl ModuleView for Vista {
             return Layout::one(Pane::Empty {
                 title: "Rebalanceamento".into(),
                 note: "Sem alvos não há para onde voltar.\n\n\
-                       Defina em Alocação (Ctrl+E) quanto você quer em cada classe."
+                       Defina em Alocação (Ctrl+A) quanto você quer em cada classe."
                     .into(),
             });
         }

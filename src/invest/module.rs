@@ -416,6 +416,61 @@ impl Layout {
     pub fn cols(partes: Vec<(u16, Layout)>) -> Layout {
         Layout::Cols(partes)
     }
+
+    /// A primeira `Pane::Table` do arranjo, na ordem em que ela é desenhada.
+    ///
+    /// É a tabela que as marcas pintam e sobre a qual o `Ctrl+E` age. «A primeira» e não
+    /// «a que tem o cursor» porque um módulo com duas listas tem uma que é o assunto e
+    /// outra que é apoio — e a de cima é sempre a primeira. Um módulo com o formulário
+    /// aberto devolve `None` daqui sozinho: o formulário **substitui** o arranjo, então
+    /// não há tabela, não há linha, e o `Ctrl+E` não tem o que marcar.
+    pub fn primeira_tabela(&self) -> Option<&Pane> {
+        match self {
+            Layout::Leaf(pane) => matches!(**pane, Pane::Table { .. }).then_some(&**pane),
+            Layout::Rows(partes) | Layout::Cols(partes) => {
+                partes.iter().find_map(|(_, filho)| filho.primeira_tabela())
+            }
+        }
+    }
+}
+
+/// Que marcas uma tela aceita: o nome com que elas são gravadas, e sobre o que podem ser.
+///
+/// É o mesmo par que uma `TableMonitor` devolve em `id()` e `mark_kinds()`, e de propósito:
+/// uma marca posta numa lista da Invest é gravada, listada e apagada pelo mesmíssimo
+/// caminho de uma posta na lista de processos. O `Ctrl+E` não tem duas implementações.
+#[derive(Clone, Copy)]
+pub struct Marcavel {
+    /// Identificador estável, no mesmo espaço de nomes de `TableMonitor::id` — uma marca
+    /// gravada com ele sobrevive a renomear o módulo.
+    ///
+    /// **Duas telas podem dividir o mesmo id, e dez dividem.** Um papel é um papel:
+    /// segui-lo em Posições e não o ver seguido em Cotações, na carteira recomendada e
+    /// nos Proventos dele seria a marca valendo só no lugar onde foi feita — que é o
+    /// oposto do que se pede a ela. Ver `marcas::ATIVOS`.
+    pub tabela: &'static str,
+    /// Como a lista de marcas chama esta tabela. Não é o nome do módulo porque as telas
+    /// que dividem um id dividem também o nome — a mesma marca não pode se apresentar de
+    /// um jeito conforme a tela em que nasceu.
+    pub nome: &'static str,
+    pub tipos: &'static [TipoDeMarca],
+}
+
+/// Uma coisa que uma marca da Invest pode ser sobre, e **em que coluna** ela está.
+///
+/// A coluna é dita pelo cabeçalho e não pelo número, que é a única diferença real para o
+/// `MarkKind` das tabelas do sistema — e a diferença existe porque a mesma lista aparece
+/// em mais de uma forma. «Ativo» é a coluna 1 na tela de Proventos, a 0 na aba «por
+/// ativo» do mesmo módulo, e a 1 outra vez no cartão da home. Um número seria a coluna
+/// certa numa das três e a errada nas outras duas — e uma marca que casa em algumas telas
+/// e não em outras é pior do que uma marca que não existe.
+pub struct TipoDeMarca {
+    pub nome: &'static str,
+    /// O texto do cabeçalho da coluna que carrega o assunto. Onde a tabela não tem essa
+    /// coluna, o tipo simplesmente não vale nela.
+    pub coluna: &'static str,
+    pub numerico: bool,
+    pub ajuda: &'static str,
 }
 
 /// Um módulo da aba Invest.
@@ -433,6 +488,17 @@ pub trait InvestModule: Send + Sync {
 
     fn needs(&self) -> &'static [Need] {
         &[]
+    }
+
+    /// Que marcas a lista deste módulo aceita — `None` quando não é uma lista de coisas
+    /// que se acompanha.
+    ///
+    /// Vale para os dois lugares em que o módulo aparece: o cartão da home e a tela
+    /// aberta. É de propósito que seja **uma** declaração para os dois — marcar um papel
+    /// dentro de Posições e não vê-lo marcado no cartão de Posições seria a marca dizendo
+    /// duas coisas diferentes sobre a mesma linha.
+    fn marcavel(&self) -> Option<Marcavel> {
+        None
     }
 
     /// A coluna de resumo da linha na lista.

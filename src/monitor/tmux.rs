@@ -565,6 +565,37 @@ fn pane_detail(pane: &crate::tmux::Pane) -> Detail {
 
 const WINDOW_HEADERS: [&str; 6] = ["Sessão", "Janela", "Painéis", "Ativa", "Rodando", "Pasta"];
 
+/// O que se pode seguir na lista plana de janelas. As mesmas três coisas que a tabela
+/// de sessões oferece nas colunas dela — uma janela é de uma sessão, roda um comando e
+/// está numa pasta — mais o nome da própria janela, que é a única aqui que não tem
+/// equivalente lá.
+const WINDOW_MARKS: [MarkKind; 4] = [
+    MarkKind {
+        name: "sessão",
+        column: 0,
+        numeric: false,
+        help: "Segue todas as janelas de uma sessão pelo nome dela.",
+    },
+    MarkKind {
+        name: "janela",
+        column: 1,
+        numeric: false,
+        help: "Segue uma janela pelo nome — «logs» pega a janela chamada logs em qualquer sessão.",
+    },
+    MarkKind {
+        name: "comando",
+        column: 4,
+        numeric: false,
+        help: "Segue pelo que está rodando no painel ativo — «vim», «cargo».",
+    },
+    MarkKind {
+        name: "pasta",
+        column: 5,
+        numeric: false,
+        help: "Segue tudo que foi aberto sob um caminho — «/home/eu/git» pega o que está lá dentro.",
+    },
+];
+
 /// Todas as janelas de todas as sessões, planas.
 ///
 /// A árvore da tabela de cima responde «o que tem dentro desta sessão». Esta responde a
@@ -596,6 +627,10 @@ impl TableMonitor for WindowsMonitor {
 
     fn headers(&self) -> &'static [&'static str] {
         &WINDOW_HEADERS
+    }
+
+    fn mark_kinds(&self) -> &'static [MarkKind] {
+        &WINDOW_MARKS
     }
 
     fn sample(&mut self, state: &SystemState, limit: Option<usize>) -> Vec<TableRow> {

@@ -11,7 +11,7 @@ use crate::invest::calc;
 use crate::invest::fundamento::Estado;
 use crate::invest::model::AssetId;
 use crate::invest::module::{
-    Ctx, Escape, Group, InvestModule, Layout, ModuleView, Outcome, Pane, Row, Tone,
+    Ctx, Escape, Group, InvestModule, Layout, Marcavel, ModuleView, Outcome, Pane, Row, Tone,
 };
 use crate::invest::modules::comum::{Lista, hint};
 
@@ -32,6 +32,10 @@ impl InvestModule for Fundamentos {
     }
     fn group(&self) -> Group {
         Group::Analise
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn keywords(&self) -> &'static str {
         "p/l lpa roe dy balanço dre lucro dívida margem ebitda setor indústria"

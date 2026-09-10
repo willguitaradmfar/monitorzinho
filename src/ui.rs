@@ -19,6 +19,7 @@ use crate::app::{
 };
 use crate::format;
 use crate::history::History;
+use crate::invest::marcas::Pintor;
 use crate::monitor::mark::MarkColor;
 use crate::monitor::{Detail, Monitor, TableRow};
 use crate::tools::rewrite::{self, Rule};
@@ -427,9 +428,7 @@ fn mark_color(color: MarkColor) -> Color {
 /// The box that writes one mark: what kind of thing to follow, the value, what colour it
 /// wears, and — on a tree — whether the children come along.
 fn render_mark_editor(frame: &mut Frame, area: Rect, app: &App, editor: &MarkEditor) {
-    let monitor = app.table_monitors[editor.table_index].as_ref();
-    let kinds = monitor.mark_kinds();
-    let Some(kind) = kinds.get(editor.kind) else {
+    let Some(kind) = editor.kinds.get(editor.kind) else {
         return;
     };
 
@@ -481,10 +480,11 @@ fn render_mark_editor(frame: &mut Frame, area: Rect, app: &App, editor: &MarkEdi
 
     let height = (lines.len() as u16).saturating_add(4).min(area.height);
     let box_area = centered(area, width, height);
+    let onde = table_name(app, &editor.table);
     let title = if editor.editing.is_some() {
-        format!(" Editar marca em {} ", monitor.title())
+        format!(" Editar marca em {onde} ")
     } else {
-        format!(" Marcar em {} ", monitor.title())
+        format!(" Marcar em {onde} ")
     };
     let action = if editor.editing.is_some() {
         "Enter salvar"
@@ -648,7 +648,7 @@ fn render_marks_screen(frame: &mut Frame, area: Rect, app: &App, screen: &MarksS
     let mut lines = vec![Line::raw("")];
     if marks.is_empty() {
         lines.push(Line::styled(
-            "   Nenhuma marca ainda. Ctrl+E numa linha de uma tabela cria a primeira.",
+            "   Nenhuma marca ainda. Ctrl+E numa linha de qualquer lista cria a primeira.",
             Style::default().fg(palette::DIM),
         ));
     }
@@ -732,10 +732,7 @@ fn render_marks_screen(frame: &mut Frame, area: Rect, app: &App, screen: &MarksS
 /// table this build no longer has. Showing the id rather than hiding the row: a mark
 /// that can't be explained is still a mark that Del can reach.
 fn table_name(app: &App, id: &str) -> String {
-    match app.table_index_of(id) {
-        Some(index) => app.table_monitors[index].title().to_string(),
-        None => id.to_string(),
-    }
+    app.mark_table_name(id).unwrap_or_else(|| id.to_string())
 }
 
 /// Slim header showing the two tabs (the active one highlighted), plus the app
@@ -800,8 +797,13 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
         // has its own footer, and offering "1-9 ampliar" over a list that can't be
         // fullscreened is the sort of hint that sends someone hunting for a bug.
         let keys = match app.tab {
-            Tab::Tools => "Tab/Shift+Tab alternar aba · Ctrl+C 2x sair",
-            Tab::Invest => "tecla do cartão entra · Enter todos · Tab alternar aba · Ctrl+C 2x sair",
+            // `Ctrl+G` anunciado nestas duas e não nas outras porque nas outras já está
+            // no rodapé de cada tabela. Aqui não há tabela com rodapé — a de Ferramentas
+            // não é uma lista, e a da Invest é uma grade de cartões.
+            Tab::Tools => "Ctrl+G marcas · Tab/Shift+Tab alternar aba · Ctrl+C 2x sair",
+            Tab::Invest => {
+                "tecla do cartão entra · Enter todos · Ctrl+G marcas · Tab alternar aba · Ctrl+C 2x sair"
+            }
             // A tecla que cria uma sessão só é anunciada onde ela faz alguma coisa: um
             // rodapé que promete um atalho inexistente manda procurar um bug.
             Tab::Tmux => {
@@ -3103,7 +3105,7 @@ fn render_invest_tab(frame: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     let cartoes = app.invest_home();
-    render_invest_grade(frame, linhas[0], &cartoes);
+    render_invest_grade(frame, linhas[0], &cartoes, &app.marks);
 
     // O rodapé diz as duas teclas que a grade não consegue mostrar sozinha, e cede o
     // lugar para um problema de gravação quando há um — um erro ao salvar a carteira
@@ -3195,7 +3197,12 @@ fn grade_de(area: Rect, desejadas: &[u16]) -> (usize, Vec<u16>) {
     (colunas, alturas)
 }
 
-fn render_invest_grade(frame: &mut Frame, area: Rect, cartoes: &[crate::app::Cartao]) {
+fn render_invest_grade(
+    frame: &mut Frame,
+    area: Rect,
+    cartoes: &[crate::app::Cartao],
+    marks: &crate::monitor::mark::Marks,
+) {
     let desejadas: Vec<u16> = cartoes
         .iter()
         .map(|c| altura_desejada(c.destaque))
@@ -3219,14 +3226,7 @@ fn render_invest_grade(frame: &mut Frame, area: Rect, cartoes: &[crate::app::Car
             let Some(cartao) = cartoes.get(indice) else {
                 return;
             };
-            render_cartao(
-                frame,
-                *celula,
-                &cartao.nome,
-                &cartao.resumo,
-                cartao.pane.as_ref(),
-                indice,
-            );
+            render_cartao(frame, *celula, cartao, indice, marks);
         }
     }
 }
@@ -3235,13 +3235,17 @@ fn render_invest_grade(frame: &mut Frame, area: Rect, cartoes: &[crate::app::Car
 fn render_cartao(
     frame: &mut Frame,
     area: Rect,
-    nome: &str,
-    resumo: &str,
-    pane: Option<&crate::invest::module::Pane>,
+    cartao: &crate::app::Cartao,
     indice: usize,
+    marks: &crate::monitor::mark::Marks,
 ) {
-    match pane {
-        Some(pane) => render_pane(frame, area, pane),
+    let (nome, resumo) = (&cartao.nome, &cartao.resumo);
+    // O cartão pinta com a declaração do próprio módulo: seguir um papel em Posições
+    // acende o cartão de Posições, o de Cotações e o da carteira recomendada em que ele
+    // está, porque os três dividem a mesma lista de marcas.
+    let pintor = Pintor::novo(marks, cartao.marcavel);
+    match cartao.pane.as_ref() {
+        Some(pane) => render_pane(frame, area, pane, &pintor),
         // Sem painel o cartão ainda existe, com o resumo: o módulo continua alcançável
         // pela tecla, e a home não ganha um buraco onde havia um nome.
         None => {
@@ -3250,7 +3254,7 @@ fn render_cartao(
             frame.render_widget(bloco, area);
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    resumo.to_string(),
+                    resumo.clone(),
                     Style::default().fg(palette::DIM),
                 ))
                 .wrap(Wrap { trim: true }),
@@ -3302,15 +3306,20 @@ fn render_module(frame: &mut Frame, area: Rect, app: &App, mf: &crate::app::Modu
     let Some(invest) = &app.invest else { return };
     let ctx = invest.ctx();
     let layout = mf.view.layout(&ctx);
+    // As marcas entram na hora de desenhar, e nunca antes: um módulo não sabe que elas
+    // existem. É a mesma divisão das tabelas do sistema, onde quem amostra devolve linhas
+    // cruas e quem sabe das marcas as pinta.
+    let alvo = invest.modulo(&mf.module).and_then(|m| m.marcavel());
+    let pintor = Pintor::novo(&app.marks, alvo);
 
     let partes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    fn desenhar(frame: &mut Frame, area: Rect, no: &ML) {
+    fn desenhar(frame: &mut Frame, area: Rect, no: &ML, pintor: &Pintor) {
         match no {
-            ML::Leaf(pane) => render_pane(frame, area, pane),
+            ML::Leaf(pane) => render_pane(frame, area, pane, pintor),
             ML::Rows(partes) | ML::Cols(partes) => {
                 let vertical = matches!(no, ML::Rows(_));
                 let pesos: Vec<Constraint> = partes
@@ -3325,16 +3334,25 @@ fn render_module(frame: &mut Frame, area: Rect, app: &App, mf: &crate::app::Modu
                     .constraints(pesos)
                     .split(area);
                 for ((_, filho), &area) in partes.iter().zip(areas.iter()) {
-                    desenhar(frame, area, filho);
+                    desenhar(frame, area, filho, pintor);
                 }
             }
         }
     }
-    desenhar(frame, partes[0], &layout);
+    desenhar(frame, partes[0], &layout, &pintor);
 
+    // O `Ctrl+E` não é do módulo, é do programa — então quem o anuncia é quem sabe se a
+    // tela aceita marca, e não cada `hint()` repetindo a mesma frase vinte vezes.
+    // Anunciado só onde há tabela: um módulo pode mostrar marcas sem ter linha para
+    // marcar — o mapa de calor pinta a moldura da célula seguida, e o `Ctrl+E` ali não
+    // teria o que fazer. Prometer a tecla onde ela não faz nada manda procurar um bug.
+    let mut dica = mf.view.hint();
+    if alvo.is_some() && layout.primeira_tabela().is_some() {
+        dica = format!("{dica} · Ctrl+E marcar ★");
+    }
     frame.render_widget(
         Paragraph::new(Line::styled(
-            format!(" {}", mf.view.hint()),
+            format!(" {dica}"),
             Style::default().fg(palette::DIM),
         )),
         partes[1],
@@ -3365,7 +3383,7 @@ fn moldura(titulo: &str) -> Block<'static> {
         ))
 }
 
-fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane) {
+fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane, pintor: &Pintor) {
     use crate::invest::module::Pane;
     match pane {
         Pane::Table {
@@ -3378,6 +3396,7 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane
         } => render_pane_table(
             frame,
             area,
+            pintor,
             &TabelaPane {
                 title,
                 headers,
@@ -3406,14 +3425,16 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane
                 note: note.as_deref(),
             },
         ),
-        Pane::Facts { title, rows } => render_pane_facts(frame, area, title, rows),
-        Pane::Bars { title, rows, full } => render_pane_bars(frame, area, title, rows, *full),
+        Pane::Facts { title, rows } => render_pane_facts(frame, area, title, rows, pintor),
+        Pane::Bars { title, rows, full } => {
+            render_pane_bars(frame, area, title, rows, *full, pintor)
+        }
         Pane::Grid {
             title,
             cells,
             selected,
             legend,
-        } => render_pane_grid(frame, area, title, cells, *selected, legend),
+        } => render_pane_grid(frame, area, title, cells, *selected, legend, pintor),
         Pane::Text {
             title,
             lines,
@@ -3424,7 +3445,13 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane
             frame.render_widget(bloco, area);
             let texto: Vec<Line> = lines
                 .iter()
-                .map(|(t, tone)| Line::styled(t.clone(), Style::default().fg(tone_color(*tone))))
+                .map(|(t, tone)| {
+                    let cor = match pintor.rotulo(&[t]) {
+                        Some(marca) => mark_color(marca),
+                        None => tone_color(*tone),
+                    };
+                    Line::styled(t.clone(), Style::default().fg(cor))
+                })
                 .collect();
             frame.render_widget(Paragraph::new(texto).scroll((*scroll, 0)), dentro);
         }
@@ -3469,7 +3496,7 @@ struct TabelaPane<'a> {
     note: Option<&'a (String, crate::invest::module::Tone)>,
 }
 
-fn render_pane_table(frame: &mut Frame, area: Rect, pane: &TabelaPane) {
+fn render_pane_table(frame: &mut Frame, area: Rect, pintor: &Pintor, pane: &TabelaPane) {
     let TabelaPane {
         title,
         headers,
@@ -3501,41 +3528,77 @@ fn render_pane_table(frame: &mut Frame, area: Rect, pane: &TabelaPane) {
     let needle = query.to_lowercase();
     let visiveis: Vec<&crate::invest::module::Row> =
         rows.iter().filter(|r| r.matches(&needle)).collect();
+    let marcas: Vec<Option<MarkColor>> =
+        visiveis.iter().map(|r| pintor.tabela(headers, r)).collect();
+
+    // A coluna da estrela só aparece onde há estrela. Nas tabelas do sistema ela é fixa,
+    // porque lá a lista se reordena sozinha embaixo de quem lê e um deslocamento lateral
+    // no meio disso é ruído; aqui a lista está parada, e dois caracteres cobrados de todo
+    // painel — inclusive dos cartões estreitos da home — para uma coluna quase sempre
+    // vazia sairiam mais caro do que o pulo de uma vez só quando a primeira marca nasce.
+    let marcada = marcas.iter().any(Option::is_some);
 
     let ui_rows: Vec<UiRow> = visiveis
         .iter()
-        .map(|r| {
-            let celulas: Vec<Cell> = r
-                .cells
-                .iter()
-                .enumerate()
-                .map(|(i, texto)| {
-                    let tone = r.cell_tones.get(i).copied().unwrap_or(r.tone);
-                    let texto = match (i, r.depth) {
-                        (0, d) if d > 0 => format!("{}{texto}", "  ".repeat(d)),
-                        _ => texto.clone(),
-                    };
-                    Cell::from(texto).style(Style::default().fg(tone_color(tone)))
-                })
-                .collect();
+        .zip(&marcas)
+        .map(|(r, &marca)| {
+            let mut celulas: Vec<Cell> = Vec::with_capacity(r.cells.len() + 1);
+            if marcada {
+                celulas.push(match marca {
+                    Some(cor) => Cell::from(Span::styled(
+                        "★",
+                        Style::default()
+                            .fg(mark_color(cor))
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    None => Cell::from(" "),
+                });
+            }
+            celulas.extend(r.cells.iter().enumerate().map(|(i, texto)| {
+                let texto = match (i, r.depth) {
+                    (0, d) if d > 0 => format!("{}{texto}", "  ".repeat(d)),
+                    _ => texto.clone(),
+                };
+                // A linha seguida é da cor da marca inteira, célula por célula: o tom que
+                // o módulo pediu para cada coluna perde aqui de propósito. A estrela diz
+                // *qual* marca; a cor é o que o olho acha sem procurar, e ela só funciona
+                // se a linha for de uma cor só.
+                let cor = match marca {
+                    Some(cor) => mark_color(cor),
+                    None => tone_color(r.cell_tones.get(i).copied().unwrap_or(r.tone)),
+                };
+                Cell::from(texto).style(Style::default().fg(cor))
+            }));
             let linha = UiRow::new(celulas);
-            match r.tone {
-                Tone::Destaque => linha.style(Style::default().add_modifier(Modifier::BOLD)),
+            match (marca, r.tone) {
+                (Some(_), _) | (None, Tone::Destaque) => {
+                    linha.style(Style::default().add_modifier(Modifier::BOLD))
+                }
                 _ => linha,
             }
         })
         .collect();
 
-    let larguras = larguras_de(headers, &visiveis, dentro.width);
+    // A largura das colunas de conteúdo é calculada sobre o que sobra depois da estrela —
+    // somar a coluna depois de repartir a largura empurraria a última para fora da borda.
+    let mut larguras = larguras_de(
+        headers,
+        &visiveis,
+        dentro.width.saturating_sub(match marcada {
+            true => MARK_WIDTH,
+            false => 0,
+        }),
+    );
+    let mut celulas_do_cabecalho: Vec<Cell> = Vec::with_capacity(headers.len() + 1);
+    if marcada {
+        larguras.insert(0, Constraint::Length(MARK_WIDTH));
+        celulas_do_cabecalho.push(Cell::from(" "));
+    }
+    celulas_do_cabecalho.extend(headers.iter().map(|h| Cell::from(h.clone())));
+
     let tabela = Table::new(ui_rows, larguras)
         .header(
-            UiRow::new(
-                headers
-                    .iter()
-                    .map(|h| Cell::from(h.clone()))
-                    .collect::<Vec<_>>(),
-            )
-            .style(
+            UiRow::new(celulas_do_cabecalho).style(
                 Style::default()
                     .fg(palette::DIM)
                     .add_modifier(Modifier::BOLD),
@@ -3826,6 +3889,7 @@ fn render_pane_facts(
     area: Rect,
     title: &str,
     rows: &[(String, String, crate::invest::module::Tone)],
+    pintor: &Pintor,
 ) {
     let bloco = moldura(title);
     let dentro = bloco.inner(area);
@@ -3840,12 +3904,27 @@ fn render_pane_facts(
     let linhas: Vec<Line> = rows
         .iter()
         .map(|(rotulo, valor, tone)| {
+            // Seguido, o fato inteiro é da cor da marca — rótulo e valor. Num painel de
+            // fatos não há coluna de estrela onde pôr uma, e meia linha colorida leria
+            // como ênfase e não como marca.
+            let marca = pintor.rotulo(&[rotulo, valor]);
             Line::from(vec![
                 Span::styled(
                     format!("{rotulo:<largura$}  "),
-                    Style::default().fg(palette::DIM),
+                    match marca {
+                        Some(cor) => Style::default()
+                            .fg(mark_color(cor))
+                            .add_modifier(Modifier::BOLD),
+                        None => Style::default().fg(palette::DIM),
+                    },
                 ),
-                Span::styled(valor.clone(), Style::default().fg(tone_color(*tone))),
+                Span::styled(
+                    valor.clone(),
+                    Style::default().fg(match marca {
+                        Some(cor) => mark_color(cor),
+                        None => tone_color(*tone),
+                    }),
+                ),
             ])
         })
         .collect();
@@ -3858,6 +3937,7 @@ fn render_pane_bars(
     title: &str,
     rows: &[crate::invest::module::Bar],
     full: Option<f64>,
+    pintor: &Pintor,
 ) {
     let bloco = moldura(title);
     let dentro = bloco.inner(area);
@@ -3906,12 +3986,24 @@ fn render_pane_bars(
                     _ => '░',
                 })
                 .collect();
+            let marca = pintor.rotulo(&[&b.label, &b.text]);
             Line::from(vec![
                 Span::styled(
                     format!("{:<rotulo$} ", b.label),
-                    Style::default().fg(palette::DIM),
+                    match marca {
+                        Some(cor) => Style::default()
+                            .fg(mark_color(cor))
+                            .add_modifier(Modifier::BOLD),
+                        None => Style::default().fg(palette::DIM),
+                    },
                 ),
-                Span::styled(desenho, Style::default().fg(tone_color(b.tone))),
+                Span::styled(
+                    desenho,
+                    Style::default().fg(match marca {
+                        Some(cor) => mark_color(cor),
+                        None => tone_color(b.tone),
+                    }),
+                ),
                 Span::styled(format!(" {}", b.text), Style::default()),
             ])
         })
@@ -3926,6 +4018,7 @@ fn render_pane_grid(
     cells: &[crate::invest::module::Cell],
     selected: Option<usize>,
     legend: &str,
+    pintor: &Pintor,
 ) {
     let mut bloco = moldura(title);
     if !legend.is_empty() {
@@ -3962,6 +4055,13 @@ fn render_pane_grid(
             }
             let indice = faixa * por_linha + i;
             let cor = tone_color(celula.tone);
+            // A cor de dentro é o dado — verde sobe, vermelho desce — e mantê-la é o
+            // ponto do mapa. A marca vai na **moldura** da célula: a variação continua
+            // legível e o papel que se segue é achado de longe.
+            let moldura_cor = match pintor.rotulo(&[&celula.label, &celula.sub]) {
+                Some(marca) => mark_color(marca),
+                None => cor,
+            };
             let mut estilo = Style::default().fg(cor);
             if selected == Some(indice) {
                 estilo = estilo.add_modifier(Modifier::REVERSED);
@@ -3980,7 +4080,7 @@ fn render_pane_grid(
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(cor)),
+                        .border_style(Style::default().fg(moldura_cor)),
                 ),
                 area_celula,
             );
@@ -4279,5 +4379,5 @@ mod sparkline_tests {
 /// Desenha um `Pane` isolado, para os testes de largura poderem olhar o resultado.
 #[cfg(test)]
 pub fn render_pane_teste(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane) {
-    render_pane(frame, area, pane);
+    render_pane(frame, area, pane, &Pintor::nenhum(&Default::default()));
 }

@@ -14,8 +14,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::invest::calc;
 use crate::invest::model::{Alerta, AssetId, RegraAlerta};
 use crate::invest::module::{
-    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, ModuleView, Need, Outcome, Pane, Row,
-    Tone,
+    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, Marcavel, ModuleView, Need, Outcome,
+    Pane, Row, Tone,
 };
 use crate::invest::modules::comum::{Formulario, Lista, hint};
 use crate::invest::provider::MarketSnapshot;
@@ -38,6 +38,10 @@ impl InvestModule for Alertas {
     }
     fn group(&self) -> Group {
         Group::Informacao
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn needs(&self) -> &'static [Need] {
         &[Need::Cotacao]

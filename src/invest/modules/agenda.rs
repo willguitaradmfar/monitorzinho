@@ -14,7 +14,8 @@ use crate::invest::calc;
 use crate::invest::model::AssetId;
 use crate::invest::model::TipoProvento;
 use crate::invest::module::{
-    Ctx, Escape, Group, InvestModule, Layout, ModuleView, Outcome, Pane, Row, Tone,
+    Ctx, Escape, Group, InvestModule, Layout, Marcavel, ModuleView, Outcome, Pane, Row,
+    TipoDeMarca, Tone,
 };
 use crate::invest::modules::comum::{Lista, hint};
 use crate::invest::tempo::{self, Data};
@@ -94,6 +95,19 @@ pub fn feriado_b3(data: &Data) -> Option<&'static str> {
         .map(|(_, _, nome)| *nome)
 }
 
+/// O que se pode seguir nesta lista. O id da tabela nunca muda depois de publicado — é
+/// com ele que as marcas já gravadas se reconhecem.
+static MARCAS: Marcavel = Marcavel {
+    tabela: "invest-agenda",
+    nome: "Agenda",
+    tipos: &[TipoDeMarca {
+        nome: "evento",
+        coluna: "O quê",
+        numerico: false,
+        ajuda: "o assunto do evento",
+    }],
+};
+
 impl InvestModule for Agenda {
     fn id(&self) -> &'static str {
         "agenda"
@@ -109,6 +123,10 @@ impl InvestModule for Agenda {
     }
     fn group(&self) -> Group {
         Group::Informacao
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(MARCAS)
     }
     fn keywords(&self) -> &'static str {
         "calendário copom feriado data-ex pagamento vencimento evento"
@@ -345,7 +363,7 @@ impl ModuleView for Vista {
             false => {
                 let mut partes = vec!["● toca a sua carteira".to_string()];
                 partes.push(format!(
-                    "★ mínimo {} (Ctrl+E muda)",
+                    "★ mínimo {} (Ctrl+R muda)",
                     "★".repeat(self.peso_minimo as usize)
                 ));
                 // O que é publicado e o que é regra fica dito: uma data calculada não pode
@@ -386,8 +404,10 @@ impl ModuleView for Vista {
                 self.lista.selecionado = 0;
                 Outcome::Ok
             }
-            // O corte de relevância, entre 1 e 3 estrelas.
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // O corte de relevância, entre 1 e 3 estrelas. `Ctrl+R` de relevância, e
+            // não o `Ctrl+E` que era: esse virou a tecla de marcar, em toda tela do
+            // programa.
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.peso_minimo = match self.peso_minimo {
                     3 => 1,
                     n => n + 1,
@@ -410,7 +430,7 @@ impl ModuleView for Vista {
         hint(&[
             "↑/↓ andar",
             "Ctrl+F só a minha carteira",
-            "Ctrl+E relevância",
+            "Ctrl+R relevância",
             "Esc sair",
         ])
     }

@@ -371,11 +371,35 @@ fn run(
                         _ => app.exit_focus(),
                     },
 
+                    // Ctrl+E, not a bare letter: in a fullscreened table every letter is
+                    // search input, and marking has to work *while* searching, since
+                    // finding the row is usually how you got to it. Not Ctrl+M either —
+                    // a terminal sends the same byte for that as for Enter.
+                    //
+                    // Above the module arm below, and that is the whole point: marking is
+                    // the app's gesture, not one panel's. Two keys are reserved from every
+                    // screen so that the same gesture is the same key in every tab — and
+                    // the three Invest modules that had claimed Ctrl+E for themselves gave
+                    // it up rather than make the standard have exceptions.
+                    KeyCode::Char('e')
+                        if matches!(app.focus, Focus::Table(_) | Focus::Module(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.toggle_mark();
+                    }
+
+                    // Ctrl+G, next door to the key that makes a mark: the list of what
+                    // has been marked. From anywhere at all — marks span every table of
+                    // every tab and outlive all of it, so the one screen that answers
+                    // "what am I following" can't be reachable only from some of them.
+                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.open_marks_screen();
+                    }
+
                     // Todo o resto vai para o módulo aberto: letras, setas, Enter, Del e
                     // combinações com Ctrl. Um módulo pode ter busca digitada direto, e
-                    // por isso não pode haver letra reservada pelo app. `Tab` já é
-                    // bloqueado sem código nenhum, porque a troca de aba exige
-                    // `Focus::None`.
+                    // por isso não pode haver letra reservada pelo app **sozinha** — as
+                    // duas exceções são as de cima, e são com Ctrl.
                     _ if app.in_module() => app.module_key(key),
                     // 'q' closes whatever is fullscreened, and only that — on the plain
                     // dashboard it does nothing (it isn't a shortcut letter either).
@@ -396,16 +420,6 @@ fn run(
                         if key.modifiers.contains(KeyModifiers::CONTROL) && app.on_tmux_tab() =>
                     {
                         app.open_session_editor();
-                    }
-
-                    // Ctrl+G, next door to the key that makes a mark: the list of what
-                    // has been marked opens from the table it was marked in, and from
-                    // the dashboard, since marks span every table and outlive all of it.
-                    KeyCode::Char('g')
-                        if matches!(app.focus, Focus::Table(_) | Focus::None)
-                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        app.open_marks_screen();
                     }
 
                     // --- add-an-execution wizard ---
@@ -480,7 +494,15 @@ fn run(
                     KeyCode::Char('a') if on_tools_tab(&app) => app.open_wizard(),
                     KeyCode::Enter if on_tools_tab(&app) => app.open_tool_monitor(),
                     KeyCode::Delete if on_tools_tab(&app) => app.request_remove_execution(),
-                    KeyCode::Char('e') if on_tools_tab(&app) => app.edit_selected_execution(),
+                    // The bare letter, and only the bare letter: `Ctrl+E` is the mark key
+                    // everywhere in the app, and this tab has no list to mark. Without
+                    // the guard it opened the execution editor instead — a reserved
+                    // gesture doing something else on one tab is worse than doing nothing.
+                    KeyCode::Char('e')
+                        if on_tools_tab(&app) && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.edit_selected_execution()
+                    }
                     KeyCode::Char('r') if on_tools_tab(&app) => app.restart_selected_execution(),
                     // Space, ahead of the global "refresh now" arm below: this tab has
                     // nothing to refresh — an execution's counters are atomics the UI
@@ -537,16 +559,6 @@ fn run(
                     }
                     KeyCode::Delete if matches!(app.focus, Focus::Table(_)) => {
                         app.request_kill_selected();
-                    }
-                    // Ctrl+E, not a bare letter: in a fullscreened table every letter is
-                    // search input, and marking has to work *while* searching, since
-                    // finding the row is usually how you got to it. Not Ctrl+M either —
-                    // a terminal sends the same byte for that as for Enter.
-                    KeyCode::Char('e')
-                        if matches!(app.focus, Focus::Table(_))
-                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        app.toggle_mark();
                     }
                     KeyCode::Backspace if matches!(app.focus, Focus::Table(_)) => {
                         app.search_backspace();

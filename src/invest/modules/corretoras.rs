@@ -10,7 +10,8 @@ use crate::invest::calc;
 use crate::invest::carteira;
 use crate::invest::model::AssetId;
 use crate::invest::module::{
-    Bar, Ctx, Escape, Group, InvestModule, Layout, ModuleView, Need, Outcome, Pane, Row, Tone,
+    Bar, Ctx, Escape, Group, InvestModule, Layout, Marcavel, ModuleView, Need, Outcome, Pane, Row,
+    TipoDeMarca, Tone,
 };
 use crate::invest::modules::comum::{Lista, hint};
 use crate::invest::tempo;
@@ -20,6 +21,19 @@ pub struct Corretoras;
 /// A partir de quantos dias uma importação passa a ser velha o bastante para ser dita.
 /// Não é erro: é que o P&L está sendo calculado sobre quantidades de um mês atrás.
 const VELHA: u64 = 30 * 86400;
+
+/// O que se pode seguir nesta lista. O id da tabela nunca muda depois de publicado — é
+/// com ele que as marcas já gravadas se reconhecem.
+static MARCAS: Marcavel = Marcavel {
+    tabela: "invest-corretoras",
+    nome: "Corretoras",
+    tipos: &[TipoDeMarca {
+        nome: "corretora",
+        coluna: "Fonte",
+        numerico: false,
+        ajuda: "o nome da corretora",
+    }],
+};
 
 impl InvestModule for Corretoras {
     fn id(&self) -> &'static str {
@@ -36,6 +50,10 @@ impl InvestModule for Corretoras {
     }
     fn group(&self) -> Group {
         Group::Carteira
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(MARCAS)
     }
     fn needs(&self) -> &'static [Need] {
         &[Need::Posicoes]

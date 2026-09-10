@@ -11,7 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::invest::calc;
 use crate::invest::model::{AssetId, Provento, TipoProvento};
 use crate::invest::module::{
-    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, ModuleView, Outcome, Pane, Row, Tone,
+    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, Marcavel, ModuleView, Outcome, Pane,
+    Row, Tone,
 };
 use crate::invest::modules::comum::{Formulario, Lista, hint};
 use crate::invest::tempo::{self, Data};
@@ -35,6 +36,10 @@ impl InvestModule for Proventos {
     }
     fn group(&self) -> Group {
         Group::Carteira
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn keywords(&self) -> &'static str {
         "dividendo jcp rendimento yield renda passiva amortização"

@@ -15,7 +15,7 @@ use crate::invest::calc;
 use crate::invest::carteira;
 use crate::invest::model::AssetId;
 use crate::invest::module::{
-    Cell, Ctx, Escape, Group, InvestModule, Layout, ModuleView, Need, Outcome, Pane, Tone,
+    Cell, Ctx, Escape, Group, InvestModule, Layout, Marcavel, ModuleView, Need, Outcome, Pane, Tone,
 };
 use crate::invest::modules::comum::hint;
 
@@ -50,6 +50,11 @@ impl InvestModule for Heatmap {
     }
     fn group(&self) -> Group {
         Group::Mercado
+    }
+
+    /// Divide a lista de marcas dos ativos: cada célula é um papel — a marca acende a moldura dela.
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn needs(&self) -> &'static [Need] {
         &[Need::Cotacao]

@@ -188,6 +188,9 @@ pub fn ordenar_cartoes(cartoes: &mut [Cartao]) {
 /// Um cartão da home da aba Invest: o que a grade desenha e o que a tecla de atalho abre.
 pub struct Cartao {
     pub id: String,
+    /// Que marcas as linhas deste cartão podem estar vestindo — a mesma declaração do
+    /// módulo. É o que faz a marca posta dentro do módulo aparecer no cartão dele.
+    pub marcavel: Option<crate::invest::module::Marcavel>,
     /// Que coisa dentro do módulo este cartão abre — ver `InvestModule::cartazes`.
     pub sub: Option<String>,
     pub nome: String,
@@ -598,8 +601,16 @@ impl SessionEditor {
 /// same form on a mark that already exists, which is why `editing` is here: the two are
 /// the same question, asked once about a row and once about an answer already given.
 pub struct MarkEditor {
-    pub table_index: usize,
-    /// Which of the table's kinds is selected, as an index into `mark_kinds()`.
+    /// The table the mark is about, by id — a `TableMonitor`'s or an Invest module's,
+    /// which from here is the same thing. An id and not an index because the two kinds
+    /// of list live in different collections, and a mark has never cared which.
+    pub table: String,
+    /// What a mark on that table can be about, with each kind's column already resolved
+    /// against the table the box was opened over. Owned rather than borrowed because an
+    /// Invest list resolves its columns by header name at the moment it is drawn — see
+    /// `invest::marcas::tipos`.
+    pub kinds: Vec<mark::MarkKind>,
+    /// Which of the table's kinds is selected, as an index into `kinds`.
     pub kind: usize,
     pub value: String,
     pub color: mark::MarkColor,
@@ -614,10 +625,14 @@ pub struct MarkEditor {
     /// shows that order, and a rewrite that jumped to the end would read as a delete
     /// plus an add.
     pub editing: Option<usize>,
-    /// Whether a row is under the box. Only then does switching kind refill the value
+    /// The row the box was opened over. Only then does switching kind refill the value
     /// from it; opened from the marks screen there is no row, and the value that is
     /// already typed is the one worth keeping.
-    pub from_row: bool,
+    ///
+    /// Kept here rather than read back from the focus when needed: the box outlives no
+    /// redraw, but the row underneath it can be a module's, and a module rebuilds its
+    /// rows every frame.
+    pub row: Option<TableRow>,
 }
 
 /// One line of the mark box. What is on offer depends on the table — a flat one has no
@@ -3021,45 +3036,75 @@ impl App {
     /// Opens the mark box for the selected row, or clears the marks that already match
     /// it — pressing the same key on something already followed means stop following it.
     pub fn toggle_mark(&mut self) {
-        let Focus::Table(tf) = &self.focus else {
+        let Some((table, kinds, row, tree)) = self.linha_a_marcar() else {
             return;
         };
-        let index = tf.table_index;
-        let monitor = self.table_monitors[index].as_ref();
-        let kinds = monitor.mark_kinds();
         if kinds.is_empty() {
             return;
         }
-        let Some(&row_idx) = tf.visible_indices().get(tf.selected) else {
-            return;
-        };
-        let Some(row) = tf.rows.get(row_idx).cloned() else {
-            return;
-        };
-        if self.marks.hit(monitor.id(), kinds, &row).is_some() {
-            self.marks.remove_matching(monitor.id(), kinds, &row);
+        if self.marks.hit(&table, &kinds, &row).is_some() {
+            self.marks.remove_matching(&table, &kinds, &row);
             self.reapply_marks();
             return;
         }
         // Filled in from the row: the value someone wants is almost always the one they
         // are looking at.
-        let tree = tf.rows.iter().any(|row| row.child_count > 0);
         let value = suggested_value(&row, &kinds[0]);
         self.mark_editor = Some(MarkEditor {
-            table_index: index,
+            color: self.next_color(&table),
+            table,
+            kinds,
             kind: 0,
             value,
-            // Not the same colour every time: a second mark that comes up the same
-            // colour as the first defeats the point of having colours at all. The count
-            // of marks already on this table is what decides, so marking three things in
-            // a row gives three different colours without anyone choosing.
-            color: self.next_color(monitor.id()),
             subtree: tree,
             tree,
             field: 0,
             editing: None,
-            from_row: true,
+            row: Some(row),
         });
+    }
+
+    /// Onde o `Ctrl+E` age: a tabela sob o cursor, o que ela aceita como marca, a linha
+    /// que está sob o cursor dela, e se ela tem árvore para estender a marca.
+    ///
+    /// Uma tabela em tela cheia e a lista de um módulo da Invest respondem a mesma coisa
+    /// aqui, e é por isso que existe **um** `toggle_mark` e não dois. A diferença entre
+    /// as duas — uma guarda as linhas congeladas, a outra as remonta a cada quadro — para
+    /// nesta função.
+    fn linha_a_marcar(&self) -> Option<(String, Vec<mark::MarkKind>, TableRow, bool)> {
+        match &self.focus {
+            Focus::Table(tf) => {
+                let monitor = self.table_monitors[tf.table_index].as_ref();
+                let &row_idx = tf.visible_indices().get(tf.selected)?;
+                let row = tf.rows.get(row_idx)?.clone();
+                let tree = tf.rows.iter().any(|row| row.child_count > 0);
+                Some((
+                    monitor.id().to_string(),
+                    monitor.mark_kinds().to_vec(),
+                    row,
+                    tree,
+                ))
+            }
+            Focus::Module(mf) => {
+                let invest = self.invest.as_ref()?;
+                let alvo = invest.modulo(&mf.module)?.marcavel()?;
+                let layout = mf.view.layout(&invest.ctx());
+                let pane = layout.primeira_tabela()?;
+                let crate::invest::module::Pane::Table { headers, .. } = pane else {
+                    return None;
+                };
+                let row = crate::invest::marcas::linha_sob_cursor(pane)?;
+                // Sem árvore: as listas da Invest agrupam com recuo, mas nenhuma tem
+                // filhos que se possa querer arrastar junto com o pai.
+                Some((
+                    alvo.tabela.to_string(),
+                    crate::invest::marcas::tipos(&alvo, headers),
+                    row,
+                    false,
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// The colour to open the box with: the first one this table isn't already using.
@@ -3098,7 +3143,7 @@ impl App {
         let Some(editor) = &mut self.mark_editor else {
             return;
         };
-        let kinds = self.table_monitors[editor.table_index].mark_kinds();
+        let kinds = editor.kinds.clone();
         match code {
             KeyCode::Up | KeyCode::Down => {
                 let delta = if code == KeyCode::Down { 1 } else { -1 };
@@ -3116,11 +3161,7 @@ impl App {
                         // mark that matches nothing. Only from a row, though — with no
                         // row underneath there is nothing better to put there than what
                         // is already typed.
-                        if editor.from_row
-                            && let Focus::Table(tf) = &self.focus
-                            && let Some(&row_idx) = tf.visible_indices().get(tf.selected)
-                            && let Some(row) = tf.rows.get(row_idx)
-                        {
+                        if let Some(row) = &editor.row {
                             editor.value = suggested_value(row, &kinds[editor.kind]);
                         }
                     }
@@ -3139,7 +3180,7 @@ impl App {
             }
             KeyCode::Enter => {
                 let mark = Mark {
-                    table: self.table_monitors[editor.table_index].id().to_string(),
+                    table: editor.table.clone(),
                     kind: kinds[editor.kind].name.to_string(),
                     value: editor.value.trim().to_string(),
                     subtree: editor.tree && editor.subtree,
@@ -3198,7 +3239,9 @@ impl App {
                     self.reapply_marks();
                 }
             }
-            KeyCode::Enter | KeyCode::Char('e') => self.edit_selected_mark(),
+            KeyCode::Enter | KeyCode::Char('e') => {
+                self.edit_selected_mark();
+            }
             // No confirmation: a mark is a highlight, and putting it back is the same
             // two keys that made it. The stop-and-read box is for what can't be undone.
             KeyCode::Delete => {
@@ -3213,36 +3256,65 @@ impl App {
     }
 
     /// Opens the mark box on the selected mark, filled in with what it already says.
-    fn edit_selected_mark(&mut self) {
-        let Some(screen) = &self.marks_screen else {
-            return;
-        };
-        let index = screen.selected;
-        let Some(mark) = self.marks.all().get(index) else {
-            return;
-        };
+    fn edit_selected_mark(&mut self) -> Option<()> {
+        let index = self.marks_screen.as_ref()?.selected;
+        let mark = self.marks.all().get(index)?.clone();
         // A mark whose table isn't in this build any more has nothing to edit against —
         // no kinds to choose from, no columns to match. It stays in the file and in the
         // list, where Del can still reach it.
-        let Some(table_index) = self.table_index_of(&mark.table) else {
-            return;
-        };
-        let kinds = self.table_monitors[table_index].mark_kinds();
+        let (kinds, tree) = self.mark_source(&mark.table)?;
         let kind = kinds
             .iter()
             .position(|kind| kind.name == mark.kind)
             .unwrap_or(0);
         self.mark_editor = Some(MarkEditor {
-            table_index,
+            table: mark.table.clone(),
+            kinds,
             kind,
             value: mark.value.clone(),
             color: mark.color,
             subtree: mark.subtree,
-            tree: self.table_monitors[table_index].tree(),
+            tree,
             field: 0,
             editing: Some(index),
-            from_row: false,
+            row: None,
         });
+        Some(())
+    }
+
+    /// O que uma tabela aceita como marca, e se ela tem árvore — de uma `TableMonitor` ou
+    /// de um módulo da Invest, procurando nessa ordem.
+    ///
+    /// `None` para uma marca deixada por uma tabela que este build não tem mais. Ela
+    /// continua no arquivo e na lista, onde o `Del` ainda a alcança: apagar sozinho o que
+    /// não se sabe mais ler seria decidir pelo usuário.
+    fn mark_source(&self, table: &str) -> Option<(Vec<mark::MarkKind>, bool)> {
+        if let Some(index) = self.table_index_of(table) {
+            return Some((
+                self.table_monitors[index].mark_kinds().to_vec(),
+                self.table_monitors[index].tree(),
+            ));
+        }
+        let alvo = self.invest.as_ref()?.modulo_da_tabela(table)?.marcavel()?;
+        Some((crate::invest::marcas::tipos_soltos(&alvo), false))
+    }
+
+    /// O nome legível de uma tabela marcada, para a lista de marcas. `None` quando este
+    /// build não conhece mais a tabela — a lista mostra o id cru, que é melhor que nada.
+    pub fn mark_table_name(&self, table: &str) -> Option<String> {
+        if let Some(index) = self.table_index_of(table) {
+            return Some(self.table_monitors[index].title().to_string());
+        }
+        // O nome vem da declaração e não do módulo: dez telas dividem a lista de ativos,
+        // e a marca não pode se chamar «Posições» só porque foi feita ali.
+        Some(
+            self.invest
+                .as_ref()?
+                .modulo_da_tabela(table)?
+                .marcavel()?
+                .nome
+                .to_string(),
+        )
     }
 
     /// Which table monitor a saved mark belongs to, or `None` for a mark left behind by
@@ -4137,6 +4209,7 @@ impl App {
             .take(MAX_SHORTCUTS)
             .flat_map(|m| {
                 let resumo = m.summary(&ctx);
+                let alvo = m.marcavel();
                 // Um módulo pode pôr mais de um cartão — ver `InvestModule::cartazes`.
                 m.cartazes(&ctx).into_iter().map(move |mut c| {
                     // O painel nasce sem título: quem manda no título é a home. Titular
@@ -4146,6 +4219,7 @@ impl App {
                     }
                     Cartao {
                         id: m.id().to_string(),
+                        marcavel: alvo,
                         sub: c.sub,
                         nome: c.titulo,
                         resumo: resumo.clone(),
@@ -4758,6 +4832,7 @@ mod home_tests {
     fn cartao(id: &str, destaque: u8) -> Cartao {
         Cartao {
             id: id.to_string(),
+            marcavel: None,
             sub: None,
             nome: id.to_string(),
             resumo: String::new(),

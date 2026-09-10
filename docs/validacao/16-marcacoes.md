@@ -13,6 +13,11 @@ Uma marcação prende a linha **visualmente**: ela continua onde o ranking a pus
 e passa a usar uma **★** onde quer que caia — na cor da marca (ver
 [22 — Cores e a tela de marcas](22-cores-e-tela-de-marcas.md)).
 
+> Desde a v0.39.0 isto vale também nas listas da aba Invest, com uma diferença
+> que só existe lá: dez telas dividem a mesma lista de marcas, para que um papel
+> seguido seja seguido em todas. Ver
+> [27 — Marcações na aba Invest](27-marcacoes-na-invest.md).
+
 ## Como marcar
 
 Numa tabela em tela cheia, **`Ctrl+E`** sobre a linha. A caixa abre **já
@@ -36,7 +41,14 @@ processo é uma linha de comando, uma sessão é uma pessoa.
 | **Top CPU / Top Memory** | `comando` — **e a opção de incluir a árvore** |
 | **SSH Sessions** | `usuário` · `origem` · `comando` |
 | **Interfaces** | `interface` |
+| **Sessões (tmux)** | `sessão` — **e a opção de incluir a árvore** · `pasta` |
+| **Janelas (tmux)** | `sessão` · `janela` · `comando` · `pasta` |
+| **Containers** | `container` · `imagem` · `estado` · `porta` |
+| **Volumes** | `volume` · `container` |
+| **Imagens** | `imagem` |
+| **Redes** | `rede` |
 | **System Info** | nenhuma — não há linha a seguir numa lista de fatos |
+| **Listas da aba Invest** | ver [27](27-marcacoes-na-invest.md) |
 
 **Número é número.** Marcar a porta `443` não pega a `4433`, mesmo que `4433`
 contenha `443` — a comparação é feita sobre cada número da célula, não sobre o
@@ -99,12 +111,18 @@ seguido de fim). Teste os dois valores e compare.
 linha. (`Ctrl+G` → `Del` remove pela lista, sem precisar achar a linha de novo.) Se várias marcas casarem com a mesma linha, todas saem — é o que
 "pare de seguir isto" quer dizer.
 
-### 6. Onde a tecla não é oferecida
+### 6. `Ctrl+G` abre de qualquer lugar
+
+Da grade, de uma tabela em tela cheia, de dentro de um módulo da Invest, da aba
+Ferramentas. A lista sobe por cima do que estiver na tela e `Esc` devolve
+exatamente onde se estava.
+
+### 7. Onde a tecla não é oferecida
 
 Em **System Info**, o rodapé **não** mostra `Ctrl+E marcar ★`, e a tecla não faz
 nada. Uma lista de fatos sobre a máquina não tem linha a seguir.
 
-### 7. As colunas não dançam
+### 8. As colunas não dançam
 
 A coluna da estrela existe sempre, marcada ou não. Marcar algo **não pode**
 deslocar a tabela para o lado sob o leitor.

@@ -11,8 +11,8 @@ use crate::invest::calc;
 use crate::invest::carteira::{self, Linha};
 use crate::invest::model::{AssetId, Classe, Moeda, Position};
 use crate::invest::module::{
-    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, ModuleView, Need, Outcome, Pane, Row,
-    Tone,
+    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, Marcavel, ModuleView, Need, Outcome,
+    Pane, Row, Tone,
 };
 use crate::invest::modules::comum::{Formulario, Lista, hint};
 
@@ -36,6 +36,10 @@ impl InvestModule for Posicoes {
     }
     fn group(&self) -> Group {
         Group::Carteira
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
 
     fn needs(&self) -> &'static [Need] {
@@ -659,7 +663,9 @@ impl ModuleView for Vista {
                 self.abrir_form(None, ctx);
                 Outcome::Ok
             }
-            KeyCode::Char('g') if ctrl => {
+            // `Ctrl+U` de agrUpar, e não o `Ctrl+G` que era: esse virou a lista de marcas,
+            // em toda tela do programa.
+            KeyCode::Char('u') if ctrl => {
                 self.agrupamento = self.agrupamento.proximo();
                 self.lista.selecionado = 0;
                 Outcome::Ok
@@ -703,7 +709,7 @@ impl ModuleView for Vista {
                 "digite para buscar",
                 "Enter editar",
                 "Ctrl+A adicionar",
-                "Ctrl+G agrupar",
+                "Ctrl+U agrupar",
                 "Del remover",
                 "Esc sair",
             ]),

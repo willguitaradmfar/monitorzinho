@@ -15,8 +15,8 @@ use crate::invest::calc;
 use crate::invest::carteiras::{Ajuste, plano};
 use crate::invest::model::{AlvoCarteira, AssetId, Carteira};
 use crate::invest::module::{
-    Bar, Cartaz, Ctx, Edit, Escape, Field, Group, InvestModule, Layout, ModuleView, Outcome, Pane,
-    Row, Tone,
+    Bar, Cartaz, Ctx, Edit, Escape, Field, Group, InvestModule, Layout, Marcavel, ModuleView,
+    Outcome, Pane, Row, Tone,
 };
 use crate::invest::modules::comum::{Formulario, Lista, hint};
 
@@ -183,6 +183,10 @@ impl InvestModule for Carteiras {
     }
     fn group(&self) -> Group {
         Group::Carteira
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn keywords(&self) -> &'static str {
         "carteira recomendada alvo aporte alocação teto rebalancear recomendação"

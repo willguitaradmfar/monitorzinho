@@ -17,7 +17,7 @@ use crate::invest::carteira;
 use crate::invest::historico::{self, Estado, fechamentos};
 use crate::invest::model::{AssetId, Market};
 use crate::invest::module::{
-    Ctx, Escape, Group, InvestModule, Layout, ModuleView, Need, Outcome, Pane, Row, Tone,
+    Ctx, Escape, Group, InvestModule, Layout, Marcavel, ModuleView, Need, Outcome, Pane, Row, Tone,
 };
 use crate::invest::modules::comum::{Lista, hint};
 use crate::invest::provider::Span;
@@ -45,6 +45,10 @@ impl InvestModule for Risco {
     }
     fn group(&self) -> Group {
         Group::Analise
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn needs(&self) -> &'static [Need] {
         &[Need::Posicoes, Need::Historico]

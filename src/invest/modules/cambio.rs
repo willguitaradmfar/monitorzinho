@@ -10,7 +10,7 @@ use crate::invest::calc;
 use crate::invest::carteira;
 use crate::invest::model::{AssetId, Market, Moeda};
 use crate::invest::module::{
-    Ctx, Escape, Group, InvestModule, Layout, ModuleView, Outcome, Pane, Row, Tone,
+    Ctx, Escape, Group, InvestModule, Layout, Marcavel, ModuleView, Outcome, Pane, Row, Tone,
 };
 use crate::invest::modules::comum::{Lista, hint, sem_preco};
 use crate::invest::modules::mercado;
@@ -33,6 +33,10 @@ impl InvestModule for Cambio {
     }
     fn group(&self) -> Group {
         Group::Mercado
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn keywords(&self) -> &'static str {
         "dólar euro moeda ptax conversão exposição"

@@ -13,13 +13,27 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::invest::calc;
 use crate::invest::model::AssetId;
 use crate::invest::module::{
-    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, ModuleView, Outcome, Pane, Row, Tone,
+    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, Marcavel, ModuleView, Outcome, Pane,
+    Row, TipoDeMarca, Tone,
 };
 use crate::invest::modules::comum::{Formulario, Lista, hint};
 use crate::invest::rss::{self, Item};
 use crate::invest::tempo;
 
 pub struct Noticias;
+
+/// O que se pode seguir nesta lista. O id da tabela nunca muda depois de publicado — é
+/// com ele que as marcas já gravadas se reconhecem.
+static MARCAS: Marcavel = Marcavel {
+    tabela: "invest-noticias",
+    nome: "Notícias",
+    tipos: &[TipoDeMarca {
+        nome: "assunto",
+        coluna: "Título",
+        numerico: false,
+        ajuda: "uma palavra do título, ou uma expressão regular",
+    }],
+};
 
 impl InvestModule for Noticias {
     fn id(&self) -> &'static str {
@@ -36,6 +50,10 @@ impl InvestModule for Noticias {
     }
     fn group(&self) -> Group {
         Group::Informacao
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(MARCAS)
     }
     fn keywords(&self) -> &'static str {
         "rss feed jornal manchete mercado imprensa"

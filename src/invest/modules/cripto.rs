@@ -10,7 +10,8 @@ use crate::invest::calc;
 use crate::invest::carteira;
 use crate::invest::model::{AssetId, Classe, Market, Moeda};
 use crate::invest::module::{
-    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, ModuleView, Outcome, Pane, Row, Tone,
+    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, Marcavel, ModuleView, Outcome, Pane,
+    Row, Tone,
 };
 use crate::invest::modules::comum::{Formulario, Lista, hint, sem_preco};
 use crate::invest::modules::mercado;
@@ -33,6 +34,10 @@ impl InvestModule for Cripto {
     }
     fn group(&self) -> Group {
         Group::Mercado
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn keywords(&self) -> &'static str {
         "bitcoin btc eth binance exchange par usdt"

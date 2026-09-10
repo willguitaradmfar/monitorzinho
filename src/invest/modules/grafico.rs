@@ -12,7 +12,8 @@ use crate::invest::calc;
 use crate::invest::historico::{self, Estado};
 use crate::invest::model::AssetId;
 use crate::invest::module::{
-    Ctx, Escape, Field, Group, InvestModule, Layout, ModuleView, Need, Outcome, Pane, Tone,
+    Ctx, Escape, Field, Group, InvestModule, Layout, Marcavel, ModuleView, Need, Outcome, Pane,
+    Tone,
 };
 use crate::invest::modules::comum::{Formulario, hint};
 use crate::invest::provider::Span;
@@ -34,6 +35,11 @@ impl InvestModule for Grafico {
     }
     fn group(&self) -> Group {
         Group::Mercado
+    }
+
+    /// Divide a lista de marcas dos ativos: o cartão lista os papéis com série; a tela é o gráfico de um deles.
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(crate::invest::marcas::ATIVOS)
     }
     fn needs(&self) -> &'static [Need] {
         &[Need::Historico]

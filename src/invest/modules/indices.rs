@@ -12,7 +12,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::invest::calc;
 use crate::invest::model::{AssetId, Market};
 use crate::invest::module::{
-    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, ModuleView, Outcome, Pane, Row, Tone,
+    Ctx, Edit, Escape, Field, Group, InvestModule, Layout, Marcavel, ModuleView, Outcome, Pane,
+    Row, TipoDeMarca, Tone,
 };
 use crate::invest::modules::comum::{Formulario, Lista, hint, sem_preco};
 
@@ -53,6 +54,19 @@ fn indicadores() -> Vec<(AssetId, &'static str)> {
         .collect()
 }
 
+/// O que se pode seguir nesta lista. O id da tabela nunca muda depois de publicado — é
+/// com ele que as marcas já gravadas se reconhecem.
+static MARCAS: Marcavel = Marcavel {
+    tabela: "invest-indices",
+    nome: "Índices e macro",
+    tipos: &[TipoDeMarca {
+        nome: "indicador",
+        coluna: "Indicador",
+        numerico: false,
+        ajuda: "o nome do indicador",
+    }],
+};
+
 impl InvestModule for Indices {
     fn id(&self) -> &'static str {
         "indices"
@@ -68,6 +82,10 @@ impl InvestModule for Indices {
     }
     fn group(&self) -> Group {
         Group::Mercado
+    }
+
+    fn marcavel(&self) -> Option<Marcavel> {
+        Some(MARCAS)
     }
     fn keywords(&self) -> &'static str {
         "ibovespa s&p nasdaq dxy vix treasury macro juro inflação"
@@ -263,7 +281,7 @@ impl ModuleView for Vista {
                     Tone::Normal,
                 )),
                 (None, false) => {
-                    informados.push((nome.to_string(), "— informe com Ctrl+E".into(), Tone::Dim))
+                    informados.push((nome.to_string(), "— informe com Ctrl+A".into(), Tone::Dim))
                 }
             }
         }
@@ -304,7 +322,7 @@ impl ModuleView for Vista {
                     note: "Índice de bolsa é dado vendido. O que existe de graça ou pede \n\
                            cadastro, ou é raspado de página e quebra sem aviso — e a decisão \n\
                            desta versão foi não depender de fonte que quebra.\n\n\
-                           Ctrl+E informa um valor à mão. Ele fica gravado, aparece com a \n\
+                           Ctrl+A informa um valor à mão. Ele fica gravado, aparece com a \n\
                            marca «informado», e nunca é colorido como se fosse ao vivo.\n\n\
                            Ligar um provedor com chave um dia troca a fonte e não muda \n\
                            nenhum módulo — é para isso que o `trait Provider` existe."
@@ -334,7 +352,9 @@ impl ModuleView for Vista {
         }
 
         match key.code {
-            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // `Ctrl+A` de anotar — o `Ctrl+E` que era virou a tecla de marcar, em toda
+            // tela do programa.
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Só o que continua sem fonte. Oferecer «informar o Ibovespa» depois de
                 // ele ganhar uma seria convidar a digitar por cima de um dado buscado.
                 let opcoes: Vec<String> = MACRO
@@ -367,6 +387,6 @@ impl ModuleView for Vista {
     }
 
     fn hint(&self) -> String {
-        hint(&["Ctrl+E informar um valor", "Esc sair"])
+        hint(&["Ctrl+A informar um valor", "Esc sair"])
     }
 }
