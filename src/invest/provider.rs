@@ -264,6 +264,53 @@ pub struct StatusFonte {
     pub peso: Option<u64>,
 }
 
+/// Para onde o preço andou **desde a leitura anterior**. Não é a variação do dia: é o
+/// último passo, e ele responde outra pergunta — «está andando agora, e para que lado».
+///
+/// Um papel pode estar em alta no dia e caindo neste minuto, e as duas coisas importam
+/// para quem está olhando a tela. A variação do dia já estava lá e continua onde estava;
+/// isto é o indicador de momento ao lado dela.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tick {
+    Subiu,
+    Desceu,
+}
+
+/// Para que lado o preço andou entre duas leituras.
+///
+/// `None` quando ele não andou — e aí a seta anterior **fica**. Uma seta que aparece por
+/// uma volta e some não chega a ser lida, e a pergunta que ela responde é «para que lado
+/// foi o último movimento», não «mexeu exatamente nesta volta».
+pub fn tick_entre(novo: f64, anterior: f64) -> Option<Tick> {
+    match novo.total_cmp(&anterior) {
+        std::cmp::Ordering::Greater => Some(Tick::Subiu),
+        std::cmp::Ordering::Less => Some(Tick::Desceu),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+/// Volume, máxima e mínima de quem os tiver, quando o dono do preço não os tem.
+///
+/// O preço vem sempre da melhor fonte — essa disputa é resolvida acima e não muda. Mas
+/// «melhor para o preço» não é «tem todos os campos»: quem serve a B3 aqui não publica
+/// volume em endereço nenhum, e por isso a coluna aparecia vazia em quase toda linha da
+/// tela de Cotações, mesmo quando outra fonte tinha respondido o número na mesma volta.
+///
+/// **Só dentro do mesmo pregão.** O volume é acumulado do dia; carregá-lo para o dia
+/// seguinte mostraria o giro de ontem como o de hoje, que é o tipo de número velho com
+/// cara de novo que esta aba passa o tempo todo evitando.
+fn herdar_acessorios(mut q: Quote, anterior: &Quote) -> Quote {
+    let mesmo_dia = tempo::Data::de_epoch(q.em, tempo::BRT_OFFSET)
+        == tempo::Data::de_epoch(anterior.em, tempo::BRT_OFFSET);
+    if !mesmo_dia {
+        return q;
+    }
+    q.volume = q.volume.or(anterior.volume);
+    q.max24 = q.max24.or(anterior.max24);
+    q.min24 = q.min24.or(anterior.min24);
+    q
+}
+
 /// O retrato que a UI lê. Trocado inteiro a cada volta, nunca editado no lugar — mesma
 /// mecânica do `container::store::Snapshot`, e pelo mesmo motivo: a interface nunca pode
 /// esperar por um socket.
@@ -271,11 +318,23 @@ pub struct StatusFonte {
 pub struct MarketSnapshot {
     pub quotes: HashMap<AssetId, Quote>,
     pub fontes: Vec<StatusFonte>,
+    /// Para que lado foi o último movimento de cada papel.
+    ///
+    /// Fora da `Quote` de propósito: um provedor não sabe disto e não tem como saber. É
+    /// uma propriedade do **nosso histórico de leituras**, não do dado — a mesma divisão
+    /// que põe a cor de uma marca fora da linha que a veste.
+    pub ticks: HashMap<AssetId, Tick>,
 }
 
 impl MarketSnapshot {
     pub fn quote(&self, ativo: &AssetId) -> Option<&Quote> {
         self.quotes.get(ativo)
+    }
+
+    /// Para que lado o preço andou na última leitura. `None` enquanto ele não mudou
+    /// nenhuma vez desde que o programa abriu.
+    pub fn tick(&self, ativo: &AssetId) -> Option<Tick> {
+        self.ticks.get(ativo).copied()
     }
 
     /// Converte para BRL. `None` quando não há como — e aí a linha fica de fora do total
@@ -699,6 +758,19 @@ impl ProviderSet {
                 {
                     continue;
                 }
+                // Para que lado o preço andou nesta leitura. **Preço igual mantém a seta
+                // anterior**: uma seta que aparece por uma volta e some não chega a ser
+                // lida, e a pergunta é «para que lado foi o último movimento», não «mexeu
+                // exatamente agora».
+                if let Some(anterior) = s.quotes.get(&q.ativo)
+                    && let Some(t) = tick_entre(q.preco, anterior.preco)
+                {
+                    s.ticks.insert(q.ativo.clone(), t);
+                }
+                let q = match s.quotes.get(&q.ativo) {
+                    Some(anterior) => herdar_acessorios(q, anterior),
+                    None => q,
+                };
                 s.quotes.insert(q.ativo.clone(), q);
             }
             // Uma fonte que não falou nesta volta mantém o que disse na anterior: sumir
@@ -778,6 +850,59 @@ pub fn dia_util_br(agora: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn q(em: u64, volume: Option<f64>, max24: Option<f64>) -> Quote {
+        Quote {
+            ativo: AssetId::new(Market::B3, "PETR4"),
+            fonte: "teste",
+            preco: 10.0,
+            anterior: None,
+            moeda: Moeda::Brl,
+            grade: Grade::AoVivo,
+            em,
+            volume,
+            max24,
+            min24: None,
+        }
+    }
+
+    /// Quem ganha o preço nem sempre tem todos os campos: a fonte da B3 não publica
+    /// volume, e a coluna ficava vazia mesmo quando outra fonte tinha respondido o
+    /// número na mesma volta.
+    #[test]
+    fn os_acessorios_vem_de_quem_os_tem() {
+        let dia = 1_789_000_000;
+        let novo = herdar_acessorios(q(dia + 60, None, None), &q(dia, Some(1e6), Some(11.0)));
+        assert_eq!(novo.volume, Some(1e6));
+        assert_eq!(novo.max24, Some(11.0));
+        // E o que a fonte nova traz manda: herdar é preencher buraco, não sobrescrever.
+        let novo = herdar_acessorios(q(dia + 60, Some(2e6), None), &q(dia, Some(1e6), None));
+        assert_eq!(novo.volume, Some(2e6));
+    }
+
+    /// O volume é acumulado do dia. Carregá-lo para o pregão seguinte mostraria o giro
+    /// de ontem como o de hoje.
+    #[test]
+    fn o_acessorio_nao_atravessa_o_pregao() {
+        let ontem = 1_789_000_000;
+        let hoje = ontem + 86_400;
+        let novo = herdar_acessorios(q(hoje, None, None), &q(ontem, Some(1e6), Some(11.0)));
+        assert_eq!(novo.volume, None);
+        assert_eq!(novo.max24, None);
+    }
+
+    #[test]
+    fn a_seta_diz_para_que_lado_foi_o_ultimo_movimento() {
+        assert_eq!(tick_entre(10.1, 10.0), Some(Tick::Subiu));
+        assert_eq!(tick_entre(9.9, 10.0), Some(Tick::Desceu));
+    }
+
+    /// Preço parado **não** apaga a seta: quem a apagasse faria a seta piscar por uma
+    /// volta e sumir, e ela existe justamente para ficar até o próximo movimento.
+    #[test]
+    fn preco_parado_nao_mexe_na_seta() {
+        assert_eq!(tick_entre(10.0, 10.0), None);
+    }
 
     #[test]
     fn recuo_dobra_e_para_no_teto() {

@@ -214,6 +214,65 @@ mod tests {
         assert!(conferidos >= 3, "só {conferidos} cartões foram conferidos");
     }
 
+    /// Toda linha tem tantas células quanto a tabela tem colunas.
+    ///
+    /// É o erro que uma coluna nova provoca e que nada no compilador pega: a seta de
+    /// momento entrou entre «PM» e «Atual» em Posições, e a linha de cabeçalho de grupo
+    /// — montada à mão, com células vazias contadas na unha — passou a pôr o total do
+    /// grupo na coluna do preço. Uma linha curta não estoura nada; ela só mostra o
+    /// número debaixo do rótulo errado.
+    #[test]
+    fn toda_linha_tem_uma_celula_por_coluna() {
+        let portfolio = carteira_cheia();
+        let market = MarketSnapshot::default();
+        let providers = providers_de_teste();
+        let ctx = ctx_de_teste(&portfolio, &market, &providers);
+
+        let mut conferidas = 0;
+        for modulo in todos() {
+            let mut panes = vec![modulo.open(&ctx, None).layout(&ctx)];
+            let mut tabelas: Vec<(&str, &Vec<String>, &Vec<crate::invest::module::Row>)> =
+                Vec::new();
+            for layout in &panes {
+                if let Some(Pane::Table { headers, rows, .. }) = layout.primeira_tabela() {
+                    tabelas.push((modulo.id(), headers, rows));
+                }
+            }
+            for (id, headers, rows) in &tabelas {
+                for (i, linha) in rows.iter().enumerate() {
+                    assert_eq!(
+                        linha.cells.len(),
+                        headers.len(),
+                        "{id}: linha {i} tem {} células para {} colunas — {:?}",
+                        linha.cells.len(),
+                        headers.len(),
+                        linha.cells
+                    );
+                    conferidas += 1;
+                }
+            }
+            panes.clear();
+            // E os cartões da home, que montam as linhas deles à parte.
+            for cartaz in modulo.cartazes(&ctx) {
+                let Some(Pane::Table { headers, rows, .. }) = cartaz.pane.as_ref() else {
+                    continue;
+                };
+                for (i, linha) in rows.iter().enumerate() {
+                    assert_eq!(
+                        linha.cells.len(),
+                        headers.len(),
+                        "{}: cartão, linha {i} com {} células para {} colunas",
+                        modulo.id(),
+                        linha.cells.len(),
+                        headers.len()
+                    );
+                    conferidas += 1;
+                }
+            }
+        }
+        assert!(conferidas > 20, "só {conferidas} linhas foram conferidas");
+    }
+
     /// Um id pode ser dividido — as dez telas de papéis dividem o mesmo —, mas então o
     /// nome tem que ser o mesmo também. Duas telas com um id e dois nomes fariam a mesma
     /// marca se apresentar de dois jeitos na lista, conforme de onde tivesse nascido.

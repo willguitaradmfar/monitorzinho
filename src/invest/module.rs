@@ -100,6 +100,9 @@ pub struct Ctx<'a> {
     /// Os disparos de alerta desde que a aba abriu, do mais recente para o mais antigo.
     /// Vêm do estado da aba e não do módulo, porque acontecem também com ele fechado.
     pub disparos: &'a [(u64, String)],
+    /// Para que lado o patrimônio inteiro andou na última leitura. A mesma seta das
+    /// cotações, sobre o único número da aba que não é de um papel só.
+    pub tick_do_patrimonio: Option<crate::invest::provider::Tick>,
     /// Há quanto tempo cada fonte externa respondeu — ver `InvestModule::buscado_em`.
     ///
     /// Um `&'static` no meio de referências emprestadas porque o registro é global: quem
@@ -692,6 +695,7 @@ pub fn ctx_de_teste<'a>(
     providers: &'a std::sync::Arc<crate::invest::provider::ProviderSet>,
 ) -> Ctx<'a> {
     Ctx {
+        tick_do_patrimonio: None,
         buscas: crate::invest::store::buscas(),
         patrimonio: &[],
         noticias: NOTICIAS_DE_TESTE.get_or_init(Default::default),

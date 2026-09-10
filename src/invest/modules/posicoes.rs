@@ -96,9 +96,13 @@ impl InvestModule for Posicoes {
             .iter()
             .take(8)
             .map(|l| {
+                let seta = crate::invest::modules::mercado::seta(ctx.market.tick(&l.posicao.ativo));
                 Row::new(vec![
                     l.posicao.ativo.short().to_string(),
-                    l.mercado_brl.map(calc::moeda).unwrap_or_else(|| "—".into()),
+                    format!(
+                        "{seta}{}",
+                        l.mercado_brl.map(calc::moeda).unwrap_or_else(|| "—".into())
+                    ),
                     l.variacao_pct.map(calc::pct).unwrap_or_else(|| "—".into()),
                 ])
                 .with_cell_tones(vec![
@@ -155,7 +159,7 @@ impl InvestModule for Posicoes {
 }
 
 /// Por que dimensão a tabela agrupa. Vira árvore quando não é plano.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Agrupamento {
     Plano,
     Classe,
@@ -261,12 +265,13 @@ impl Vista {
                 grupo_atual = Some(chave);
             }
 
+            let seta = crate::invest::modules::mercado::seta(ctx.market.tick(&l.posicao.ativo));
             let atual = match l.preco {
                 Some(p) => {
                     let origem = l.origem();
                     match origem.is_empty() {
-                        true => calc::preco(p),
-                        false => format!("{} {origem}", calc::preco(p)),
+                        true => format!("{seta}{}", calc::preco(p)),
+                        false => format!("{seta}{} {origem}", calc::preco(p)),
                     }
                 }
                 None => "—".to_string(),
@@ -733,6 +738,78 @@ mod tests {
         pr: &'a std::sync::Arc<crate::invest::provider::ProviderSet>,
     ) -> Ctx<'a> {
         crate::invest::module::ctx_de_teste(p, m, pr)
+    }
+
+    /// A linha de cabeçalho de grupo é montada à mão, com células vazias contadas na
+    /// unha — e por isso é a que desalinha quando uma coluna nasce no meio da tabela.
+    /// Foi o que a seta de momento fez: o total do grupo foi parar na coluna do preço.
+    #[test]
+    fn a_linha_de_grupo_tem_uma_celula_por_coluna_em_todo_agrupamento() {
+        use crate::invest::model::{Classe, Moeda, Position};
+        let portfolio = Portfolio {
+            posicoes: vec![
+                Position {
+                    fonte: "corretora-a".into(),
+                    conta: String::new(),
+                    ativo: AssetId::new(Market::B3, "PETR4"),
+                    classe: Classe::Acao,
+                    quantidade: 100.0,
+                    preco_medio: Some(30.0),
+                    moeda: Moeda::Brl,
+                    preco_manual: Some(40.0),
+                    preco_manual_em: Some(0),
+                    atualizado_em: 0,
+                    carteira: None,
+                },
+                Position {
+                    fonte: "corretora-b".into(),
+                    ativo: AssetId::new(Market::B3, "HGLG11"),
+                    classe: Classe::Fii,
+                    ..Position {
+                        fonte: String::new(),
+                        conta: String::new(),
+                        ativo: AssetId::new(Market::B3, "X"),
+                        classe: Classe::Acao,
+                        quantidade: 50.0,
+                        preco_medio: Some(150.0),
+                        moeda: Moeda::Brl,
+                        preco_manual: Some(160.0),
+                        preco_manual_em: Some(0),
+                        atualizado_em: 0,
+                        carteira: None,
+                    }
+                },
+            ],
+            ..Default::default()
+        };
+        let market = MarketSnapshot::default();
+        let providers = crate::invest::module::providers_de_teste();
+        let ctx = ctx_com(&portfolio, &market, &providers);
+
+        for agrupamento in [
+            Agrupamento::Plano,
+            Agrupamento::Classe,
+            Agrupamento::Corretora,
+            Agrupamento::Moeda,
+        ] {
+            let vista = Vista {
+                lista: Lista::default(),
+                form: None,
+                agrupamento,
+                confirmando_remocao: None,
+            };
+            let linhas = vista.ordenadas(&ctx);
+            let rows = vista.linhas_tabela(&ctx, &linhas);
+            assert!(!rows.is_empty(), "{agrupamento:?} não montou linha nenhuma");
+            for (i, r) in rows.iter().enumerate() {
+                assert_eq!(
+                    r.cells.len(),
+                    CABECALHO.len(),
+                    "{agrupamento:?}: linha {i} com {:?}",
+                    r.cells
+                );
+            }
+        }
     }
 
     fn form_preenchido() -> Formulario {

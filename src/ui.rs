@@ -125,6 +125,33 @@ fn shortcut_badge(key: Option<char>) -> Option<Line<'static>> {
     })
 }
 
+/// Separa a seta de momento do começo de um texto e a pinta por conta.
+///
+/// A seta diz para que lado o preço andou **entre uma leitura e a seguinte** — é o
+/// sinalizador de agora, e não a variação do dia, que continua onde sempre esteve.
+///
+/// Ela é colada no número, e não posta numa coluna própria: uma coluna separa a seta do
+/// valor que ela qualifica, e o olho tem que ir e voltar. Mas colada ela não pode herdar
+/// a cor da célula — um papel em alta no dia e caindo neste minuto tem a variação verde
+/// e a seta vermelha, e é exatamente esse desencontro que ela existe para mostrar. Por
+/// isso a cor é decidida aqui, no único lugar do programa que sabe de cor: quem monta a
+/// linha escreve `▲ 62,52` e não sabe de nada.
+fn com_seta(texto: &str, estilo: Style) -> Line<'static> {
+    let cor = match texto.chars().next() {
+        Some('▲') => palette::GREEN,
+        Some('▼') => palette::RED,
+        _ => return Line::styled(texto.to_string(), estilo),
+    };
+    let resto: String = texto.chars().skip(1).collect();
+    Line::from(vec![
+        Span::styled(
+            texto.chars().next().unwrap_or(' ').to_string(),
+            Style::default().fg(cor).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(resto, estilo),
+    ])
+}
+
 /// Bottom-border hint shown only in fullscreen (e.g. "Esc/q voltar").
 fn hint_line(text: &str) -> Line<'static> {
     Line::styled(format!(" {} ", text), Style::default().fg(palette::DIM)).right_aligned()
@@ -3681,7 +3708,7 @@ fn render_pane_table(
                     Some(cor) => mark_color(cor),
                     None => tone_color(r.cell_tones.get(i).copied().unwrap_or(r.tone)),
                 };
-                Cell::from(texto).style(Style::default().fg(cor))
+                Cell::from(com_seta(&texto, Style::default().fg(cor)))
             }));
             let linha = UiRow::new(celulas);
             match (marca, r.tone) {
@@ -4035,24 +4062,26 @@ fn render_pane_facts(
             // fatos não há coluna de estrela onde pôr uma, e meia linha colorida leria
             // como ênfase e não como marca.
             let marca = pintor.rotulo(&[rotulo, valor]);
-            Line::from(vec![
-                Span::styled(
-                    format!("{rotulo:<largura$}  "),
-                    match marca {
-                        Some(cor) => Style::default()
-                            .fg(mark_color(cor))
-                            .add_modifier(Modifier::BOLD),
-                        None => Style::default().fg(palette::DIM),
-                    },
-                ),
-                Span::styled(
-                    valor.clone(),
+            let mut spans = vec![Span::styled(
+                format!("{rotulo:<largura$}  "),
+                match marca {
+                    Some(cor) => Style::default()
+                        .fg(mark_color(cor))
+                        .add_modifier(Modifier::BOLD),
+                    None => Style::default().fg(palette::DIM),
+                },
+            )];
+            spans.extend(
+                com_seta(
+                    valor,
                     Style::default().fg(match marca {
                         Some(cor) => mark_color(cor),
                         None => tone_color(*tone),
                     }),
-                ),
-            ])
+                )
+                .spans,
+            );
+            Line::from(spans)
         })
         .collect();
     frame.render_widget(Paragraph::new(linhas), dentro);
@@ -4348,7 +4377,7 @@ fn render_pane_grid(
             estilo.add_modifier(Modifier::BOLD),
         )];
         if dentro_a >= 2 {
-            linhas.push(Line::styled(cortar(&celula.sub), estilo));
+            linhas.push(com_seta(&cortar(&celula.sub), estilo));
         }
         // A grandeza **some** quando não cabe inteira, em vez de aparecer cortada: um
         // número cortado não é um número aproximado, é outro número.

@@ -119,6 +119,7 @@ impl InvestModule for Indices {
                     };
                     // Taxa do Banco Central sai com «%»; preço sai como preço. Sem isso
                     // «0,0517» ao lado de «5,09» parece a mesma unidade e não é.
+                    let seta = crate::invest::modules::mercado::seta(ctx.market.tick(&ativo));
                     let valor = match mercado {
                         Market::Bcb => {
                             calc::pct_casas(q.preco, if ativo.symbol == "CDI" { 4 } else { 2 })
@@ -128,16 +129,16 @@ impl InvestModule for Indices {
                     match (q.anterior, mercado) {
                         (Some(a), Market::Bcb) => (
                             (*nome).to_string(),
-                            format!("{valor} ({})", calc::pp(q.preco - a)),
+                            format!("{seta}{valor} ({})", calc::pp(q.preco - a)),
                             Tone::Normal,
                         ),
                         _ => match q.variacao() {
                             Some(v) => (
                                 (*nome).to_string(),
-                                format!("{valor} {}", calc::pct(v)),
+                                format!("{seta}{valor} {}", calc::pct(v)),
                                 crate::invest::modules::heatmap::tom(Some(v)),
                             ),
-                            None => ((*nome).to_string(), valor, Tone::Normal),
+                            None => ((*nome).to_string(), format!("{seta}{valor}"), Tone::Normal),
                         },
                     }
                 })
@@ -204,12 +205,16 @@ impl ModuleView for Vista {
                 (Some(q), true) => {
                     // Uma série do Banco Central é uma **taxa**: sem o «%» ao lado,
                     // «0,0517» não diz o que é. E taxa diária precisa de quatro casas.
-                    let valor = match mercado {
-                        Market::Bcb => {
-                            calc::pct_casas(q.preco, if ativo.symbol == "CDI" { 4 } else { 2 })
+                    let valor = format!(
+                        "{}{}",
+                        crate::invest::modules::mercado::seta(ctx.market.tick(&ativo)),
+                        match mercado {
+                            Market::Bcb => {
+                                calc::pct_casas(q.preco, if ativo.symbol == "CDI" { 4 } else { 2 })
+                            }
+                            _ => calc::preco(q.preco),
                         }
-                        _ => calc::preco(q.preco),
-                    };
+                    );
                     // A variação contra a **leitura anterior**, e na unidade certa: um
                     // preço varia em porcento, uma taxa varia em pontos percentuais.
                     // «O IPCA caiu de 0,16 para 0,07» é −0,09 p.p., não −56%.

@@ -222,12 +222,26 @@ fn anunciados(
 fn ler(ativo: &AssetId, serie: &Value, agora: u64) -> Option<Quote> {
     let instantes = serie.get("timestamp")?.as_array()?;
     let cotacoes = serie.get("quotation")?.as_array()?;
-    let (em, preco) = instantes
+    let pontos: Vec<(u64, f64)> = instantes
         .iter()
         .zip(cotacoes)
         .filter_map(|(t, q)| Some((t.as_u64()?, q.get("close")?.as_f64()?)))
-        .max_by_key(|(t, _)| *t)?;
+        .collect();
+    let (em, preco) = pontos.iter().copied().max_by_key(|(t, _)| *t)?;
     let em = em.min(agora);
+    // Máxima e mínima **do dia**, tiradas da própria série de cinco minutos. As colunas
+    // ficavam vazias na maioria das linhas da tela de Cotações, e não porque faltasse
+    // dado: é que só a brapi e o Yahoo as preenchiam, e quem serve a B3 aqui é esta
+    // fonte. A Kinvo não publica os campos prontos, mas publica a série — e o máximo
+    // dela é o máximo do dia.
+    //
+    // São os fechamentos de cada barra de cinco minutos, então uma pavio que suba e
+    // volte dentro da mesma barra não entra. É por baixo, e é honesto: a alternativa era
+    // a coluna continuar vazia.
+    let (max24, min24) = pontos
+        .iter()
+        .map(|(_, p)| *p)
+        .fold((f64::MIN, f64::MAX), |(a, b), p| (a.max(p), b.min(p)));
     Some(Quote {
         ativo: ativo.clone(),
         fonte: "kinvo",
@@ -241,9 +255,11 @@ fn ler(ativo: &AssetId, serie: &Value, agora: u64) -> Option<Quote> {
         // O instante do dado, não o da busca. É o que faz a tela dizer «há 3 min» em vez
         // de «agora» para um preço que a fonte carimbou faz três minutos.
         em,
+        // A Kinvo não publica volume em nenhum dos endereços dela — a coluna fica vazia
+        // para o que vem daqui, e vazio é o que se sabe.
         volume: None,
-        max24: None,
-        min24: None,
+        max24: (max24 > f64::MIN).then_some(max24),
+        min24: (min24 < f64::MAX).then_some(min24),
     })
 }
 
@@ -287,6 +303,38 @@ fn serie(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// As colunas «Máx 24h» e «Mín 24h» ficavam vazias na maioria das linhas de
+    /// Cotações — não por falta de dado, mas porque só a brapi e o Yahoo preenchiam os
+    /// campos prontos, e quem serve a B3 aqui é esta fonte. A série intradiária tem a
+    /// resposta; era só olhar para ela.
+    #[test]
+    fn a_maxima_e_a_minima_do_dia_saem_da_propria_serie() {
+        let serie: Value = serde_json::from_str(
+            r#"{
+                "previousClose": 48.45,
+                "timestamp": [100, 200, 300],
+                "quotation": [{"close": 48.9}, {"close": 49.6}, {"close": 48.2}]
+            }"#,
+        )
+        .expect("json de teste");
+        let q = ler(&AssetId::new(Market::B3, "PETR4"), &serie, 1_000).expect("lê a cotação");
+        assert_eq!(q.max24, Some(49.6));
+        assert_eq!(q.min24, Some(48.2));
+        // O preço continua sendo o do carimbo mais recente, e não o maior nem o último.
+        assert_eq!(q.preco, 48.2);
+        // Volume esta fonte não publica em endereço nenhum, e vazio é o que se sabe.
+        assert_eq!(q.volume, None);
+    }
+
+    /// Uma série vazia não vira máxima zero: `0` numa coluna de preço se lê como um
+    /// preço, e um preço de zero é uma afirmação falsa.
+    #[test]
+    fn serie_sem_ponto_nenhum_nao_inventa_extremos() {
+        let serie: Value =
+            serde_json::from_str(r#"{"timestamp": [], "quotation": []}"#).expect("json de teste");
+        assert!(ler(&AssetId::new(Market::B3, "PETR4"), &serie, 1_000).is_none());
+    }
 
     #[test]
     fn cobre_a_b3_e_o_ibov_e_mais_nada() {

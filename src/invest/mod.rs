@@ -79,6 +79,10 @@ pub struct InvestState {
     /// Os proventos **anunciados** pelas empresas — sugestões, não registros. Ver
     /// `invest::provento`.
     pub anunciados: crate::invest::provento::Cache,
+    /// O patrimônio da leitura anterior, e para que lado ele andou desde ela. É a mesma
+    /// seta das cotações, sobre o único número da aba que não é de um papel só.
+    ultimo_patrimonio: Option<f64>,
+    tick_do_patrimonio: Option<crate::invest::provider::Tick>,
     modulos: Vec<Box<dyn InvestModule>>,
     /// A curva do patrimônio, um ponto por dia — ver `serie`.
     pub patrimonio: Vec<serie::Ponto>,
@@ -133,6 +137,8 @@ impl InvestState {
             historico: Default::default(),
             fundamentos: Default::default(),
             anunciados,
+            ultimo_patrimonio: None,
+            tick_do_patrimonio: None,
             modulos: modules::todos(),
             patrimonio: serie::load(),
             serie_gravada_em: 0,
@@ -157,6 +163,7 @@ impl InvestState {
             anunciados: &self.anunciados,
             calendario: &self.calendario,
             disparos: &self.disparos,
+            tick_do_patrimonio: self.tick_do_patrimonio,
             buscas: store::buscas(),
             agora: store::agora(),
             somente_leitura: self.somente_leitura,
@@ -293,8 +300,28 @@ impl InvestState {
     /// e nunca segura o mutex enquanto a tela desenha.
     pub fn atualizar_market(&mut self) {
         self.market = self.providers.snapshot();
+        self.marcar_tick_do_patrimonio();
         self.registrar_patrimonio();
         self.avaliar_alertas();
+    }
+
+    /// Para que lado o **patrimônio inteiro** andou nesta leitura.
+    ///
+    /// Mora aqui e não no retrato de mercado porque o retrato não conhece a carteira: o
+    /// total é a soma das posições, e quem tem as duas coisas na mão é este estado. É a
+    /// mesma seta das cotações, sobre o único número da aba que não é de um papel só.
+    fn marcar_tick_do_patrimonio(&mut self) {
+        let linhas = carteira::linhas(&self.portfolio, &self.market, store::agora());
+        let total = carteira::totais(&linhas).mercado;
+        if total <= 0.0 {
+            return;
+        }
+        if let Some(anterior) = self.ultimo_patrimonio
+            && let Some(t) = crate::invest::provider::tick_entre(total, anterior)
+        {
+            self.tick_do_patrimonio = Some(t);
+        }
+        self.ultimo_patrimonio = Some(total);
     }
 
     /// Confere as regras de alerta contra o retrato novo.
@@ -606,6 +633,8 @@ mod tests {
             cache,
             market: providers.snapshot(),
             providers,
+            ultimo_patrimonio: None,
+            tick_do_patrimonio: None,
             modulos: modules::todos(),
             patrimonio: Vec::new(),
             serie_gravada_em: 0,

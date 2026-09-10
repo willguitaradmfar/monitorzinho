@@ -76,7 +76,11 @@ impl InvestModule for Patrimonio {
         let t = carteira::totais(&linhas);
         let mut rows = vec![(
             "patrimônio".into(),
-            format!("R$ {}", calc::moeda(t.mercado)),
+            format!(
+                "{}R$ {}",
+                crate::invest::modules::mercado::seta(ctx.tick_do_patrimonio),
+                calc::moeda(t.mercado)
+            ),
             Tone::Destaque,
         )];
         if t.custo != 0.0 {
@@ -511,7 +515,11 @@ impl Vista {
 
         let mut fatos = vec![(
             "patrimônio".into(),
-            format!("R$ {}", calc::moeda(t.mercado)),
+            format!(
+                "{}R$ {}",
+                crate::invest::modules::mercado::seta(ctx.tick_do_patrimonio),
+                calc::moeda(t.mercado)
+            ),
             Tone::Destaque,
         )];
         // O custo só entra quando **todas** as posições o informam. Somar o custo de

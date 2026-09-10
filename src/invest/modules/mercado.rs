@@ -8,11 +8,41 @@
 use crate::invest::calc;
 use crate::invest::model::AssetId;
 use crate::invest::module::{Ctx, Row, Tone};
-use crate::invest::provider::Quote;
+use crate::invest::provider::{Quote, Tick};
 use crate::invest::tempo;
 
 /// As colunas de uma tabela de cotação.
 pub const CABECALHO: [&str; 6] = ["Ativo", "Último", "Var%", "Máx 24h", "Mín 24h", "Volume"];
+
+/// Os índices das colunas, por nome.
+///
+/// Um número solto quebra calado quando uma coluna nasce no meio — e uma nasceu: a seta
+/// de momento entrou entre o ativo e o preço, e quatro testes passaram a conferir a
+/// célula errada sem que nada no compilador reclamasse.
+#[cfg(test)]
+pub const COL_ATIVO: usize = 0;
+#[cfg(test)]
+pub const COL_PRECO: usize = 1;
+#[cfg(test)]
+pub const COL_VAR: usize = 2;
+#[cfg(test)]
+pub const COL_VOLUME: usize = 5;
+
+/// A seta do último movimento, colada na frente do número a que ela se refere.
+///
+/// Colada, e não numa coluna própria: uma coluna separa a seta do valor que ela
+/// qualifica, e o olho tem que ir e voltar. Ela **é** parte do número.
+///
+/// Devolve texto e não cor porque quem pinta é o desenho: a seta tem cor própria — verde
+/// sobe, vermelho desce — e ela não pode herdar o tom da célula, senão diria a coisa
+/// errada num papel que está em alta no dia e caindo neste minuto. Ver `ui::com_seta`.
+pub fn seta(tick: Option<Tick>) -> &'static str {
+    match tick {
+        Some(Tick::Subiu) => "▲ ",
+        Some(Tick::Desceu) => "▼ ",
+        None => "",
+    }
+}
 
 /// Uma linha de cotação, com a regra de cor que vale em toda a aba.
 ///
@@ -69,7 +99,8 @@ pub fn linha(
     // número. Antes ela só aparecia na coluna de volume, e só nos ativos sem volume: os
     // que tinham volume não diziam de quando era o preço.
     let preco = format!(
-        "{} {origem}·{}",
+        "{}{} {origem}·{}",
+        seta(ctx.market.tick(ativo)),
         calc::preco(q.preco),
         tempo::idade(q.idade(agora))
     );
@@ -224,10 +255,10 @@ mod tests {
         let ativo = AssetId::new(Market::B3, "PETR4");
         let q = quote(Grade::Manual, 38.42, Some(38.0));
         let r = com_ctx!(|ctx| linha(&ativo, Some(&q), true, 0, ctx));
-        assert!(r.cells[2].is_empty(), "informado não mostra variação");
-        assert_eq!(r.cell_tones[2], Tone::Dim);
+        assert!(r.cells[COL_VAR].is_empty(), "informado não mostra variação");
+        assert_eq!(r.cell_tones[COL_VAR], Tone::Dim);
         assert!(
-            r.cells[1].contains("manual"),
+            r.cells[COL_PRECO].contains("manual"),
             "a origem fica visível na coluna"
         );
     }
@@ -242,7 +273,7 @@ mod tests {
             0,
             ctx
         ));
-        assert_eq!(sobe.cell_tones[2], Tone::Bom);
+        assert_eq!(sobe.cell_tones[COL_VAR], Tone::Bom);
         let cai = com_ctx!(|ctx| linha(
             &ativo,
             Some(&quote(Grade::AoVivo, 37.0, Some(38.0))),
@@ -250,7 +281,7 @@ mod tests {
             0,
             ctx
         ));
-        assert_eq!(cai.cell_tones[2], Tone::Ruim);
+        assert_eq!(cai.cell_tones[COL_VAR], Tone::Ruim);
     }
 
     #[test]
@@ -260,11 +291,11 @@ mod tests {
         // e ela ainda não respondeu, a linha diz «buscando» — as duas coisas são
         // diferentes, e trocá-las fazia a tela se contradizer em dois segundos.
         let r = com_ctx!(|ctx| linha(&ativo, None, false, 0, ctx));
-        assert_eq!(r.cells[1], "—");
+        assert_eq!(r.cells[COL_PRECO], "—");
         assert!(
-            r.cells[5].contains("buscando"),
+            r.cells[COL_VOLUME].contains("buscando"),
             "com fonte cobrindo, a linha tem que dizer que está buscando: «{}»",
-            r.cells[5]
+            r.cells[COL_VOLUME]
         );
     }
 
@@ -273,8 +304,8 @@ mod tests {
         let ativo = AssetId::new(Market::B3, "PETR4");
         let minha = com_ctx!(|ctx| linha(&ativo, None, true, 0, ctx));
         let outra = com_ctx!(|ctx| linha(&ativo, None, false, 0, ctx));
-        assert!(minha.cells[0].starts_with('●'));
-        assert!(!outra.cells[0].starts_with('●'));
+        assert!(minha.cells[COL_ATIVO].starts_with('●'));
+        assert!(!outra.cells[COL_ATIVO].starts_with('●'));
     }
 
     #[test]
@@ -285,15 +316,15 @@ mod tests {
         let q = quote(Grade::AoVivo, 38.42, None);
         let parada = com_ctx!(|ctx| linha(&ativo, Some(&q), true, 600, ctx));
         assert!(
-            parada.cells[1].contains("há 10 min"),
+            parada.cells[COL_PRECO].contains("há 10 min"),
             "deu «{}»",
-            parada.cells[1]
+            parada.cells[COL_PRECO]
         );
         let fresca = com_ctx!(|ctx| linha(&ativo, Some(&q), true, 0, ctx));
         assert!(
-            fresca.cells[1].contains("agora"),
+            fresca.cells[COL_PRECO].contains("agora"),
             "deu «{}»",
-            fresca.cells[1]
+            fresca.cells[COL_PRECO]
         );
     }
 
@@ -301,6 +332,10 @@ mod tests {
     fn sem_preco_nenhum_a_linha_nao_inventa_idade() {
         let ativo = AssetId::new(Market::B3, "PETR4");
         let r = com_ctx!(|ctx| linha(&ativo, None, true, 600, ctx));
-        assert!(!r.cells[1].contains("há "), "deu «{}»", r.cells[1]);
+        assert!(
+            !r.cells[COL_PRECO].contains("há "),
+            "deu «{}»",
+            r.cells[COL_PRECO]
+        );
     }
 }

@@ -222,7 +222,11 @@ fn celula(c: &Caixa, ctx: &Ctx, modo: Tamanho) -> Cell {
     Cell {
         label: c.ativo.short().to_string(),
         sub: match c.variacao {
-            Some(v) => calc::pct(v),
+            Some(v) => format!(
+                "{}{}",
+                crate::invest::modules::mercado::seta(ctx.market.tick(&c.ativo)),
+                calc::pct(v)
+            ),
             None => ctx
                 .market
                 .quote(&c.ativo)
