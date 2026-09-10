@@ -509,6 +509,17 @@ pub trait InvestModule: Send + Sync {
         None
     }
 
+    /// A fonte do **cartão**, quando ela não é a mesma da tela aberta.
+    ///
+    /// O padrão é ser a mesma, e quase sempre é. Gráfico e Fundamentos são a exceção: a
+    /// tela deles vive da série e dos múltiplos, mas o cartão é a lista de **quais**
+    /// papéis têm um e outro, com o preço de cada um ao lado — nada de série nem de
+    /// múltiplo é buscado para desenhá-lo. A idade que vale ali é a do preço, e declarar
+    /// a outra faria o cartão dizer «nunca buscado» por cima de preços ao vivo.
+    fn fonte_do_cartao(&self) -> Option<&'static str> {
+        self.fonte_externa()
+    }
+
     /// Que marcas a lista deste módulo aceita — `None` quando não é uma lista de coisas
     /// que se acompanha.
     ///

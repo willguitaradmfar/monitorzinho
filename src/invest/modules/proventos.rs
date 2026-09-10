@@ -208,7 +208,7 @@ impl Vista {
     ///
     /// **Sugestão, e a tela diz isso.** O valor mostrado usa a quantidade de hoje, que não
     /// é necessariamente a que se tinha na data-com — quem comprou depois não recebeu
-    /// nada, e quem tinha o dobro recebeu o dobro. Por isso `Ctrl+I` **abre o formulário
+    /// nada, e quem tinha o dobro recebeu o dobro. Por isso o `Enter` **abre o formulário
     /// preenchido** em vez de gravar direto: o número passa por quem sabe.
     fn anunciados(&self, ctx: &Ctx) -> Pane {
         let pendentes = ctx.anunciados.pendentes();
@@ -404,8 +404,9 @@ impl ModuleView for Vista {
                                empresa declarou por cota e quando. O que ela não sabe é \n\
                                quanto você tinha na data-com — e sem isso o valor recebido \n\
                                seria um palpite gravado como fato.\n\n\
-                               Ctrl+I abre o formulário já preenchido com a estimativa; \n\
-                               quem confirma é você. Ctrl+A adiciona um do zero.\n\n\
+                               Tab põe o cursor nesta lista e Enter abre o formulário \n\
+                               já preenchido com a estimativa; quem confirma é você. \n\
+                               Ctrl+A adiciona um do zero.\n\n\
                                O tipo importa e não é cosmético: dividendo é isento, JCP \n\
                                tem 15% retido na fonte, e amortização é devolução de \n\
                                capital — que reduz o preço médio. O programa avisa; quem \n\

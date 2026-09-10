@@ -4212,7 +4212,7 @@ impl App {
             .flat_map(|m| {
                 let resumo = m.summary(&ctx);
                 let alvo = m.marcavel();
-                let fonte = m.fonte_externa();
+                let fonte = m.fonte_do_cartao();
                 // Um módulo pode pôr mais de um cartão — ver `InvestModule::cartazes`.
                 m.cartazes(&ctx).into_iter().map(move |mut c| {
                     // O painel nasce sem título: quem manda no título é a home. Titular

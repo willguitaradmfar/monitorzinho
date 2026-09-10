@@ -99,6 +99,22 @@ Três coisas mudaram em `epoch_de_iso`:
 o instante nulo é relida na abertura. Quem tinha 215 notícias sem data abre a versão nova
 com zero, sem esperar o feed republicar nada.
 
+## O que o selo denunciou na primeira hora de uso
+
+Proventos dizia **«nunca buscado»**, e estava certo. O cache de anúncios é semeado do
+disco na abertura, `get` só busca o que ainda não é chave do mapa — e depois da primeira
+execução todo ativo da carteira já era chave. Nenhum era rebuscado. Nem naquela execução,
+nem em nenhuma futura: **quem tivesse rodado o programa uma vez nunca mais veria um
+anúncio novo**, e nada na tela dizia isso.
+
+A semente é dado, não recibo: ela diz o que se sabe, não quando se soube. Agora `get`
+pergunta ao registro de buscas, e uma lista com mais de um dia — ou sem registro nenhum,
+que é o caso de toda instalação que sobe para esta versão — é rebuscada uma vez por
+execução.
+
+É o primeiro uso concreto do selo, e vale registrar por isso: a defasagem invisível
+escondia um cache congelado havia semanas.
+
 ## Como testar
 
 ### 1. A idade da consulta em toda parte
@@ -136,7 +152,14 @@ Derrube a rede e espere. **Esperado:** o selo **para de avançar** e amarela na 
 hora; ele não volta para `agora` a cada tentativa falha. O rodapé de Cotações continua
 dizendo qual fonte caiu e por quê.
 
-### 5. Notícias com data
+### 5. Proventos rebusca quando envelhece
+
+Abra Proventos. **Esperado:** o selo sai de «nunca buscado» e vira uma idade de verdade
+em alguns segundos, e a tabela `busca` ganha a linha `anunciado`. Feche e reabra dentro
+do mesmo dia: **não** rebusca (o selo mostra a idade acumulada). Mais de 24 h depois,
+rebusca uma vez.
+
+### 6. Notícias com data
 
 Abra Notícias. **Esperado:** nenhuma linha com «sem data», e a coluna *Quando* em ordem
 decrescente de verdade.
@@ -161,3 +184,6 @@ Há teste ao vivo contra os cinco endereços:
 - Preço sem idade ao lado em qualquer módulo
 - «sem data» voltando em Notícias
 - Uma notícia da manhã acima de uma da tarde (o fuso voltou a ser ignorado)
+- Proventos preso em «nunca buscado» depois de aberto (o cache voltou a congelar)
+- O cartão de Gráfico ou de Fundamentos dizendo «nunca buscado» sobre preços ao vivo — o
+  cartão deles é uma lista de papéis com o **preço** ao lado, e a idade dali é a do preço

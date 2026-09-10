@@ -37,6 +37,12 @@ impl InvestModule for Grafico {
         Group::Mercado
     }
 
+    /// O cartão é uma lista de papéis com o **preço** de cada um; nada daqui é buscado
+    /// para desenhá-lo.
+    fn fonte_do_cartao(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::COTACAO)
+    }
+
     fn fonte_externa(&self) -> Option<&'static str> {
         Some(crate::invest::store::fonte::HISTORICO)
     }
