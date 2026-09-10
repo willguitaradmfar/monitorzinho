@@ -33,11 +33,46 @@ pub struct Yahoo {
     cursor: std::sync::atomic::AtomicUsize,
 }
 
-/// O símbolo como o Yahoo o chama: ação brasileira leva o sufixo `.SA`.
-fn simbolo(ativo: &AssetId) -> String {
+/// Os índices macro que o Yahoo serve, do nome curto que a aba usa para o símbolo dele.
+///
+/// Eles moram em `Market::Outro` e **continuam lá**, pelo mesmo motivo do Ibovespa na
+/// Kinvo: o mercado faz parte da chave gravada, e mudá-lo apagaria o valor informado à
+/// mão por quem já acompanhava o indicador antes de ele ganhar fonte.
+///
+/// Os nomes curtos são os que já estavam publicados — `SPX`, `DXY`, `VIX`, `UST10Y` — e
+/// os novos seguem a mesma forma. O que o Yahoo chama de `DX-Y.NYB` ninguém digita.
+const MACRO: &[(&str, &str)] = &[
+    ("SPX", "^GSPC"),
+    ("NDX", "^NDX"),
+    ("VIX", "^VIX"),
+    ("DXY", "DX-Y.NYB"),
+    ("UST10Y", "^TNX"),
+    ("BRENT", "BZ=F"),
+    ("OURO", "GC=F"),
+];
+
+// O que **não** está aqui, e por quê:
+//
+// * `2YY=F`, o Treasury de 2 anos — é um futuro de taxa, e futuro rola de contrato.
+//   Medido em 10/09/2026, a chamada de um dia dava 4,404 e a de cinco dias terminava em
+//   4,18: dois números do mesmo símbolo. Ele vem do FRED, que publica a taxa e não um
+//   contrato sobre ela.
+// * `TIO=F`, o minério de ferro — o mesmo problema, e pior: a chamada de um dia dava
+//   161,91 e a de cinco dias terminava em 99,37. Não há símbolo livre que dê uma série
+//   coerente de minério, então ele fica **de fora** em vez de entrar com um número que
+//   não se sustenta.
+
+/// O símbolo como o Yahoo o chama: ação brasileira leva o sufixo `.SA`, e um índice
+/// macro tem nome próprio — ver `MACRO`.
+fn simbolo(ativo: &AssetId) -> Option<String> {
     match ativo.market {
-        Market::B3 => format!("{}.SA", ativo.symbol),
-        _ => ativo.symbol.clone(),
+        Market::B3 => Some(format!("{}.SA", ativo.symbol)),
+        Market::Us => Some(ativo.symbol.clone()),
+        Market::Outro => MACRO
+            .iter()
+            .find(|(curto, _)| *curto == ativo.symbol)
+            .map(|(_, yahoo)| (*yahoo).to_string()),
+        _ => None,
     }
 }
 
@@ -91,7 +126,7 @@ impl Provider for Yahoo {
     }
 
     fn covers(&self, ativo: &AssetId) -> bool {
-        matches!(ativo.market, Market::B3 | Market::Us)
+        simbolo(ativo).is_some()
     }
 
     fn is_open(&self, ativo: &AssetId, agora: u64) -> bool {
@@ -126,12 +161,14 @@ impl Provider for Yahoo {
 
         for i in 0..quantos {
             let ativo = &ativos[(inicio + i) % ativos.len()];
+            let Some(simbolo) = simbolo(ativo) else {
+                continue;
+            };
             if i > 0 {
                 std::thread::sleep(ENTRE_PEDIDOS);
             }
             let url = format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=1d",
-                simbolo(ativo)
+                "https://query1.finance.yahoo.com/v8/finance/chart/{simbolo}?interval=1d&range=1d"
             );
             let valor = match feed::get_json(&url) {
                 Ok(v) => v,
@@ -216,9 +253,9 @@ impl Provider for Yahoo {
             Span::Ano => "1y",
             Span::CincoAnos => "5y",
         };
+        let simbolo = simbolo(ativo)?;
         Some(historico(&format!(
-            "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range={range}",
-            simbolo(ativo)
+            "https://query1.finance.yahoo.com/v8/finance/chart/{simbolo}?interval=1d&range={range}"
         )))
     }
 
@@ -239,8 +276,21 @@ mod tests {
 
     #[test]
     fn acao_brasileira_ganha_o_sufixo_do_yahoo() {
-        assert_eq!(simbolo(&AssetId::new(Market::B3, "PETR4")), "PETR4.SA");
-        assert_eq!(simbolo(&AssetId::new(Market::Us, "AAPL")), "AAPL");
+        assert_eq!(
+            simbolo(&AssetId::new(Market::B3, "PETR4")).as_deref(),
+            Some("PETR4.SA")
+        );
+        assert_eq!(
+            simbolo(&AssetId::new(Market::Us, "AAPL")).as_deref(),
+            Some("AAPL")
+        );
+        // Os índices macro têm nome próprio, e um nome que não está na lista não vira
+        // símbolo nenhum — senão o provedor pediria `CDB9261WNPX` ao Yahoo.
+        assert_eq!(
+            simbolo(&AssetId::new(Market::Outro, "DXY")).as_deref(),
+            Some("DX-Y.NYB")
+        );
+        assert_eq!(simbolo(&AssetId::new(Market::Outro, "CDB123")), None);
     }
 
     #[test]

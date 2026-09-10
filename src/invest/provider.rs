@@ -307,11 +307,28 @@ fn herdar_acessorios(mut q: Quote, anterior: &Quote) -> Quote {
 pub struct MarketSnapshot {
     pub quotes: HashMap<AssetId, Quote>,
     pub fontes: Vec<StatusFonte>,
+    /// Quando **chegou** a cotação de cada ativo, que é outra coisa que `Quote::em`.
+    ///
+    /// `em` é a hora do dado — o último negócio, ou o dia de referência de uma série do
+    /// Banco Central, que pode ser do mês passado. Isto é a hora em que a resposta
+    /// entrou, e é o que responde «esta linha está sendo atualizada?». Um IPCA de julho
+    /// buscado há dez segundos é um dado velho e uma leitura nova, e as duas coisas
+    /// precisam caber na mesma tela sem se confundirem.
+    ///
+    /// Fora da `Quote` de propósito: um provedor não sabe quando a resposta dele foi
+    /// aceita — pode nem ter sido, se outra fonte melhor tinha respondido antes.
+    pub recebido: HashMap<AssetId, u64>,
 }
 
 impl MarketSnapshot {
     pub fn quote(&self, ativo: &AssetId) -> Option<&Quote> {
         self.quotes.get(ativo)
+    }
+
+    /// Há quanto tempo a cotação deste ativo chegou. `None` para o que veio do cache de
+    /// disco e ainda não foi rebuscado nesta execução — ali não houve leitura nenhuma.
+    pub fn idade_da_leitura(&self, ativo: &AssetId, agora: u64) -> Option<u64> {
+        self.recebido.get(ativo).map(|em| agora.saturating_sub(*em))
     }
 
     /// Converte para BRL. `None` quando não há como — e aí a linha fica de fora do total
@@ -378,7 +395,7 @@ impl ProviderSet {
                         // O cache não guarda a fonte: ele existe para a aba abrir com
                         // números, e o provedor que os deu pode nem estar neste build.
                         fonte: "cache",
-                        ativo,
+                        ativo: ativo.clone(),
                         preco: c.preco,
                         anterior: c.anterior,
                         moeda,
@@ -389,6 +406,12 @@ impl ProviderSet {
                         min24: None,
                     },
                 );
+                // A idade da leitura atravessa o desligamento junto com o preço: quem
+                // reabre o programa vê «há 8 h» na coluna, e não uma linha muda sobre
+                // um número de ontem.
+                if let Some(gravado) = c.gravado_em {
+                    inicial.recebido.insert(ativo, gravado);
+                }
             }
         }
 
@@ -614,12 +637,38 @@ impl ProviderSet {
             // junto, mesmo havendo outra logo atrás que sabe respondê-lo.
             let mut pendentes: Vec<AssetId> = ativos.clone();
 
+            // Quem ainda **não tem cotação nenhuma** — para eles irem na frente logo
+            // abaixo.
+            let sem_nada: Vec<AssetId> = match self.snapshot.lock() {
+                Ok(s) => pendentes
+                    .iter()
+                    .filter(|a| !s.quotes.contains_key(*a))
+                    .cloned()
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+
             for provedor in &self.provedores {
-                let meus: Vec<AssetId> = pendentes
+                let cobertos: Vec<AssetId> = pendentes
                     .iter()
                     .filter(|a| provedor.covers(a))
                     .cloned()
                     .collect();
+                // **Buraco antes de refresco.** Um provedor que só busca alguns por volta
+                // — o Yahoo faz quatro por minuto, para não ser bloqueado — gastava a
+                // cota dele revisitando o que já tinha valor, e o rodízio levava dez
+                // minutos para chegar no último. Dez minutos de «buscando…» é
+                // indistinguível de quebrado. Enquanto houver linha vazia, a volta
+                // inteira é para ela; quando não houver, o rodízio volta ao normal.
+                let vazios: Vec<AssetId> = cobertos
+                    .iter()
+                    .filter(|a| sem_nada.contains(a))
+                    .cloned()
+                    .collect();
+                let meus = match vazios.is_empty() {
+                    true => cobertos,
+                    false => vazios,
+                };
                 if meus.is_empty() {
                     continue;
                 }
@@ -739,6 +788,9 @@ impl ProviderSet {
                     Some(anterior) => herdar_acessorios(q, anterior),
                     None => q,
                 };
+                // A hora em que **esta** resposta foi aceita. Marcada aqui e não no
+                // provedor porque só aqui se sabe que ela venceu a disputa de origem.
+                s.recebido.insert(q.ativo.clone(), agora);
                 s.quotes.insert(q.ativo.clone(), q);
             }
             // Uma fonte que não falou nesta volta mantém o que disse na anterior: sumir
@@ -776,6 +828,9 @@ impl ProviderSet {
                         anterior: q.anterior,
                         grade: q.grade.code().to_string(),
                         moeda: q.moeda.code().to_string(),
+                        // A hora da **leitura**, e não a do dado: é o que faz a próxima
+                        // abertura saber se o cache é de uma hora ou de uma semana.
+                        gravado_em: s.recebido.get(&q.ativo).copied(),
                     },
                 )
             })
@@ -818,6 +873,31 @@ pub fn dia_util_br(agora: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A regra que tirou o «buscando…» de dez minutos: com o provedor buscando poucos
+    /// por volta, a cota vai toda para as linhas vazias enquanto houver alguma.
+    #[test]
+    fn buraco_vem_antes_de_refresco() {
+        let a = |s: &str| AssetId::new(Market::Outro, s);
+        let cobertos = [a("SPX"), a("NDX"), a("VIX"), a("DXY")];
+        let sem_nada = [a("VIX"), a("DXY")];
+
+        let vazios: Vec<AssetId> = cobertos
+            .iter()
+            .filter(|x| sem_nada.contains(x))
+            .cloned()
+            .collect();
+        assert_eq!(vazios, vec![a("VIX"), a("DXY")]);
+
+        // E quando não há buraco nenhum, a volta é o rodízio inteiro outra vez.
+        let nenhum: Vec<AssetId> = Vec::new();
+        let vazios: Vec<AssetId> = cobertos
+            .iter()
+            .filter(|x| nenhum.contains(x))
+            .cloned()
+            .collect();
+        assert!(vazios.is_empty());
+    }
 
     /// A regressão que a falta de internet revelou: o provedor `informado` não faz I/O,
     /// roda de dois em dois segundos, cobre todo ativo e sempre devolve `Ok`. Com a rede

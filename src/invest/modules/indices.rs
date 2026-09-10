@@ -33,11 +33,31 @@ const MACRO: &[(&str, Market, &str)] = &[
     // o cobre. Ele continua em `Market::Outro` porque é onde nasceu e mudar o mercado
     // mudaria a chave gravada na carteira de quem já o acompanha.
     ("IBOV", Market::Outro, "Ibovespa"),
-    // Estes ainda não têm fonte sem chave. Ficam informados, e a tela diz isso.
+    // Os índices da B3 que não são o Ibovespa. Em `Market::B3` porque é o que eles são,
+    // e o Yahoo os serve com o sufixo `.SA` sem ninguém precisar mapear nada.
+    //
+    // Small caps e dividendos entram pelos **ETFs** que os seguem, e não pelos índices:
+    // o SMLL e o IDIV não têm cotação pública, o SMAL11 e o DIVO11 têm, e a forma da
+    // curva é a mesma. A tela diz qual é qual no nome.
+    ("IFIX", Market::B3, "IFIX (fundos imobiliários)"),
+    ("SMAL11", Market::B3, "Small caps (SMAL11)"),
+    ("DIVO11", Market::B3, "Dividendos (DIVO11)"),
+    // Os quatro que estavam aqui **só como informados** — e não precisavam estar: o
+    // Yahoo serve os quatro de graça. Continuam em `Market::Outro` porque é a chave que
+    // já estava gravada; quem os traduz é `providers::yahoo::MACRO`.
     ("SPX", Market::Outro, "S&P 500"),
+    ("NDX", Market::Outro, "Nasdaq 100"),
+    ("VIX", Market::Outro, "VIX (medo)"),
     ("DXY", Market::Outro, "Dólar (DXY)"),
-    ("VIX", Market::Outro, "VIX"),
     ("UST10Y", Market::Outro, "Treasury 10 anos"),
+    // Juro americano na fonte: o Yahoo só tem futuro de taxa, que rola de contrato e dá
+    // dois números diferentes para o mesmo símbolo. Ver `providers::fred`.
+    ("UST2Y", Market::Outro, "Treasury 2 anos"),
+    ("FEDFUNDS", Market::Outro, "Fed Funds"),
+    // Commodities que mexem com esta carteira: petróleo é PRIO3 e PETR4, e entra na
+    // inflação. O minério ficou de fora — não há símbolo livre com série coerente.
+    ("BRENT", Market::Outro, "Petróleo Brent"),
+    ("OURO", Market::Outro, "Ouro"),
 ];
 
 /// Todos os indicadores da tela: o catálogo do Banco Central primeiro — juro e inflação
@@ -246,6 +266,24 @@ impl ModuleView for Vista {
                     let (proximo, exato) =
                         crate::invest::modules::agenda::proximo_anuncio(&ativo.symbol, &hoje)
                             .unwrap_or_default();
+                    // «Data» é a do **dado** — o dia de referência de uma série do Banco
+                    // Central é do mês passado, e está certo. «Lido» é a da **leitura**:
+                    // responde «esta linha ainda está sendo buscada?», que a outra não
+                    // responde. Um IPCA de julho lido há dez segundos é um dado velho e
+                    // uma leitura nova, e as duas coisas cabem na mesma linha.
+                    // «do cache» **com a idade**: o valor veio do disco e ainda não foi
+                    // rebuscado nesta execução, e o que se quer saber é se aquele disco é
+                    // de uma hora ou de uma semana. Sem idade nenhuma só quando nem o
+                    // carimbo existe — gravado por uma versão que ainda não o anotava.
+                    let da_leitura = ctx.market.idade_da_leitura(&ativo, ctx.agora);
+                    let do_cache = q.fonte == "cache";
+                    let lido = match (da_leitura, do_cache) {
+                        (Some(s), true) => {
+                            format!("do cache · {}", crate::invest::tempo::idade(s))
+                        }
+                        (Some(s), false) => crate::invest::tempo::idade(s),
+                        (None, _) => "do cache".into(),
+                    };
                     vivos.push(
                         Row::new(vec![
                             nome.to_string(),
@@ -256,6 +294,7 @@ impl ModuleView for Vista {
                                 crate::invest::tempo::BRT_OFFSET,
                             )
                             .longa(),
+                            lido,
                             match (proximo.is_empty(), exato) {
                                 (true, _) => String::new(),
                                 // Uma janela de costume não pode parecer uma data marcada.
@@ -267,6 +306,7 @@ impl ModuleView for Vista {
                             Tone::Normal,
                             Tone::Destaque,
                             tom,
+                            Tone::Dim,
                             Tone::Dim,
                             match exato {
                                 true => Tone::Normal,
@@ -281,6 +321,7 @@ impl ModuleView for Vista {
                         "—".into(),
                         String::new(),
                         "buscando…".into(),
+                        String::new(),
                         String::new(),
                     ],
                     Tone::Dim,
@@ -306,6 +347,7 @@ impl ModuleView for Vista {
                         "Agora".into(),
                         "Contra a leitura anterior".into(),
                         "Data".into(),
+                        "Lido".into(),
                         "Próximo anúncio".into(),
                     ],
                     rows: vivos,

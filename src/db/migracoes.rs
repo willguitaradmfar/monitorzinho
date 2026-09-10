@@ -69,6 +69,11 @@ pub const TODAS: &[Migracao] = &[
         nome: "0002_busca",
         sql: include_str!("migracoes/0002_busca.sql"),
     },
+    Migracao {
+        versao: 3,
+        nome: "0003_cotacao_gravada_em",
+        sql: include_str!("migracoes/0003_cotacao_gravada_em.sql"),
+    },
 ];
 
 /// A maior versão que este binário sabe alcançar.

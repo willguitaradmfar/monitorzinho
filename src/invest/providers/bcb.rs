@@ -75,6 +75,15 @@ pub const SERIES: &[Serie] = &[
         nome: "IPCA (mensal)",
         diaria: false,
     },
+    // O acumulado de doze meses, que é o número que se cita: «a inflação está em 4,4%».
+    // O mensal sozinho não responde isso — 0,07% num mês não diz nada sobre o ano.
+    // [{"data":"01/07/2026","valor":"4.44"}]
+    Serie {
+        simbolo: "IPCA12",
+        codigo: 13522,
+        nome: "IPCA (12 meses)",
+        diaria: false,
+    },
     // [{"data":"01/08/2026","valor":"-0.22"}]
     Serie {
         simbolo: "IGPM",

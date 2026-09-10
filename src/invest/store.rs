@@ -449,6 +449,14 @@ pub fn save_mru(mru: &Mru) {
 pub struct CachedQuote {
     pub preco: f64,
     pub em: u64,
+    /// Quando esta leitura foi **gravada**, que é outra coisa que `em`. `em` é a hora do
+    /// dado — o dia de referência de uma série do Banco Central é do mês passado, e está
+    /// certo. Isto é a hora em que ela entrou, e é o que responde «este cache é de
+    /// quando?» antes de a busca dar a primeira volta.
+    ///
+    /// `None` no que foi gravado por uma versão que ainda não anotava isso.
+    #[serde(default)]
+    pub gravado_em: Option<u64>,
     #[serde(default)]
     pub anterior: Option<f64>,
     #[serde(default)]
@@ -498,7 +506,7 @@ pub fn load_cache() -> Cache {
     let agora = agora() as i64;
     db::ler(Cache::new(), |conn| {
         let mut stmt = conn.prepare(
-            "SELECT ativo, preco, anterior, em, grade, moeda FROM cotacao
+            "SELECT ativo, preco, anterior, em, grade, moeda, gravado_em FROM cotacao
              WHERE ?1 - em <= CASE grade WHEN 'fechamento' THEN ?2 ELSE ?3 END",
         )?;
         // Os dois tetos vêm de `validade`, e não repetidos aqui: o `CASE` do SQL escolhe
@@ -519,6 +527,7 @@ pub fn load_cache() -> Cache {
                         em: row.get::<_, i64>(3)? as u64,
                         grade: row.get(4)?,
                         moeda: row.get(5)?,
+                        gravado_em: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
                     },
                 ))
             },
@@ -530,11 +539,12 @@ pub fn load_cache() -> Cache {
 pub fn save_cache(cache: &Cache) {
     db::escrever(|conn| {
         let mut stmt = conn.prepare(
-            "INSERT INTO cotacao (ativo, preco, anterior, em, grade, moeda)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO cotacao (ativo, preco, anterior, em, grade, moeda, gravado_em)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(ativo) DO UPDATE SET
                  preco = excluded.preco, anterior = excluded.anterior,
-                 em = excluded.em, grade = excluded.grade, moeda = excluded.moeda",
+                 em = excluded.em, grade = excluded.grade, moeda = excluded.moeda,
+                 gravado_em = excluded.gravado_em",
         )?;
         for (ativo, q) in cache {
             if !q.preco.is_finite() {
@@ -547,6 +557,7 @@ pub fn save_cache(cache: &Cache) {
                 q.em as i64,
                 &q.grade,
                 &q.moeda,
+                q.gravado_em.map(|v| v as i64),
             ))?;
         }
         Ok(())
@@ -1133,6 +1144,7 @@ mod tests {
                             em: row.get::<_, i64>(3)? as u64,
                             grade: row.get(4)?,
                             moeda: row.get(5)?,
+                            gravado_em: None,
                         },
                     ))
                 },

@@ -4,6 +4,7 @@ pub mod bcb;
 pub mod binance;
 pub mod brapi;
 pub mod cambio;
+pub mod fred;
 pub mod kinvo;
 pub mod manual;
 pub mod yahoo;
@@ -35,6 +36,7 @@ pub fn todos(manuais: Arc<Mutex<HashMap<AssetId, (f64, u64)>>>) -> Vec<Box<dyn P
         Box::new(binance::Binance::default()),
         Box::new(cambio::Cambio),
         Box::new(bcb::Bcb),
+        Box::new(fred::Fred),
         Box::new(manual::Manual::new(manuais)),
     ]
 }
