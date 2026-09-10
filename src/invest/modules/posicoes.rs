@@ -107,18 +107,30 @@ impl InvestModule for Posicoes {
                         ),
                         l.mercado_brl.map(calc::moeda).unwrap_or_else(|| "—".into())
                     ),
-                    l.variacao_pct.map(calc::pct).unwrap_or_else(|| "—".into()),
+                    // O P&L, e não a variação do dia: o cartão já ordena por valor, e
+                    // «quanto esta posição rendeu» é a pergunta que sobra depois de
+                    // «quanto ela vale». Sem preço médio informado não há resposta, e a
+                    // linha diz «—» em vez de fingir zero.
+                    format!(
+                        "{}{}",
+                        crate::invest::modules::mercado::seta_de(
+                            &l.posicao.ativo,
+                            "pnl",
+                            l.pnl_brl
+                        ),
+                        l.pnl_pct.map(calc::pct).unwrap_or_else(|| "—".into())
+                    ),
                 ])
                 .with_cell_tones(vec![
                     Tone::Normal,
                     Tone::Normal,
-                    crate::invest::modules::heatmap::tom(l.variacao_pct),
+                    crate::invest::modules::heatmap::tom(l.pnl_pct),
                 ])
             })
             .collect();
         Some(Pane::Table {
             title: String::new(),
-            headers: vec!["Ativo".into(), "Valor".into(), "No dia".into()],
+            headers: vec!["Ativo".into(), "Valor".into(), "P&L".into()],
             rows,
             selected: None,
             query: String::new(),

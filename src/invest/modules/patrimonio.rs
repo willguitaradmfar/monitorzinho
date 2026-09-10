@@ -398,12 +398,41 @@ impl Vista {
         linhas
     }
 
-    /// O total de patrimônio no fim de cada um dos últimos seis meses.
+    /// O total de patrimônio no fim de cada uma das últimas oito semanas.
+    ///
+    /// O degrau que faltava entre o dia e o mês. Sete dias mostram o ruído da semana e
+    /// seis meses escondem tudo o que acontece dentro de um; a semana é a escala em que
+    /// um aporte ou um tombo aparecem como um degrau e não como um solavanco.
+    ///
+    /// Cada ponto é a **sexta-feira** daquela semana — o último pregão dela —, e o da
+    /// semana corrente é hoje, que ainda não fechou.
+    fn semanal(&self, ctx: &Ctx) -> Pane {
+        let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
+        let base = tempo::dias_de(hoje.ano, hoje.mes, hoje.dia);
+        // Distância até a sexta-feira desta semana: `dia_da_semana` dá 0 no domingo, e a
+        // sexta é o 5.
+        let ate_sexta = 5 - hoje.dia_da_semana() as i64;
+        let semanas: Vec<(String, Data)> = (0..8)
+            .rev()
+            .map(|i| {
+                let sexta = tempo::data_de_dias(base + ate_sexta - i * 7);
+                // A semana corrente não fechou: o ponto dela é hoje.
+                let d = match base + ate_sexta - i * 7 > base {
+                    true => hoje,
+                    false => sexta,
+                };
+                (format!("{:02}/{:02}", d.dia, d.mes), d)
+            })
+            .collect();
+        self.grafico(ctx, "Patrimônio semana a semana · 8 semanas", semanas)
+    }
+
+    /// O total de patrimônio no fim de cada um dos últimos doze meses.
     fn mensal(&self, ctx: &Ctx) -> Pane {
         let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
         let mut meses: Vec<(String, Data)> = Vec::new();
         let mut m = hoje;
-        for _ in 0..6 {
+        for _ in 0..12 {
             // O fim de cada mês; o do mês corrente é hoje, que ainda não fechou.
             let fim = match (m.ano, m.mes) == (hoje.ano, hoje.mes) {
                 true => hoje,
@@ -415,7 +444,7 @@ impl Vista {
             m = m.mes_anterior();
         }
         meses.reverse();
-        self.grafico(ctx, "Patrimônio por mês · 6 meses", meses)
+        self.grafico(ctx, "Patrimônio por mês · 12 meses", meses)
     }
 
     /// O total de patrimônio dia a dia, nos últimos sete dias.
@@ -730,17 +759,24 @@ impl ModuleView for Vista {
         // A curva do período ficava no alto e empurrava para o rodapé o número que se vem
         // ver. Ela também não fazia falta: o gráfico dia a dia logo abaixo desenha a mesma
         // coisa, com eixo rotulado e escala escrita, o que a curva não tinha.
+        // Três escalas, do curto para o longo: dia e semana lado a lado, mês inteiro
+        // embaixo. O mensal ganha a largura toda porque são doze colunas — espremido em
+        // meia tela, um ano vira uma serra ilegível.
+        //
+        // «De onde veio» encolheu para caber a escala nova. Ele é o detalhe que se
+        // consulta depois de ver a forma, e as formas é que são o assunto desta tela.
         Layout::rows(vec![
-            (2, self.painel_de_valores(ctx)),
+            (4, self.painel_de_valores(ctx)),
             (
-                3,
+                5,
                 Layout::cols(vec![
                     (1, Layout::one(self.diario(ctx))),
-                    (1, Layout::one(self.mensal(ctx))),
+                    (1, Layout::one(self.semanal(ctx))),
                 ]),
             ),
+            (5, Layout::one(self.mensal(ctx))),
             (
-                2,
+                3,
                 Layout::one(Pane::Facts {
                     title: format!("De onde veio · {} pontos", janela.len()),
                     rows: fatos,
@@ -773,5 +809,89 @@ impl ModuleView for Vista {
 
     fn hint(&self) -> String {
         hint(&["←/→ período", "d absoluto/percentual", "Esc sair"])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// As oito sextas-feiras que o gráfico semanal usa, sem depender de carteira nenhuma:
+    /// é aritmética de calendário, e é onde um erro de um dia passa despercebido.
+    fn sextas(hoje: Data) -> Vec<Data> {
+        let base = tempo::dias_de(hoje.ano, hoje.mes, hoje.dia);
+        let ate_sexta = 5 - hoje.dia_da_semana() as i64;
+        (0..8)
+            .rev()
+            .map(|i| {
+                let dia = base + ate_sexta - i * 7;
+                match dia > base {
+                    true => hoje,
+                    false => tempo::data_de_dias(dia),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_semana_termina_na_sexta_e_a_corrente_termina_hoje() {
+        // Quarta-feira, 09/09/2026.
+        let quarta = Data {
+            ano: 2026,
+            mes: 9,
+            dia: 9,
+        };
+        let pontos = sextas(quarta);
+        assert_eq!(pontos.len(), 8);
+        // A semana corrente ainda não fechou: o último ponto é hoje, não a sexta que vem.
+        assert_eq!(*pontos.last().expect("há ponto"), quarta);
+        // As sete anteriores são sextas-feiras de verdade, em ordem crescente.
+        for d in &pontos[..7] {
+            assert_eq!(d.dia_da_semana(), 5, "{d:?} não é sexta");
+        }
+        for par in pontos.windows(2) {
+            assert!(
+                tempo::dias_de(par[0].ano, par[0].mes, par[0].dia)
+                    < tempo::dias_de(par[1].ano, par[1].mes, par[1].dia),
+                "{par:?} fora de ordem"
+            );
+        }
+    }
+
+    /// Numa sexta-feira, a semana corrente termina **hoje** — e o ponto não pode
+    /// aparecer duas vezes.
+    #[test]
+    fn numa_sexta_o_ultimo_ponto_e_hoje_uma_vez_so() {
+        let sexta = Data {
+            ano: 2026,
+            mes: 9,
+            dia: 11,
+        };
+        assert_eq!(
+            sexta.dia_da_semana(),
+            5,
+            "a data do teste tem que ser sexta"
+        );
+        let pontos = sextas(sexta);
+        assert_eq!(*pontos.last().expect("há ponto"), sexta);
+        assert_eq!(
+            pontos.iter().filter(|d| **d == sexta).count(),
+            1,
+            "a sexta corrente não pode entrar duas vezes"
+        );
+    }
+
+    /// No domingo a sexta da semana corrente já passou, e o ponto de hoje continua
+    /// sendo hoje.
+    #[test]
+    fn no_domingo_o_ultimo_ponto_ainda_e_hoje() {
+        let domingo = Data {
+            ano: 2026,
+            mes: 9,
+            dia: 13,
+        };
+        assert_eq!(domingo.dia_da_semana(), 0);
+        let pontos = sextas(domingo);
+        assert_eq!(*pontos.last().expect("há ponto"), domingo);
     }
 }
