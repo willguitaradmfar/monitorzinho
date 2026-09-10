@@ -12,7 +12,14 @@ use crate::invest::provider::Quote;
 use crate::invest::tempo;
 
 /// As colunas de uma tabela de cotação.
-pub const CABECALHO: [&str; 6] = ["Ativo", "Último", "Var%", "Máx 24h", "Mín 24h", "Volume"];
+///
+/// «Lido» é a última, e responde outra coisa que a idade colada no preço. Aquela é a do
+/// **dado** — a série da B3 aqui vem de cinco em cinco minutos, então o preço tem os
+/// minutos que tiver. Esta é a da **leitura**: se ela diz «há 2 s» e o preço diz «há 16
+/// min», o mercado é que está devagar; se ela também envelhece, quem parou foi a busca.
+pub const CABECALHO: [&str; 7] = [
+    "Ativo", "Último", "Var%", "Máx 24h", "Mín 24h", "Volume", "Lido",
+];
 
 /// Os índices das colunas, por nome.
 ///
@@ -27,6 +34,8 @@ pub const COL_PRECO: usize = 1;
 pub const COL_VAR: usize = 2;
 #[cfg(test)]
 pub const COL_VOLUME: usize = 5;
+#[cfg(test)]
+pub const COL_LIDO: usize = 6;
 
 /// A seta do último movimento **deste número**, colada na frente dele.
 ///
@@ -75,6 +84,7 @@ pub fn linha(
                     true => "buscando…".into(),
                     false => "nenhuma fonte cobre este ativo".to_string(),
                 },
+                String::new(),
             ],
             Tone::Dim,
         );
@@ -139,6 +149,17 @@ pub fn linha(
         extremo("max", q.max24),
         extremo("min", q.min24),
         volume,
+        // Do cache **com a idade**: o valor veio do disco e ainda não foi rebuscado
+        // nesta execução, e o que se quer saber é se aquele disco é de uma hora ou de
+        // uma semana.
+        match (
+            ctx.market.idade_da_leitura(ativo, agora),
+            q.fonte == "cache",
+        ) {
+            (Some(s), true) => format!("do cache · {}", tempo::idade(s)),
+            (Some(s), false) => tempo::idade(s),
+            (None, _) => "do cache".into(),
+        },
     ])
     .with_cell_tones(vec![
         match na_carteira {
@@ -150,6 +171,7 @@ pub fn linha(
             false => Tone::Dim,
         },
         tom_var,
+        Tone::Dim,
         Tone::Dim,
         Tone::Dim,
         Tone::Dim,
@@ -338,6 +360,19 @@ mod tests {
             "deu «{}»",
             fresca.cells[COL_PRECO]
         );
+    }
+
+    /// A idade da **leitura** é outra coluna que a idade do dado, e as duas juntas
+    /// separam «o mercado está devagar» de «a busca parou».
+    #[test]
+    fn a_coluna_lido_e_a_da_leitura_e_nao_a_do_dado() {
+        let ativo = AssetId::new(Market::B3, "PETR4");
+        let q = quote(Grade::AoVivo, 38.42, None);
+        // Sem leitura registrada — o que veio do disco —, a coluna diz de onde veio.
+        let r = com_ctx!(|ctx| linha(&ativo, Some(&q), true, 600, ctx));
+        assert_eq!(r.cells[COL_LIDO], "do cache");
+        // E a idade do dado continua onde estava, colada no preço.
+        assert!(r.cells[COL_PRECO].contains("há 10 min"));
     }
 
     #[test]

@@ -162,7 +162,14 @@ volta**. **Esperado:** `há 3 min`, não `agora`.
 sqlite3 ~/.local/share/monitorzinho/db/padrao.db "SELECT chave, em FROM busca"
 ```
 
-### 3. A idade do dado, na linha
+### 3. As duas idades, lado a lado
+
+Em Cotações, a coluna *Lido* contra a idade colada no preço. **Esperado:** com o pregão
+aberto, `Lido` na casa dos segundos e o preço podendo ter minutos — a série da B3 aqui
+vem de cinco em cinco minutos, e há papel com meia hora de atraso. As duas juntas
+separam «o mercado está devagar» de «a busca parou»; sozinha, nenhuma das duas separa.
+
+### 3.1. A idade do dado, na linha
 
 Em Posições, a coluna *Atual*: `565,08 manual·há 17 h`, `62,52 kinvo atrasado·há 16 h`.
 **Toda** linha diz de quando é o preço, e não só as informadas à mão — era o caso que
