@@ -4258,15 +4258,9 @@ impl App {
             //
             // O que tornou isto barato foi a fonte em lote: dezoito papéis da B3 numa
             // chamada, contra um pedido por ativo de antes.
-            _ => {
-                self.tab == Tab::Invest
-                    // Alertas ligados rodam com a aba fechada — é a exceção, e ela é
-                    // escolhida um a um pelo usuário.
-                    || self
-                        .invest
-                        .as_ref()
-                        .is_some_and(|i| i.portfolio.alertas.iter().any(|a| a.ligado))
-            }
+            // Sem exceção: a aba fechada não busca nada. A exceção que havia eram os
+            // alertas ligados, que rodavam de longe — e o módulo deles saiu.
+            _ => self.tab == Tab::Invest,
         }
     }
 
@@ -4405,10 +4399,6 @@ impl App {
         // abrir é o gesto que expressa interesse, e reordenar por tempo de permanência
         // seria adivinhar intenção.
         invest.marcar_aberto(id);
-        // Ver a tela é o que zera o aviso da barra.
-        if id == "alertas" {
-            invest.marcar_disparos_vistos();
-        }
         let Some(view) = invest.modulo(id).map(|m| match sub {
             Some(sub) => m.open_em(&invest.ctx(), Some(sub)),
             None => m.open(&invest.ctx(), alvo.as_ref()),
@@ -4527,10 +4517,6 @@ impl App {
         };
         let ctx = invest.ctx();
         mf.view.tick(&ctx);
-        let alertas_na_tela = mf.module == "alertas";
-        if alertas_na_tela && let Some(invest) = self.invest.as_mut() {
-            invest.marcar_disparos_vistos();
-        }
     }
 
     /// True while a destructive action is waiting to be confirmed. Checked before every

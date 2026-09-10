@@ -163,7 +163,7 @@ impl InvestModule for Agenda {
             title: String::new(),
             rows: eventos
                 .into_iter()
-                .take(8)
+                .take(10)
                 .map(|e| {
                     (
                         format!("{:02}/{:02}", e.data.dia, e.data.mes),
@@ -312,10 +312,6 @@ pub struct Evento {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        "Agenda".into()
-    }
-
     fn layout(&self, ctx: &Ctx) -> Layout {
         let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
         // A tela cheia **pede** o calendário, e é este `get` que dispara a busca. O cartão

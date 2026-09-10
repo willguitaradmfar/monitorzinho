@@ -22,9 +22,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::db;
-use crate::invest::model::{
-    Alerta, AlvoCarteira, AssetId, Carteira, Lancamento, Moeda, Portfolio, Position, Provento,
-};
+use crate::invest::model::{AlvoCarteira, AssetId, Carteira, Moeda, Portfolio, Position, Provento};
 
 pub use crate::db::agora;
 
@@ -154,61 +152,6 @@ fn ler_portfolio(conn: &Connection) -> rusqlite::Result<Portfolio> {
                 retido: row.get(4)?,
                 moeda,
                 quantidade: row.get(6)?,
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-
-    let mut lancamentos = conn.prepare(
-        "SELECT em, tipo, ativo, quantidade, preco, taxas, valor, moeda, nota
-         FROM lancamento ORDER BY id",
-    )?;
-    p.lancamentos = lancamentos
-        .query_map([], |row| {
-            let Some(tipo) = db::do_codigo(&row.get::<_, String>(1)?) else {
-                return Ok(None);
-            };
-            Ok(Some(Lancamento {
-                em: row.get::<_, i64>(0)? as u64,
-                tipo,
-                ativo: row
-                    .get::<_, Option<String>>(2)?
-                    .and_then(|t| AssetId::parse(&t).ok()),
-                quantidade: row.get(3)?,
-                preco: row.get(4)?,
-                taxas: row.get(5)?,
-                valor: row.get(6)?,
-                moeda: row
-                    .get::<_, Option<String>>(7)?
-                    .and_then(|m| db::do_codigo(&m)),
-                nota: row.get(8)?,
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-
-    let mut alertas = conn.prepare(
-        "SELECT ativo, regra, valor, ligado, armado, ultimo_disparo FROM alerta ORDER BY id",
-    )?;
-    p.alertas = alertas
-        .query_map([], |row| {
-            let (Ok(ativo), Some(regra)) = (
-                AssetId::parse(&row.get::<_, String>(0)?),
-                db::do_codigo(&row.get::<_, String>(1)?),
-            ) else {
-                return Ok(None);
-            };
-            Ok(Some(Alerta {
-                ativo,
-                regra,
-                valor: row.get(2)?,
-                ligado: row.get::<_, i64>(3)? != 0,
-                armado: row.get::<_, i64>(4)? != 0,
-                ultimo_disparo: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -348,42 +291,6 @@ fn gravar_em(conn: &Connection, portfolio: &Portfolio) -> rusqlite::Result<()> {
                 v.retido,
                 db::codigo(&v.moeda),
                 v.quantidade,
-            ))?;
-        }
-
-        let mut lancamento = conn.prepare(
-            "INSERT INTO lancamento (id, em, tipo, ativo, quantidade, preco, taxas, valor,
-                                     moeda, nota)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        )?;
-        for (i, l) in portfolio.lancamentos.iter().enumerate() {
-            lancamento.execute((
-                i as i64 + 1,
-                l.em as i64,
-                db::codigo(&l.tipo),
-                l.ativo.as_ref().map(|a| a.to_string()),
-                l.quantidade,
-                l.preco,
-                l.taxas,
-                l.valor,
-                l.moeda.as_ref().map(db::codigo),
-                &l.nota,
-            ))?;
-        }
-
-        let mut alerta = conn.prepare(
-            "INSERT INTO alerta (id, ativo, regra, valor, ligado, armado, ultimo_disparo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
-        for (i, a) in portfolio.alertas.iter().enumerate() {
-            alerta.execute((
-                i as i64 + 1,
-                a.ativo.to_string(),
-                db::codigo(&a.regra),
-                a.valor,
-                a.ligado as i64,
-                a.armado as i64,
-                a.ultimo_disparo.map(|v| v as i64),
             ))?;
         }
 
@@ -898,7 +805,7 @@ mod tests_buscas {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::invest::model::{Classe, RegraAlerta, TipoLancamento, TipoProvento};
+    use crate::invest::model::{Classe, TipoProvento};
 
     fn portfolio_cheio() -> Portfolio {
         let mut p = Portfolio::default();
@@ -947,25 +854,6 @@ mod tests {
             moeda: Moeda::Brl,
             quantidade: Some(100.0),
         });
-        p.lancamentos.push(Lancamento {
-            em: 2000,
-            tipo: TipoLancamento::Compra,
-            ativo: Some(AssetId::parse("B3/PETR4").unwrap()),
-            quantidade: 100.0,
-            preco: 31.4,
-            taxas: 2.5,
-            valor: 0.0,
-            moeda: Some(Moeda::Brl),
-            nota: "primeira".into(),
-        });
-        p.alertas.push(Alerta {
-            ativo: AssetId::parse("B3/PETR4").unwrap(),
-            regra: RegraAlerta::Acima,
-            valor: 40.0,
-            ligado: false,
-            armado: true,
-            ultimo_disparo: Some(3000),
-        });
         p.carteiras.push(Carteira {
             nome: "dividendos".into(),
             alvos: vec![AlvoCarteira {
@@ -1010,14 +898,6 @@ mod tests {
         assert_eq!(lido.proventos.len(), 1);
         assert_eq!(lido.proventos[0].tipo, TipoProvento::Jcp);
         assert_eq!(lido.proventos[0].retido, 18.0);
-        assert_eq!(lido.lancamentos.len(), 1);
-        assert_eq!(lido.lancamentos[0].nota, "primeira");
-        assert_eq!(lido.lancamentos[0].moeda, Some(Moeda::Brl));
-        assert_eq!(lido.alertas.len(), 1);
-        // Desligado continua desligado depois de reiniciar.
-        assert!(!lido.alertas[0].ligado);
-        assert!(lido.alertas[0].armado);
-        assert_eq!(lido.alertas[0].ultimo_disparo, Some(3000));
         assert_eq!(lido.carteiras.len(), 1);
         assert_eq!(lido.carteiras[0].alvos[0].teto, Some(28.0));
         assert_eq!(lido.carteiras[0].alvos[0].ordem, 1);

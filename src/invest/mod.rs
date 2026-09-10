@@ -87,11 +87,6 @@ pub struct InvestState {
     /// vivo, e gravar um arquivo a cada dois segundos por um número que se lê em meses
     /// seria escrever no disco à toa.
     serie_gravada_em: u64,
-    /// Os disparos de alerta desde que a aba abriu, do mais recente para o mais antigo.
-    /// É o que a barra de abas conta e o que o módulo mostra no histórico.
-    pub disparos: Vec<(u64, String)>,
-    /// Quantos disparos ainda não foram vistos — o contador ao lado de «Invest».
-    pub disparos_novos: usize,
     /// Se há sujeira ainda não gravada.
     sujo: bool,
     /// O que a última gravação disse que deu errado, para a tela poder mostrar.
@@ -137,8 +132,6 @@ impl InvestState {
             modulos: modules::todos(),
             patrimonio: serie::load(),
             serie_gravada_em: 0,
-            disparos: Vec::new(),
-            disparos_novos: 0,
             sujo: false,
             erro_gravacao: None,
         };
@@ -157,7 +150,6 @@ impl InvestState {
             fundamentos: &self.fundamentos,
             anunciados: &self.anunciados,
             calendario: &self.calendario,
-            disparos: &self.disparos,
             buscas: store::buscas(),
             agora: store::agora(),
             somente_leitura: self.somente_leitura,
@@ -217,15 +209,10 @@ impl InvestState {
                 Need::Posicoes if ctx.portfolio.posicoes.is_empty() => Some("sem posições"),
                 Need::Cotacao if ctx.market.quotes.is_empty() => Some("sem cotação"),
                 Need::Cambio if ctx.market.taxa(model::Moeda::Usd).is_none() => Some("sem câmbio"),
-                Need::Historico if !self.tem_historico() => Some("sem histórico"),
-                Need::Provedor(nome) => Some(*nome),
                 _ => None,
             };
             if let Some(falta) = falta {
-                return Estado::Falta(match need {
-                    Need::Provedor(nome) => format!("precisa de {nome}"),
-                    _ => falta.to_string(),
-                });
+                return Estado::Falta(falta.to_string());
             }
         }
         // Um aviso e não um impedimento: dá para usar tudo com preço informado, e a tela
@@ -234,15 +221,6 @@ impl InvestState {
             return Estado::Falta("preço manual".to_string());
         }
         Estado::Pronto
-    }
-
-    fn tem_historico(&self) -> bool {
-        self.portfolio.ativos_de_interesse().iter().any(|a| {
-            matches!(
-                a.market,
-                model::Market::Binance | model::Market::Bcb | model::Market::Fx
-            )
-        })
     }
 
     fn tudo_manual(&self) -> bool {
@@ -295,59 +273,6 @@ impl InvestState {
     pub fn atualizar_market(&mut self) {
         self.market = self.providers.snapshot();
         self.registrar_patrimonio();
-        self.avaliar_alertas();
-    }
-
-    /// Confere as regras de alerta contra o retrato novo.
-    ///
-    /// Aqui e não dentro do módulo: um alerta que só funcionasse com a tela dele aberta
-    /// seria inútil — é justamente para avisar de longe que ele existe.
-    fn avaliar_alertas(&mut self) {
-        if self.portfolio.alertas.is_empty() {
-            return;
-        }
-        let agora = store::agora();
-        let disparados =
-            modules::alertas::avaliar(&mut self.portfolio.alertas, &self.market, agora);
-        for i in disparados {
-            let Some(a) = self.portfolio.alertas.get(i) else {
-                continue;
-            };
-            let preco = self
-                .market
-                .quote(&a.ativo)
-                .map(|q| self::calc::preco(q.preco))
-                .unwrap_or_default();
-            self.disparos.insert(
-                0,
-                (
-                    agora,
-                    format!(
-                        "{} {} {} · agora {preco}",
-                        a.ativo.short(),
-                        a.regra.label(),
-                        match a.regra.e_percentual() {
-                            true => self::calc::pct_casas(a.valor, 2),
-                            false => self::calc::preco(a.valor),
-                        }
-                    ),
-                ),
-            );
-            self.disparos_novos += 1;
-            // O estado «armado» é do arquivo: sem gravá-lo, reiniciar o programa faria
-            // toda regra já satisfeita disparar de novo.
-            self.sujo = true;
-        }
-        // O histórico tem teto: um alerta de variação numa semana volátil encheria a
-        // memória com linhas que ninguém vai rolar até o fim.
-        self.disparos.truncate(200);
-    }
-
-    /// Chamado enquanto a tela dos alertas está na frente: zera o contador da barra. A
-    /// cada volta e não só ao abrir, senão um disparo que acontece **com a tela aberta**
-    /// deixaria um aviso que ninguém tem como dispensar.
-    pub fn marcar_disparos_vistos(&mut self) {
-        self.disparos_novos = 0;
     }
 
     /// Carimba o patrimônio de hoje. Um ponto por dia; dentro do dia, o mais recente vale.
@@ -369,7 +294,11 @@ impl InvestState {
         if !totais.completo() || totais.mercado <= 0.0 {
             return;
         }
-        let (aporte, retirada, proventos) = serie::fluxos_do_dia(&self.portfolio, agora);
+        // Aporte, retirada e provento eram lidos dos lançamentos, e o módulo que os
+        // registrava saiu. A curva continua sendo o patrimônio de verdade; o que ela
+        // deixou de poder é **separar** quanto dele foi dinheiro novo — e a tela diz
+        // isso, em vez de chamar aporte de valorização.
+        let (aporte, retirada, proventos) = (0.0, 0.0, 0.0);
         serie::registrar(
             &mut self.patrimonio,
             agora,
@@ -481,20 +410,6 @@ impl InvestState {
                     self.portfolio.proventos.remove(i);
                 }
             }
-            E::AddLancamento(l) => {
-                self.portfolio.lancamentos.push(*l);
-                // Ordem cronológica inversa é como o módulo os mostra, e ordenar aqui
-                // significa que nenhuma tela precisa ordenar de novo.
-                self.portfolio
-                    .lancamentos
-                    .sort_by_key(|l| std::cmp::Reverse(l.em));
-            }
-            E::RemoverLancamento(i) => {
-                if i < self.portfolio.lancamentos.len() {
-                    self.portfolio.lancamentos.remove(i);
-                }
-            }
-            E::SetAlertas(a) => self.portfolio.alertas = a,
             E::SetCarteira(c) => {
                 match self
                     .portfolio
@@ -610,8 +525,6 @@ mod tests {
             modulos: modules::todos(),
             patrimonio: Vec::new(),
             serie_gravada_em: 0,
-            disparos: Vec::new(),
-            disparos_novos: 0,
             sujo: false,
             erro_gravacao: None,
         }

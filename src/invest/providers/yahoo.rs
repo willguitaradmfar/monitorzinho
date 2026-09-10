@@ -246,21 +246,13 @@ impl Provider for Yahoo {
             return None;
         }
         let range = match span {
-            Span::Dia => "1d",
-            Span::Semana => "5d",
             Span::Mes => "1mo",
-            Span::SeisMeses => "6mo",
             Span::Ano => "1y",
-            Span::CincoAnos => "5y",
         };
         let simbolo = simbolo(ativo)?;
         Some(historico(&format!(
             "https://query1.finance.yahoo.com/v8/finance/chart/{simbolo}?interval=1d&range={range}"
         )))
-    }
-
-    fn tem_historico(&self) -> bool {
-        true
     }
 
     /// Um minuto. Devagar de propósito: a fonte não tem contrato, e a punição por

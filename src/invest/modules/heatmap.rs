@@ -329,10 +329,6 @@ struct Vista {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        "Heatmap".into()
-    }
-
     fn quer_mercado(&self) -> bool {
         true
     }
@@ -412,10 +408,6 @@ impl ModuleView for Vista {
                 self.selecionado = 0;
                 Outcome::Ok
             }
-            KeyCode::Enter => Outcome::Abrir {
-                modulo: "grafico",
-                alvo: caixas.get(self.selecionado).map(|c| c.ativo.clone()),
-            },
             _ => Outcome::Ignorada,
         }
     }
@@ -425,12 +417,7 @@ impl ModuleView for Vista {
     }
 
     fn hint(&self) -> String {
-        hint(&[
-            "setas andar",
-            "Ctrl+W o que o tamanho mede",
-            "Enter gráfico",
-            "Esc sair",
-        ])
+        hint(&["setas andar", "Ctrl+W o que o tamanho mede", "Esc sair"])
     }
 }
 

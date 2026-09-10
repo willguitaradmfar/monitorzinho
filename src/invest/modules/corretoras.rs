@@ -111,10 +111,6 @@ struct Vista {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        "Corretoras".into()
-    }
-
     fn quer_mercado(&self) -> bool {
         true
     }

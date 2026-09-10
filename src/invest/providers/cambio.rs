@@ -147,10 +147,6 @@ impl Provider for Cambio {
         crate::invest::provider::dia_util_br(agora)
     }
 
-    fn tem_historico(&self) -> bool {
-        true
-    }
-
     fn intervalo(&self) -> Duration {
         // Compartilha a volta com as cotações: se tivesse cadência própria, haveria um
         // instante em que o preço de um ativo em dólar já mudou e o câmbio ainda não, e o

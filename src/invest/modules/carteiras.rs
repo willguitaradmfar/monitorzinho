@@ -124,7 +124,10 @@ fn cartao(carteira: &Carteira, p: &crate::invest::carteiras::Plano, patrimonio: 
             .ajustes
             .iter()
             .filter(|a| a.delta.abs() > 0.005 * p.total.max(1.0))
-            .take(5)
+            // Dez, como Posições e Cotações: cinco cabiam sempre e escondiam metade do
+            // que há a fazer numa carteira de quinze papéis. O que não couber na altura
+            // do cartão é cortado pelo desenho, que é quem sabe o tamanho dele.
+            .take(10)
             .map(|a| {
                 let barrado = a.acima_do_teto && a.delta > 0.0;
                 Row::new(vec![
@@ -282,10 +285,6 @@ impl Vista {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        "Carteiras recomendadas".into()
-    }
-
     fn quer_mercado(&self) -> bool {
         true
     }

@@ -134,10 +134,6 @@ impl Provider for Fred {
         Some(pontos(serie.id, Some(&janela(span.dias()))))
     }
 
-    fn tem_historico(&self) -> bool {
-        true
-    }
-
     /// O FRED publica em dia útil americano. Aproximar pelo dia útil brasileiro erra os
     /// feriados dos dois países em direções opostas e acerta o essencial: no sábado não
     /// há número novo, e insistir é gastar banda alheia para receber a mesma resposta.

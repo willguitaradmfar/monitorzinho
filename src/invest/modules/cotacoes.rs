@@ -234,10 +234,6 @@ fn linhas(ctx: &Ctx, ativos: &[AssetId]) -> Vec<Row> {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        "Cotações".into()
-    }
-
     fn quer_mercado(&self) -> bool {
         true
     }

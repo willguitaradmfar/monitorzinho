@@ -402,20 +402,14 @@ impl Provider for Brapi {
         // Os intervalos que a API aceita. Um dia e uma semana não existem lá, e o menor
         // que ela tem já cobre os dois com sobra.
         let range = match span {
-            Span::Dia | Span::Semana | Span::Mes => "1mo",
-            Span::SeisMeses => "6mo",
+            Span::Mes => "1mo",
             Span::Ano => "1y",
-            Span::CincoAnos => "5y",
         };
         let token = token().map(|t| format!("&token={t}")).unwrap_or_default();
         Some(historico(&format!(
             "https://brapi.dev/api/quote/{}?range={range}&interval=1d{token}",
             ativo.symbol
         )))
-    }
-
-    fn tem_historico(&self) -> bool {
-        true
     }
 
     fn tem_fundamento(&self) -> bool {

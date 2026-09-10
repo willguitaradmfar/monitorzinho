@@ -241,13 +241,6 @@ impl Provider for Bcb {
         crate::invest::provider::dia_util_br(agora)
     }
 
-    /// Uma vez por dia por série. Estes números mudam uma vez por dia — ou por mês, no
-    /// IPCA — e pedi-los a cada dois segundos é gastar cota alheia para receber a mesma
-    /// resposta.
-    fn tem_historico(&self) -> bool {
-        true
-    }
-
     fn intervalo(&self) -> Duration {
         Duration::from_secs(6 * 3600)
     }

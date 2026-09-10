@@ -285,26 +285,6 @@ pub fn agrupar<F: Fn(&Linha) -> String>(linhas: &[Linha], chave: F) -> Vec<(Stri
     v
 }
 
-/// A média ponderada de preços médios **informados**, para quando o mesmo ativo aparece
-/// em mais de uma fonte.
-///
-/// Isto continua sendo «informado»: é agregação de valores informados, não derivação a
-/// partir de operações. A distinção importa e está aqui para quem for mexer não confundir.
-pub fn preco_medio_consolidado(posicoes: &[&Position]) -> Option<f64> {
-    // Só as que têm custo informado entram. Misturar uma sem preço médio como se
-    // custasse zero puxaria a média para baixo e inventaria um custo que ninguém informou.
-    let com_custo: Vec<&&Position> = posicoes.iter().filter(|p| p.custo().is_some()).collect();
-    if com_custo.len() != posicoes.len() || com_custo.is_empty() {
-        return None;
-    }
-    let quantidade: f64 = com_custo.iter().map(|p| p.quantidade).sum();
-    if quantidade <= 0.0 {
-        return None;
-    }
-    let custo: f64 = com_custo.iter().filter_map(|p| p.custo()).sum();
-    Some(custo / quantidade)
-}
-
 #[cfg(test)]
 mod tests_origem {
     use super::*;
@@ -510,16 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn media_ponderada_de_pms_informados() {
-        // Mesma ação em duas corretoras: 100 a 30 e 300 a 40 dão PM consolidado de 37,50.
-        let a = pos("PETR4", 100.0, 30.0, Moeda::Brl);
-        let b = pos("PETR4", 300.0, 40.0, Moeda::Brl);
-        let pm = preco_medio_consolidado(&[&a, &b]).unwrap();
-        assert!((pm - 37.5).abs() < 1e-9, "deu {pm}");
-        assert_eq!(preco_medio_consolidado(&[]), None);
-    }
-
-    #[test]
     fn pesos_somam_cem_quando_tudo_conta() {
         let mut p = Portfolio::default();
         let a = pos("PETR4", 100.0, 30.0, Moeda::Brl);
@@ -667,16 +637,5 @@ mod sem_pm_tests {
         let t = totais(&linhas(&p, &market, 0));
         assert!(t.completo());
         assert!(t.pnl_pct().is_some());
-    }
-
-    #[test]
-    fn o_pm_consolidado_recusa_misturar_com_e_sem_custo() {
-        // Tratar a sem-PM como custo zero puxaria a média para baixo e inventaria um
-        // custo que ninguém informou.
-        let a = pos("PETR4", 100.0, Some(30.0));
-        let b = pos("PETR4", 300.0, None);
-        assert_eq!(preco_medio_consolidado(&[&a, &b]), None);
-        let c = pos("PETR4", 300.0, Some(40.0));
-        assert_eq!(preco_medio_consolidado(&[&a, &c]), Some(37.5));
     }
 }

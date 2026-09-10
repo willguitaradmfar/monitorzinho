@@ -5,7 +5,7 @@
 //! serve `defaultKeyStatistics`, `financialData` e `summaryProfile` mesmo com token
 //! grátis — conferido em 08/09/2026. O que faltava era medir em vez de supor.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 use crate::invest::calc;
 use crate::invest::fundamento::Estado;
@@ -134,10 +134,6 @@ fn grande(v: f64) -> String {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        "Fundamentos".into()
-    }
-
     fn quer_mercado(&self) -> bool {
         true
     }
@@ -297,15 +293,9 @@ impl ModuleView for Vista {
     }
 
     fn key(&mut self, key: KeyEvent, ctx: &Ctx) -> Outcome {
-        match key.code {
-            KeyCode::Enter => Outcome::Abrir {
-                modulo: "grafico",
-                alvo: empresas(ctx).get(self.lista.selecionado).cloned(),
-            },
-            _ => match self.lista.tecla(key, empresas(ctx).len()) {
-                true => Outcome::Ok,
-                false => Outcome::Ignorada,
-            },
+        match self.lista.tecla(key, empresas(ctx).len()) {
+            true => Outcome::Ok,
+            false => Outcome::Ignorada,
         }
     }
 
@@ -314,12 +304,7 @@ impl ModuleView for Vista {
     }
 
     fn hint(&self) -> String {
-        hint(&[
-            "↑/↓ andar",
-            "digite para buscar",
-            "Enter gráfico",
-            "Esc sair",
-        ])
+        hint(&["↑/↓ andar", "digite para buscar", "Esc sair"])
     }
 }
 

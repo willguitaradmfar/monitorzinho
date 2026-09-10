@@ -2,35 +2,22 @@
 //! existe: uma lista num lugar só, e um módulo novo é uma linha nela.
 
 pub mod agenda;
-pub mod alertas;
 pub mod alocacao;
-pub mod book;
-pub mod cambio;
 pub mod carteiras;
 pub mod comum;
 pub mod corretoras;
 pub mod cotacoes;
-pub mod cripto;
 pub mod fundamentos;
-pub mod grafico;
 pub mod heatmap;
 pub mod importacao;
-pub mod indicadores;
 pub mod indices;
-pub mod lancamentos;
 pub mod mercado;
 pub mod noticias;
 pub mod patrimonio;
 pub mod posicoes;
 pub mod proventos;
-pub mod rebalanceamento;
-pub mod risco;
 
 use crate::invest::module::InvestModule;
-
-/// A leitura de uma data escrita por gente, compartilhada por quem pede uma. Uma cópia só
-/// para que «dd/mm/aaaa» signifique a mesma coisa em toda tela.
-pub use lancamentos::ler_data as lancamentos_data;
 
 /// A ordem aqui é a ordem em que os módulos aparecem para quem nunca abriu nenhum — e é
 /// a ordem em que alguém constrói o uso: primeiro o que é meu, depois o que está
@@ -41,27 +28,18 @@ pub fn todos() -> Vec<Box<dyn InvestModule>> {
         Box::new(posicoes::Posicoes),
         Box::new(carteiras::Carteiras),
         Box::new(alocacao::Alocacao),
-        Box::new(rebalanceamento::Rebalanceamento),
         Box::new(patrimonio::Patrimonio),
         Box::new(corretoras::Corretoras),
         Box::new(proventos::Proventos),
-        Box::new(lancamentos::Lancamentos),
         // Mercado
         Box::new(cotacoes::Cotacoes),
-        Box::new(cambio::Cambio),
-        Box::new(cripto::Cripto),
-        Box::new(grafico::Grafico),
         Box::new(indices::Indices),
         Box::new(heatmap::Heatmap),
-        Box::new(book::Book),
         // Análise
-        Box::new(risco::Risco),
-        Box::new(indicadores::Indicadores),
         Box::new(fundamentos::Fundamentos),
         // Operação
         Box::new(importacao::Importacao),
         // Informação
-        Box::new(alertas::Alertas),
         Box::new(noticias::Noticias),
         Box::new(agenda::Agenda),
     ]
@@ -72,8 +50,7 @@ mod tests {
     use super::*;
     use crate::invest::marcas;
     use crate::invest::model::{
-        Alerta, AssetId, Carteira, Classe, Lancamento, Market, Moeda, Portfolio, Position,
-        Provento, RegraAlerta, TipoLancamento, TipoProvento,
+        AssetId, Carteira, Classe, Market, Moeda, Portfolio, Position, Provento, TipoProvento,
     };
     use crate::invest::module::{Pane, ctx_de_teste, providers_de_teste};
     use crate::invest::provider::MarketSnapshot;
@@ -111,25 +88,6 @@ mod tests {
             carteiras: vec![Carteira {
                 nome: "Nord".into(),
                 alvos: Vec::new(),
-            }],
-            lancamentos: vec![Lancamento {
-                em: 0,
-                tipo: TipoLancamento::Compra,
-                ativo: Some(AssetId::new(Market::B3, "PETR4")),
-                quantidade: 100.0,
-                preco: 10.0,
-                taxas: 0.0,
-                valor: 1000.0,
-                moeda: Some(Moeda::Brl),
-                nota: String::new(),
-            }],
-            alertas: vec![Alerta {
-                ativo: AssetId::new(Market::B3, "PETR4"),
-                regra: RegraAlerta::Acima,
-                valor: 40.0,
-                ligado: true,
-                armado: false,
-                ultimo_disparo: None,
             }],
             proventos: vec![Provento {
                 ativo: AssetId::new(Market::B3, "PETR4"),
@@ -177,10 +135,9 @@ mod tests {
             );
             conferidos += 1;
         }
-        // O teste não pode degradar em silêncio: hoje ele alcança treze dos catorze
-        // módulos marcáveis — o que fica de fora é Risco, que só desenha tabela com série
-        // histórica, e história não se inventa numa carteira de teste.
-        assert!(conferidos >= 13, "só {conferidos} módulos foram conferidos");
+        // O teste não pode degradar em silêncio. Eram treze antes de nove módulos
+        // saírem; hoje são nove, e todos os que desenham tabela estão entre eles.
+        assert!(conferidos >= 9, "só {conferidos} módulos foram conferidos");
     }
 
     /// O mesmo, no cartão da home. Ele mostra menos colunas que a tela aberta e às vezes
@@ -306,14 +263,11 @@ mod tests {
         let esperado = [
             "posicoes",
             "cotacoes",
-            "cripto",
-            "cambio",
             "carteiras",
             "proventos",
-            "lancamentos",
-            "alertas",
             "fundamentos",
-            "risco",
+            "heatmap",
+            "alocacao",
         ];
         for modulo in todos() {
             if !esperado.contains(&modulo.id()) {

@@ -138,22 +138,14 @@ impl Provider for Binance {
         // Cada janela pede uma granularidade diferente: um dia em velas diárias é um
         // ponto só, e cinco anos em velas de cinco minutos são meio milhão de pontos.
         let (intervalo, limite) = match span {
-            Span::Dia => ("5m", 288),
-            Span::Semana => ("1h", 120),
             Span::Mes => ("4h", 180),
-            Span::SeisMeses => ("1d", 182),
             Span::Ano => ("1d", 365),
-            Span::CincoAnos => ("1w", 260),
         };
         let url = format!(
             "https://api.binance.com/api/v3/klines?symbol={}&interval={intervalo}&limit={limite}",
             ativo.symbol
         );
         Some(buscar_klines(&url))
-    }
-
-    fn tem_historico(&self) -> bool {
-        true
     }
 
     fn intervalo(&self) -> Duration {

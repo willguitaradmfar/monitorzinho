@@ -341,3 +341,44 @@ mod tests {
         assert!(f.erro.is_none(), "o erro descrevia o que estava lá antes");
     }
 }
+
+/// Lê `08/09/2026`, ou hoje quando vazio.
+///
+/// Mora aqui e não no módulo que a usa porque **dois** a usam, e porque «dd/mm/aaaa»
+/// precisa significar a mesma coisa em toda tela. Veio de Lançamentos, que saiu.
+pub fn ler_data(texto: &str, agora: u64) -> Result<u64, String> {
+    use crate::invest::tempo::{self, Data};
+    let texto = texto.trim();
+    if texto.is_empty() {
+        return Ok(agora);
+    }
+    let partes: Vec<&str> = texto.split('/').collect();
+    if partes.len() != 3 {
+        return Err("data no formato dd/mm/aaaa".into());
+    }
+    let (Ok(dia), Ok(mes), Ok(ano)) = (
+        partes[0].parse::<u32>(),
+        partes[1].parse::<u32>(),
+        partes[2].parse::<i32>(),
+    ) else {
+        return Err("data no formato dd/mm/aaaa".into());
+    };
+    if !(1..=31).contains(&dia) || !(1..=12).contains(&mes) {
+        return Err("dia ou mês fora da faixa".into());
+    }
+    Ok(Data { ano, mes, dia }.epoch_inicio(tempo::BRT_OFFSET))
+}
+
+#[cfg(test)]
+mod tests_data {
+    use super::ler_data;
+
+    #[test]
+    fn vazio_e_hoje_e_o_resto_e_conferido() {
+        assert_eq!(ler_data("", 1_789_000_000), Ok(1_789_000_000));
+        assert!(ler_data("08/09/2026", 0).is_ok());
+        assert!(ler_data("2026-09-08", 0).is_err());
+        assert!(ler_data("32/09/2026", 0).is_err());
+        assert!(ler_data("08/13/2026", 0).is_err());
+    }
+}

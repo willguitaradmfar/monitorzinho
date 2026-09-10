@@ -22,7 +22,9 @@ use crate::invest::provider::{Candle, ProviderSet, Span};
 pub enum Estado {
     Buscando,
     Pronta(Vec<Candle>),
-    Falhou(String),
+    /// Sem mensagem: nenhuma tela a mostra desde que Gráfico e Risco saíram, e um
+    /// campo que ninguém lê é um campo que mente sobre existir.
+    Falhou,
     /// A fonte não tem histórico deste ativo — o caso de todo preço informado. É
     /// diferente de «falhou»: não adianta tentar de novo.
     SemFonte,
@@ -61,14 +63,6 @@ impl Cache {
         Estado::Buscando
     }
 
-    /// Só olha, sem pedir. Para quem quer desenhar o que já existe sem disparar rede.
-    pub fn peek(&self, ativo: &AssetId, span: Span) -> Option<Estado> {
-        self.series
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&(ativo.clone(), span)).cloned())
-    }
-
     pub fn pendentes(&self) -> usize {
         self.pendentes.load(Ordering::Relaxed)
     }
@@ -91,11 +85,9 @@ impl Cache {
             .spawn(move || {
                 let (ativo, span) = chave.clone();
                 let resultado = match providers.history(&ativo, span) {
-                    Some(Ok(v)) if v.is_empty() => {
-                        Estado::Falhou("a fonte respondeu sem nenhum ponto".into())
-                    }
+                    Some(Ok(v)) if v.is_empty() => Estado::Falhou,
                     Some(Ok(v)) => Estado::Pronta(v),
-                    Some(Err(e)) => Estado::Falhou(e.frase()),
+                    Some(Err(_)) => Estado::Falhou,
                     None => Estado::SemFonte,
                 };
                 if matches!(resultado, Estado::Pronta(_)) {
@@ -107,85 +99,5 @@ impl Cache {
                 pendentes.fetch_sub(1, Ordering::Relaxed);
             })
             .ok();
-    }
-}
-
-/// Os fechamentos de uma série, que é o que quase todo cálculo quer.
-/// Os rótulos do eixo do tempo de uma série de velas.
-///
-/// `dd/mm` numa janela curta e `mm/aa` numa longa: num gráfico de cinco anos a data exata
-/// de cada ponto não cabe nem interessa, e num de uma semana o mês sozinho não distingue
-/// nada. Quem desenha decide quantos deles cabem — ver `render_pane_chart`.
-pub fn rotulos(candles: &[Candle], span: Span) -> Vec<String> {
-    use crate::invest::tempo::{self, Data};
-    let curto = matches!(span, Span::Dia | Span::Semana | Span::Mes);
-    candles
-        .iter()
-        .map(|c| {
-            let d = Data::de_epoch(c.em, tempo::BRT_OFFSET);
-            match curto {
-                true => format!("{:02}/{:02}", d.dia, d.mes),
-                false => format!("{:02}/{:02}", d.mes, d.ano % 100),
-            }
-        })
-        .collect()
-}
-
-pub fn fechamentos(candles: &[Candle]) -> Vec<f64> {
-    candles.iter().map(|c| c.fechamento).collect()
-}
-
-/// A frase que a tela mostra quando não há série. Diz **por que**, e o que fazer.
-pub fn explicar(estado: &Estado, ativo: &AssetId) -> Option<String> {
-    match estado {
-        Estado::Pronta(_) => None,
-        Estado::Buscando => Some("buscando a série…".into()),
-        Estado::Falhou(e) => Some(format!("a fonte não respondeu: {e}")),
-        Estado::SemFonte => Some(format!(
-            "{ativo} não tem histórico: o preço dele é informado, e um preço informado \
-             não tem série.\n\nTêm histórico: pares da Binance, câmbio (FX/USDBRL) e as \
-             séries do Banco Central."
-        )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::invest::model::Market;
-
-    #[test]
-    fn fechamentos_extrai_a_coluna_certa() {
-        let candles = vec![
-            Candle {
-                em: 1,
-                fechamento: 10.0,
-            },
-            Candle {
-                em: 2,
-                fechamento: 12.0,
-            },
-        ];
-        assert_eq!(fechamentos(&candles), vec![10.0, 12.0]);
-    }
-
-    #[test]
-    fn sem_fonte_e_diferente_de_falhou() {
-        let ativo = AssetId::new(Market::B3, "PETR4");
-        // «Sem fonte» explica e não convida a tentar de novo; «falhou» diz o erro.
-        let sem = explicar(&Estado::SemFonte, &ativo).unwrap();
-        assert!(sem.contains("informado"));
-        let falhou = explicar(&Estado::Falhou("tempo".into()), &ativo).unwrap();
-        assert!(falhou.contains("tempo"));
-        // Pronta não explica nada — não há o que explicar.
-        assert!(explicar(&Estado::Pronta(Vec::new()), &ativo).is_none());
-    }
-
-    #[test]
-    fn peek_nao_dispara_busca() {
-        let c = Cache::default();
-        let ativo = AssetId::new(Market::Binance, "BTCBRL");
-        assert!(c.peek(&ativo, Span::Mes).is_none());
-        assert_eq!(c.pendentes(), 0, "olhar não pode custar uma requisição");
     }
 }

@@ -818,20 +818,6 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(palette::DIM)
         };
         spans.push(Span::styled(format!(" {} ", tab.title()), style));
-        // O aviso de alerta mora aqui e em nenhum outro lugar: um monitor que sequestra a
-        // tela para avisar é um monitor que se fecha. Um contador na barra é o quanto de
-        // atenção isto pede.
-        if *tab == Tab::Invest
-            && let Some(invest) = &app.invest
-            && invest.disparos_novos > 0
-        {
-            spans.push(Span::styled(
-                format!("({}) ", invest.disparos_novos),
-                Style::default()
-                    .fg(palette::YELLOW)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 

@@ -132,44 +132,23 @@ pub struct Candle {
 
 /// Que janela de histórico se está pedindo.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// As duas janelas que alguém ainda pede.
+///
+/// Eram seis, e as outras quatro serviam ao seletor de período do Gráfico, que saiu.
+/// Uma variante que ninguém constrói é um `match` a mais em cada provedor para um caso
+/// que não acontece — e cinco provedores tinham esse `match`.
 pub enum Span {
-    Dia,
-    Semana,
+    /// O lucro do mês e o da semana, no mapa de calor.
     Mes,
-    SeisMeses,
+    /// A curva do patrimônio reconstruída a partir do preço das posições.
     Ano,
-    CincoAnos,
 }
 
 impl Span {
-    pub const ALL: [Span; 6] = [
-        Span::Dia,
-        Span::Semana,
-        Span::Mes,
-        Span::SeisMeses,
-        Span::Ano,
-        Span::CincoAnos,
-    ];
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Span::Dia => "1 dia",
-            Span::Semana => "5 dias",
-            Span::Mes => "1 mês",
-            Span::SeisMeses => "6 meses",
-            Span::Ano => "1 ano",
-            Span::CincoAnos => "5 anos",
-        }
-    }
-
     pub fn dias(&self) -> u32 {
         match self {
-            Span::Dia => 1,
-            Span::Semana => 5,
             Span::Mes => 30,
-            Span::SeisMeses => 182,
             Span::Ano => 365,
-            Span::CincoAnos => 1825,
         }
     }
 }
@@ -218,16 +197,6 @@ pub trait Provider: Send + Sync {
 
     /// Se esta fonte serve fundamento, para os módulos perguntarem sem buscar.
     fn tem_fundamento(&self) -> bool {
-        false
-    }
-
-    /// Se esta fonte serve série histórica **sem precisar buscá-la para descobrir**.
-    ///
-    /// É o que substituiu uma lista de mercados escrita à mão em cinco módulos. Aquela
-    /// lista foi feita quando só cripto e câmbio tinham série, e ficou para trás no dia em
-    /// que a B3 ganhou uma fonte — sem que nada apontasse o erro. Perguntar ao provedor é
-    /// a única forma de a resposta continuar certa quando as fontes mudam.
-    fn tem_historico(&self) -> bool {
         false
     }
 
@@ -584,14 +553,6 @@ impl ProviderSet {
         self.provedores
             .iter()
             .any(|p| p.covers(ativo) && p.tem_fundamento())
-    }
-
-    /// Se algum provedor sabe dar série histórica deste ativo. É o que os módulos que
-    /// desenham no tempo perguntam — em vez de trazerem a própria lista de mercados.
-    pub fn tem_historico(&self, ativo: &AssetId) -> bool {
-        self.provedores
-            .iter()
-            .any(|p| p.covers(ativo) && p.tem_historico())
     }
 
     /// Quem responderia por este ativo, para a tela poder dizer a origem antes mesmo de

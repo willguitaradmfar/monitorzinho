@@ -125,10 +125,8 @@ impl Provider for Kinvo {
         // 182 pregões são nove meses. Cortar por contagem fazia «6 meses» mostrar de
         // dezembro a setembro.
         let (range, desde) = match span {
-            Span::Dia | Span::Semana | Span::Mes => ("1mo", None),
-            Span::SeisMeses => ("1y", Some(182)),
+            Span::Mes => ("1mo", None),
             Span::Ano => ("1y", None),
-            Span::CincoAnos => ("5y", None),
         };
         // O endereço é «histórico do setor»: ele devolve o papel pedido, os pares do
         // setor dele **e o IBOV**. Pedir o histórico de `IBOV` diretamente responde 200
@@ -144,10 +142,6 @@ impl Provider for Kinvo {
             "https://open-api.kinvo.com.br/v2/sector-historic-quotation/{portador}?range={range}&interval=1d"
         );
         Some(serie(&url, simbolo, desde))
-    }
-
-    fn tem_historico(&self) -> bool {
-        true
     }
 
     /// Os proventos anunciados, do mapa de calor mensal que a Kinvo publica.

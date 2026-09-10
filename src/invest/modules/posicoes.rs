@@ -94,7 +94,7 @@ impl InvestModule for Posicoes {
         });
         let rows: Vec<Row> = linhas
             .iter()
-            .take(8)
+            .take(10)
             .map(|l| {
                 Row::new(vec![
                     l.posicao.ativo.short().to_string(),
@@ -500,10 +500,6 @@ fn ler_form(form: &Formulario) -> Result<Position, String> {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        format!("Posições · {}", self.agrupamento.label())
-    }
-
     fn quer_mercado(&self) -> bool {
         true
     }

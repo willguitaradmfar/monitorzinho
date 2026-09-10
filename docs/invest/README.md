@@ -43,10 +43,8 @@ confiável, o preço é informado, e a tela diz a origem e a idade dele.
 | [10](10-posicoes.md) | **Posições** | Ativo, quantidade, preço médio informado, preço atual, P&L. A fonte da verdade. |
 | [17](17-carteiras.md) | **Carteiras recomendadas** | O alvo de cada carteira, e o que aportar para chegar nele. |
 | [11](11-alocacao.md) | **Alocação** | Por classe, setor, moeda, país. Alvo × real e o desvio. |
-| [12](12-rebalanceamento.md) | **Rebalanceamento** | Quanto comprar e vender para voltar ao alvo — e como distribuir o aporte. |
 | [13](13-patrimonio.md) | **Patrimônio** | A curva do total ao longo do tempo, e de onde veio cada movimento dela. |
 | [14](14-proventos.md) | **Proventos** | Dividendos e JCP recebidos, agendados, yield on cost. |
-| [15](15-lancamentos.md) | **Lançamentos** | Histórico de operações. Opcional, e **nunca** escreve no preço médio. |
 | [16](16-corretoras.md) | **Corretoras** | O mesmo patrimônio visto por onde ele está custodiado. |
 
 ### Mercado — o que está acontecendo
@@ -54,19 +52,13 @@ confiável, o preço é informado, e a tela diz a origem e a idade dele.
 | | | |
 | --- | --- | --- |
 | [20](20-cotacoes.md) | **Cotações** | A watchlist: último, variação, volume, mini-gráfico. |
-| [22](22-grafico.md) | **Gráfico** | Preço no tempo, com timeframes e cursor. |
 | [23](23-heatmap.md) | **Heatmap** | A grade colorida por variação — o mercado inteiro num olhar. |
 | [24](24-indices-e-macro.md) | **Índices e macro** | IBOV, S&P, DXY, VIX, DI, treasury. |
-| [25](25-cambio.md) | **Câmbio** | USD/BRL, EUR/BRL, e a conversão que todo o resto usa. |
-| [27](27-cripto.md) | **Cripto** | Preço, funding, dominância. A única fonte com tempo real de graça. |
-| [28](28-book.md) | **Book e negócios** | Profundidade e times & trades, onde a fonte permitir. |
 
 ### Análise — o que isso quer dizer
 
 | | | |
 | --- | --- | --- |
-| [30](30-indicadores.md) | **Indicadores** | Médias, RSI, MACD, bandas — sobre a série do gráfico. |
-| [31](31-risco.md) | **Risco** | Volatilidade, drawdown, Sharpe, beta, VaR. |
 | [34](34-fundamentos.md) | **Fundamentos** | P/L, P/VP, DY, ROE, dívida. |
 
 ### Informação — o que eu preciso saber
@@ -75,7 +67,6 @@ confiável, o preço é informado, e a tela diz a origem e a idade dele.
 | --- | --- | --- |
 | [40](40-noticias.md) | **Notícias** | RSS por ativo, no formato de log que a aba Ferramentas já usa. |
 | [41](41-agenda.md) | **Agenda** | Resultados, COPOM, payroll, data-ex. |
-| [42](42-alertas.md) | **Alertas** | Regras que rodam em segundo plano e acendem cor. |
 
 ### Operação — o que eu tenho que fazer
 
@@ -123,16 +114,39 @@ Duas coisas que o plano previu e que se confirmaram medindo: a aba não faz **ne
 requisição enquanto nenhum módulo está aberto (medido com `strace -e trace=connect`), e
 nenhum arquivo da carteira é aberto antes de alguém entrar na aba.
 
+## Os módulos que saíram, e por quê
+
+A aba nasceu com vinte e oito módulos e tem treze. Não foi corte de escopo: cada um que
+saiu ou **não era usado**, ou **dizia o que outro já dizia**.
+
+| Saiu | Onde a informação está agora |
+| --- | --- |
+| Metas, Fita, Imposto de renda, Correlação, Simulador, Comparador | em lugar nenhum — nenhum deles chegou a ser usado |
+| Renda fixa | em **Índices e macro**, junto do resto do juro e da inflação |
+| Rebalanceamento | em **Alocação**, que já mostra alvo × real e o desvio |
+| Alertas | saiu inteiro, com a avaliação que rodava a cada volta |
+| Risco, Indicadores | saíram com a estatística de série que só eles usavam |
+| Book e negócios | nunca existiu — era uma tela que explicava por que não existia |
+| Lançamentos | saiu; o que ele alimentava era a separação entre aporte e valorização no Patrimônio, que agora avisa que não a faz |
+| Gráfico, Cripto, Câmbio | em **Cotações**, **Índices e macro** e no **Heatmap** |
+
+**Remover módulo é remover código.** Saíram junto: treze funções de estatística de série
+em `calc`, quatro variantes de `Span` que ninguém mais constrói (e o `match` delas em
+cinco provedores), `Portfolio::alertas` e `Portfolio::lancamentos` com as tabelas que
+os liam e gravavam, a avaliação de alertas a cada volta do mercado, o contador na barra
+de abas, e dezesseis `title()` de vista que nada chamava. Um módulo removido que deixa
+o motor dele ligado não removeu carga nenhuma.
+
 ## Ordem de construção
 
 As fases estão justificadas em [00 — Arquitetura](00-arquitetura.md#12-fases). Em resumo:
 
 1. **Fundação** — 00, 01, 02, 03, 10 (Posições), 51 (Importação).
    Entrega uma carteira que existe, é importável e mostra P&L. Sem chave de API.
-2. **Mercado grátis** — 20, 25, 26, 27, 21.
-   Cotação de cripto e câmbio em tempo real, juro brasileiro. Ainda sem chave.
+2. **Mercado grátis** — 20, 24.
+   Cotação, câmbio e juro brasileiro, tudo dentro de Cotações e Índices e macro.
 3. **Leitura** — 22, 11, 13, 24, 31.
-   O gráfico, a alocação, a curva de patrimônio e o risco.
+   A alocação, a curva de patrimônio e o mapa de calor.
 4. **O resto**, na ordem em que doer.
 
 O corte entre a fase 2 e a 3 não é arbitrário: é onde acaba o que se consegue de graça

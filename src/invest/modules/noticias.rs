@@ -91,7 +91,7 @@ impl InvestModule for Noticias {
             title: String::new(),
             rows: crate::invest::noticias::recentes(&itens)
                 .into_iter()
-                .take(8)
+                .take(10)
                 .map(|i| {
                     let (_, item) = &itens[i];
                     (
@@ -246,13 +246,6 @@ impl Vista {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        match self.aba {
-            Aba::Itens => "Notícias".into(),
-            Aba::Feeds => "Notícias · feeds".into(),
-        }
-    }
-
     fn tick(&mut self, ctx: &Ctx) {
         // A busca vive no estado da aba, não aqui — ver `invest::noticias::Cache`. O
         // módulo aberto só a mantém acordada; o cartão da home faz o mesmo pedido, e o

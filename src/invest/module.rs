@@ -15,9 +15,7 @@
 
 use crossterm::event::KeyEvent;
 
-use crate::invest::model::{
-    Alerta, AssetId, Carteira, Lancamento, Portfolio, PosKey, Position, Provento,
-};
+use crate::invest::model::{AssetId, Carteira, Portfolio, PosKey, Position, Provento};
 use crate::invest::provider::MarketSnapshot;
 
 /// Em que grupo o módulo aparece na lista.
@@ -59,9 +57,6 @@ pub enum Need {
     Posicoes,
     Cotacao,
     Cambio,
-    Historico,
-    /// Precisa de uma fonte que este build não tem. A linha diz qual.
-    Provedor(&'static str),
 }
 
 /// O que a coluna de estado da lista mostra. Vazio é o bom estado — o silêncio.
@@ -97,9 +92,6 @@ pub struct Ctx<'a> {
     /// O calendário econômico já buscado. Quem está numa tela cheia pede o de verdade,
     /// com `get`, que dispara a busca; a home lê com `ja_tem`, que não dispara nada.
     pub calendario: &'a crate::invest::calendario::Cache,
-    /// Os disparos de alerta desde que a aba abriu, do mais recente para o mais antigo.
-    /// Vêm do estado da aba e não do módulo, porque acontecem também com ele fechado.
-    pub disparos: &'a [(u64, String)],
     /// Há quanto tempo cada fonte externa respondeu — ver `InvestModule::buscado_em`.
     ///
     /// Um `&'static` no meio de referências emprestadas porque o registro é global: quem
@@ -139,9 +131,6 @@ pub enum Edit {
     SetAlvos(std::collections::BTreeMap<String, f64>),
     AddProvento(Box<Provento>),
     RemoverProvento(usize),
-    AddLancamento(Box<Lancamento>),
-    RemoverLancamento(usize),
-    SetAlertas(Vec<Alerta>),
     /// Cria ou substitui uma carteira recomendada, pelo nome.
     ///
     /// Uma operação só porque a carteira é uma coisa só: mexer num alvo e gravar a lista
@@ -641,8 +630,6 @@ pub struct Cartaz {
 
 /// A tela viva de um módulo.
 pub trait ModuleView: Send {
-    fn title(&self) -> String;
-
     /// Chamado a cada tick, só enquanto o módulo está na tela. Lê retratos que as threads
     /// publicaram; **nunca faz I/O**.
     fn tick(&mut self, _ctx: &Ctx) {}
@@ -718,7 +705,6 @@ pub fn ctx_de_teste<'a>(
         portfolio,
         market,
         providers,
-        disparos: &[],
         agora: 0,
         somente_leitura: false,
     }
@@ -738,89 +724,6 @@ pub fn providers_de_teste() -> std::sync::Arc<crate::invest::provider::ProviderS
         manuais,
         &Default::default(),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn busca_de_linha_e_por_qualquer_celula() {
-        let r = Row::new(vec!["PETR4".into(), "ação".into(), "38,42".into()]);
-        assert!(r.matches("petr"));
-        assert!(r.matches("ação"));
-        assert!(r.matches("38"));
-        assert!(!r.matches("vale"));
-        assert!(r.matches(""), "busca vazia casa com tudo");
-    }
-
-    #[test]
-    fn grupos_estao_na_ordem_de_uso() {
-        assert_eq!(Group::ALL[0], Group::Carteira);
-        assert_eq!(Group::ALL[1], Group::Mercado);
-        assert_eq!(Group::ALL.len(), 5);
-    }
-}
-
-#[cfg(test)]
-mod alvo_tests {
-    use super::*;
-    use crate::invest::model::{Market, Portfolio};
-    use crate::invest::modules;
-    use crate::invest::provider::MarketSnapshot;
-
-    /// Fixa o contrato que faltava: um módulo que desenha **um** ativo tem que abrir no
-    /// que lhe foi pedido.
-    ///
-    /// Sem isto, «Enter no PETR4» em Cotações abria o gráfico no primeiro ativo com série
-    /// que existisse — na prática, sempre o mesmo. Um atalho que ignora a seleção é pior
-    /// que atalho nenhum, porque parece funcionar.
-    #[test]
-    fn os_modulos_de_um_ativo_abrem_no_alvo() {
-        let mut portfolio = Portfolio::default();
-        // Uma watchlist em que o «primeiro com série» é outro, para o teste distinguir
-        // «abriu no alvo» de «abriu no padrão».
-        portfolio
-            .watchlist
-            .push(AssetId::new(Market::Binance, "BTCBRL"));
-        portfolio.watchlist.push(AssetId::new(Market::Fx, "USDBRL"));
-        let market = MarketSnapshot::default();
-        let providers = providers_de_teste();
-        let ctx = ctx_de_teste(&portfolio, &market, &providers);
-
-        let alvo = AssetId::new(Market::Fx, "USDBRL");
-        for id in ["grafico", "indicadores"] {
-            let m = modules::todos()
-                .into_iter()
-                .find(|m| m.id() == id)
-                .expect("o módulo tem que estar registrado");
-            let padrao = m.open(&ctx, None).title();
-            let com_alvo = m.open(&ctx, Some(&alvo)).title();
-            assert!(
-                com_alvo.contains("USDBRL"),
-                "{id} ignorou o alvo: abriu «{com_alvo}»"
-            );
-            assert_ne!(padrao, com_alvo, "{id} abriu igual com e sem alvo");
-        }
-    }
-
-    #[test]
-    fn sem_alvo_o_modulo_escolhe_por_conta_propria() {
-        // O alvo é uma preferência, não uma exigência: abrir o Gráfico pela lista de
-        // módulos não passa alvo nenhum, e ele ainda tem que mostrar alguma coisa.
-        let mut portfolio = Portfolio::default();
-        portfolio
-            .watchlist
-            .push(AssetId::new(Market::Binance, "BTCBRL"));
-        let market = MarketSnapshot::default();
-        let providers = providers_de_teste();
-        let ctx = ctx_de_teste(&portfolio, &market, &providers);
-        let m = modules::todos()
-            .into_iter()
-            .find(|m| m.id() == "grafico")
-            .unwrap();
-        assert!(m.open(&ctx, None).title().contains("BTCBRL"));
-    }
 }
 
 #[cfg(test)]

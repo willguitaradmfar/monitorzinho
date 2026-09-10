@@ -687,10 +687,6 @@ impl Vista {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        format!("Patrimônio · {}", PERIODOS[self.periodo].0)
-    }
-
     fn quer_mercado(&self) -> bool {
         true
     }
@@ -735,15 +731,17 @@ impl ModuleView for Vista {
             fatos.push(("proventos".into(), fmt(d.proventos), Tone::Normal));
             fatos.push(("variação total".into(), fmt(d.total), Tone::Destaque));
 
-            // Sem lançamentos não há como separar aporte de valorização — e apresentar
-            // tudo como mercado seria a mentira mais cara deste módulo.
-            if ctx.portfolio.lancamentos.is_empty() {
-                fatos.push((
-                    "decomposição incompleta".into(),
-                    "sem lançamentos, um aporte aparece como valorização".into(),
-                    Tone::Aviso,
-                ));
-            }
+            // **Sempre.** Nada mais registra aporte e retirada desde que o módulo de
+            // lançamentos saiu, então a decomposição não tem como separar dinheiro novo
+            // de valorização — e apresentar tudo como mercado seria a mentira mais cara
+            // deste módulo. Ela avisa em vez de calar.
+            fatos.push((
+                "decomposição incompleta".into(),
+                "aporte e retirada não são registrados — os dois aparecem como \
+                 valorização"
+                    .into(),
+                Tone::Aviso,
+            ));
         }
         fatos.extend(self.rumo(ctx));
         if lacunas > 0 {

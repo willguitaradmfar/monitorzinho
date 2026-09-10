@@ -418,13 +418,6 @@ impl Vista {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        match self.etapa {
-            Etapa::Escolhendo => "Importação · escolher arquivo".into(),
-            Etapa::Conferindo => format!("Importação · {}", self.fonte),
-        }
-    }
-
     fn tick(&mut self, _ctx: &Ctx) {
         if matches!(self.etapa, Etapa::Escolhendo) && self.entradas.is_empty() {
             self.listar();

@@ -359,7 +359,7 @@ fn ler_form(form: &Formulario, agora: u64) -> Result<Provento, String> {
     if retido > bruto {
         return Err("o retido não pode ser maior que o bruto".into());
     }
-    let pago_em = super::lancamentos_data(&form.valor("data"), agora)?;
+    let pago_em = crate::invest::modules::comum::ler_data(&form.valor("data"), agora)?;
     Ok(Provento {
         ativo,
         tipo,
@@ -372,10 +372,6 @@ fn ler_form(form: &Formulario, agora: u64) -> Result<Provento, String> {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        "Proventos".into()
-    }
-
     fn quer_mercado(&self) -> bool {
         true
     }

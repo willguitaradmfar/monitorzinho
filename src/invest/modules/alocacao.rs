@@ -204,10 +204,6 @@ struct Vista {
 }
 
 impl ModuleView for Vista {
-    fn title(&self) -> String {
-        format!("Alocação · por {}", self.dimensao.label())
-    }
-
     fn quer_mercado(&self) -> bool {
         true
     }

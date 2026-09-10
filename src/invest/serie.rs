@@ -10,7 +10,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::db;
-use crate::invest::store;
 use crate::invest::tempo::{self, Data};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -237,27 +236,6 @@ pub fn lacunas(janela: &[&Ponto]) -> u32 {
     let esperados = (tempo::dias_de(b.ano, b.mes, b.dia) - tempo::dias_de(a.ano, a.mes, a.dia) + 1)
         .max(0) as u32;
     esperados.saturating_sub(janela.len() as u32)
-}
-
-/// Aportes, retiradas e proventos de um dia, lidos dos lançamentos.
-pub fn fluxos_do_dia(portfolio: &crate::invest::model::Portfolio, agora: u64) -> (f64, f64, f64) {
-    use crate::invest::model::TipoLancamento;
-    let hoje = chave_dia(agora);
-    let mut fluxos = (0.0, 0.0, 0.0);
-    for l in portfolio
-        .lancamentos
-        .iter()
-        .filter(|l| chave_dia(l.em) == hoje)
-    {
-        match l.tipo {
-            TipoLancamento::Aporte => fluxos.0 += l.valor,
-            TipoLancamento::Retirada => fluxos.1 += l.valor,
-            TipoLancamento::Provento => fluxos.2 += l.valor,
-            _ => {}
-        }
-    }
-    let _ = store::agora;
-    fluxos
 }
 
 #[cfg(test)]

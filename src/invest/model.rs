@@ -414,82 +414,6 @@ impl TipoProvento {
     }
 }
 
-/// Um lançamento: o histórico, que é **opcional e nunca escreve no preço médio**.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Lancamento {
-    pub em: u64,
-    pub tipo: TipoLancamento,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ativo: Option<AssetId>,
-    #[serde(default)]
-    pub quantidade: f64,
-    #[serde(default)]
-    pub preco: f64,
-    #[serde(default)]
-    pub taxas: f64,
-    /// Para aporte e retirada, onde não há ativo nem preço: o valor em dinheiro.
-    #[serde(default)]
-    pub valor: f64,
-    #[serde(default)]
-    pub moeda: Option<Moeda>,
-    #[serde(default)]
-    pub nota: String,
-}
-
-impl Lancamento {
-    /// Quanto dinheiro esta linha movimentou, na moeda dela. Positivo entra, negativo sai.
-    pub fn fluxo(&self) -> f64 {
-        match self.tipo {
-            TipoLancamento::Compra => -(self.quantidade * self.preco + self.taxas),
-            TipoLancamento::Venda => self.quantidade * self.preco - self.taxas,
-            TipoLancamento::Aporte => self.valor,
-            TipoLancamento::Retirada => -self.valor,
-            TipoLancamento::Provento => self.valor,
-            TipoLancamento::Ajuste => 0.0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum TipoLancamento {
-    #[serde(rename = "compra")]
-    Compra,
-    #[serde(rename = "venda")]
-    Venda,
-    #[serde(rename = "provento")]
-    Provento,
-    #[serde(rename = "aporte")]
-    Aporte,
-    #[serde(rename = "retirada")]
-    Retirada,
-    /// Split, bonificação, o que a vida trouxer. Existe porque evento corporativo não tem
-    /// fonte sem chave, e a alternativa seria a pessoa não ter como registrar que houve um.
-    #[serde(rename = "ajuste")]
-    Ajuste,
-}
-
-impl TipoLancamento {
-    pub const ALL: [TipoLancamento; 6] = [
-        TipoLancamento::Compra,
-        TipoLancamento::Venda,
-        TipoLancamento::Provento,
-        TipoLancamento::Aporte,
-        TipoLancamento::Retirada,
-        TipoLancamento::Ajuste,
-    ];
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            TipoLancamento::Compra => "compra",
-            TipoLancamento::Venda => "venda",
-            TipoLancamento::Provento => "provento",
-            TipoLancamento::Aporte => "aporte",
-            TipoLancamento::Retirada => "retirada",
-            TipoLancamento::Ajuste => "ajuste",
-        }
-    }
-}
-
 /// Uma carteira recomendada: **o alvo, não a posição**.
 ///
 /// Ela descreve para onde a carteira deve ir — que ativos, em que proporção, e até que
@@ -536,57 +460,6 @@ impl Carteira {
     }
 }
 
-/// Uma regra de alerta. É uma `Execution` com outro nome — ver `docs/invest/42`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Alerta {
-    pub ativo: AssetId,
-    pub regra: RegraAlerta,
-    pub valor: f64,
-    /// Desligado continua desligado depois de reiniciar, mesma decisão de
-    /// `tools::persist`: voltar fazendo o que alguém desligou é o oposto do que foi pedido.
-    #[serde(default = "sim")]
-    pub ligado: bool,
-    /// Se a condição valia na última volta. É o que faz a regra disparar uma vez e não a
-    /// cada volta enquanto a condição continua verdadeira.
-    #[serde(default)]
-    pub armado: bool,
-    #[serde(default)]
-    pub ultimo_disparo: Option<u64>,
-}
-
-fn sim() -> bool {
-    true
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum RegraAlerta {
-    #[serde(rename = "acima")]
-    Acima,
-    #[serde(rename = "abaixo")]
-    Abaixo,
-    /// Variação percentual no dia, em módulo.
-    #[serde(rename = "varia")]
-    Varia,
-}
-
-impl RegraAlerta {
-    pub const ALL: [RegraAlerta; 3] = [RegraAlerta::Acima, RegraAlerta::Abaixo, RegraAlerta::Varia];
-
-    /// Se o valor da regra é uma porcentagem e não um preço. «varia mais de 0,0100» não
-    /// diz o que é; «varia mais de 0,01%» diz.
-    pub fn e_percentual(&self) -> bool {
-        matches!(self, RegraAlerta::Varia)
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            RegraAlerta::Acima => "acima de",
-            RegraAlerta::Abaixo => "abaixo de",
-            RegraAlerta::Varia => "varia mais de",
-        }
-    }
-}
-
 /// Tudo que é do usuário. O que fica em `invest.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Portfolio {
@@ -606,10 +479,6 @@ pub struct Portfolio {
     pub alvos: BTreeMap<String, f64>,
     #[serde(default)]
     pub proventos: Vec<Provento>,
-    #[serde(default)]
-    pub lancamentos: Vec<Lancamento>,
-    #[serde(default)]
-    pub alertas: Vec<Alerta>,
     /// Setor informado por ativo. Informado, e não raspado: um setor errado é pior que um
     /// setor em branco, porque leva a uma conclusão sobre concentração.
     #[serde(default)]
@@ -644,8 +513,6 @@ impl Default for Portfolio {
             watchlist: Vec::new(),
             alvos: BTreeMap::new(),
             proventos: Vec::new(),
-            lancamentos: Vec::new(),
-            alertas: Vec::new(),
             setores: BTreeMap::new(),
             mapeamentos: BTreeMap::new(),
             carteiras: Vec::new(),
@@ -665,11 +532,6 @@ impl Portfolio {
             }
         }
         for a in self.watchlist.iter() {
-            if !out.contains(a) {
-                out.push(a.clone());
-            }
-        }
-        for a in self.alertas.iter().map(|a| &a.ativo) {
             if !out.contains(a) {
                 out.push(a.clone());
             }
