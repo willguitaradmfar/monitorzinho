@@ -741,7 +741,7 @@ impl ProviderSet {
                     .is_some_and(|p| p.is_open(&q.ativo, agora));
                 if let Some(atual) = s.quotes.get(&q.ativo)
                     && q.grade.peso() < atual.grade.peso()
-                    && (!andando || q.em.saturating_sub(atual.em) < VALIDADE_DA_ORIGEM)
+                    && (!andando || q.em.saturating_sub(atual.em) < validade_da_origem(atual.grade))
                 {
                     continue;
                 }
@@ -808,9 +808,23 @@ impl ProviderSet {
 
 /// Por quanto tempo uma origem melhor segura o lugar contra uma pior.
 ///
-/// Meia hora: passado isso, um preço de mercado deixou de ser mais informativo que o
-/// informado, e prendê-lo na tela seria mostrar um número que já não descreve nada.
-const VALIDADE_DA_ORIGEM: u64 = 30 * 60;
+/// Meia hora para um preço de mercado: passado isso, ele deixou de ser mais informativo
+/// que o informado, e prendê-lo na tela seria mostrar um número que já não descreve nada.
+///
+/// **Mas não para o que é publicado uma vez por dia.** O preço do Tesouro nasce com
+/// horas de idade — é o fechamento do pregão anterior — e o informado, gravado na
+/// importação, é sempre mais novo pelo relógio. Com o prazo único, o Tesouro aparecia e
+/// voltava para «manual» sozinho na volta seguinte: a regra achava que a fonte boa tinha
+/// envelhecido quando ela só estava fazendo o que faz.
+///
+/// O prazo do publicado sai de `store::validade`, que já responde a mesma pergunta para
+/// o cache — e responder duas vezes seria ter dois números para uma decisão só.
+fn validade_da_origem(grade: Grade) -> u64 {
+    match grade {
+        Grade::Fechamento => store::validade(grade.code()),
+        _ => 30 * 60,
+    }
+}
 
 /// Quantas vezes o recuo pode dobrar. A partir de 2 s, oito passos chegam a ~8 min.
 const RECUO_MAX: u32 = 8;
@@ -1471,7 +1485,49 @@ mod prioridade_tests {
         let ativo = AssetId::new(Market::B3, "PETR4");
         set.publicar(vec![quote(Grade::AoVivo, 48.09, 1000)], Vec::new());
         set.publicar(
-            vec![quote(Grade::Manual, 38.42, 1000 + VALIDADE_DA_ORIGEM + 1)],
+            vec![quote(
+                Grade::Manual,
+                38.42,
+                1000 + validade_da_origem(Grade::AoVivo) + 1,
+            )],
+            Vec::new(),
+        );
+        assert_eq!(set.snapshot().quote(&ativo).unwrap().preco, 38.42);
+    }
+
+    /// O sintoma: o preço do Tesouro aparecia e **voltava para «manual» sozinho** na
+    /// volta seguinte. Ele é publicado uma vez por pregão, então nasce com horas de
+    /// idade; o informado, gravado na importação, é sempre mais novo pelo relógio. Medir
+    /// a validade da origem só pelo relógio entregava o lugar ao pior dos dois.
+    #[test]
+    fn o_publicado_nao_perde_o_lugar_para_o_informado_por_ser_de_ontem() {
+        let set = conjunto_com_pregao(true);
+        let ativo = AssetId::new(Market::B3, "PETR4");
+        // Um fechamento de ontem, e um informado gravado hoje de manhã.
+        set.publicar(vec![quote(Grade::Fechamento, 48.09, 1000)], Vec::new());
+        set.publicar(
+            vec![quote(Grade::Manual, 38.42, 1000 + 16 * 3600)],
+            Vec::new(),
+        );
+        assert_eq!(
+            set.snapshot().quote(&ativo).unwrap().preco,
+            48.09,
+            "o publicado tem que segurar o lugar"
+        );
+    }
+
+    /// Mas não para sempre: uma série que a fonte abandonou acaba cedendo.
+    #[test]
+    fn o_publicado_abandonado_acaba_cedendo() {
+        let set = conjunto_com_pregao(true);
+        let ativo = AssetId::new(Market::B3, "PETR4");
+        set.publicar(vec![quote(Grade::Fechamento, 48.09, 1000)], Vec::new());
+        set.publicar(
+            vec![quote(
+                Grade::Manual,
+                38.42,
+                1000 + validade_da_origem(Grade::Fechamento) + 1,
+            )],
             Vec::new(),
         );
         assert_eq!(set.snapshot().quote(&ativo).unwrap().preco, 38.42);
@@ -1487,7 +1543,11 @@ mod prioridade_tests {
         let ativo = AssetId::new(Market::B3, "PETR4");
         set.publicar(vec![quote(Grade::AoVivo, 48.09, 1000)], Vec::new());
         set.publicar(
-            vec![quote(Grade::Manual, 38.42, 1000 + VALIDADE_DA_ORIGEM + 1)],
+            vec![quote(
+                Grade::Manual,
+                38.42,
+                1000 + validade_da_origem(Grade::AoVivo) + 1,
+            )],
             Vec::new(),
         );
         // O conjunto de teste não tem provedor da B3, então `quem_busca` diz «ninguém» e
