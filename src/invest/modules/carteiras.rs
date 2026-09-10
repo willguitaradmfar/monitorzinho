@@ -326,6 +326,7 @@ impl ModuleView for Vista {
             .ajustes
             .iter()
             .map(|a| {
+                use crate::invest::modules::mercado::seta_de;
                 Row::new(vec![
                     match a.ordem {
                         // Quem saiu do alvo não tem posição na lista — ele saiu dela.
@@ -334,13 +335,30 @@ impl ModuleView for Vista {
                     },
                     a.ativo.short().to_string(),
                     calc::pct_simples(a.alvo_pct),
-                    calc::pct_simples(a.atual_pct),
-                    format!("R$ {}", calc::moeda(a.atual)),
+                    format!(
+                        "{}{}",
+                        seta_de(&a.ativo, "cart:hoje", Some(a.atual_pct)),
+                        calc::pct_simples(a.atual_pct)
+                    ),
+                    format!(
+                        "{}R$ {}",
+                        seta_de(&a.ativo, "cart:valor", Some(a.atual)),
+                        calc::moeda(a.atual)
+                    ),
                     // O preço de agora ao lado do teto: sem ele, «acima do teto» é uma
                     // afirmação que a tela pede para acreditar.
                     match (a.preco, a.teto) {
-                        (Some(p), Some(t)) => format!("{} / {}", calc::preco(p), calc::preco(t)),
-                        (Some(p), None) => format!("{} / —", calc::preco(p)),
+                        (Some(p), Some(t)) => format!(
+                            "{}{} / {}",
+                            seta_de(&a.ativo, "preco", Some(p)),
+                            calc::preco(p),
+                            calc::preco(t)
+                        ),
+                        (Some(p), None) => format!(
+                            "{}{} / —",
+                            seta_de(&a.ativo, "preco", Some(p)),
+                            calc::preco(p)
+                        ),
                         (None, _) => "—".into(),
                     },
                     // O teto barra a **compra**. Uma linha que pede venda não é barrada

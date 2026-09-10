@@ -100,9 +100,6 @@ pub struct Ctx<'a> {
     /// Os disparos de alerta desde que a aba abriu, do mais recente para o mais antigo.
     /// Vêm do estado da aba e não do módulo, porque acontecem também com ele fechado.
     pub disparos: &'a [(u64, String)],
-    /// Para que lado o patrimônio inteiro andou na última leitura. A mesma seta das
-    /// cotações, sobre o único número da aba que não é de um papel só.
-    pub tick_do_patrimonio: Option<crate::invest::provider::Tick>,
     /// Há quanto tempo cada fonte externa respondeu — ver `InvestModule::buscado_em`.
     ///
     /// Um `&'static` no meio de referências emprestadas porque o registro é global: quem
@@ -231,6 +228,16 @@ pub struct Row {
     pub cell_tones: Vec<Tone>,
     /// Profundidade, para as tabelas que agrupam. 0 é linha rasa.
     pub depth: usize,
+    /// O **fim** de uma célula com tom próprio: qual célula, que sufixo, e em que tom.
+    ///
+    /// Existe para a origem e a idade do preço poderem avisar que o número é velho **sem
+    /// pintar o número**. A alternativa era escrever a palavra «atrasado» ao lado, que
+    /// ocupa espaço em toda linha para dizer o que a cor diz de relance.
+    ///
+    /// O sufixo é um pedaço do texto que **já está** na célula, e não um acréscimo: assim
+    /// a largura da coluna continua saindo do conteúdo dela, sem ninguém precisar somar
+    /// duas partes.
+    pub rabicho: Option<(usize, String, Tone)>,
 }
 
 impl Row {
@@ -251,6 +258,12 @@ impl Row {
 
     pub fn with_cell_tones(mut self, tones: Vec<Tone>) -> Self {
         self.cell_tones = tones;
+        self
+    }
+
+    /// Marca o fim de uma célula para ser pintado à parte — ver `rabicho`.
+    pub fn com_rabicho(mut self, celula: usize, sufixo: impl Into<String>, tom: Tone) -> Self {
+        self.rabicho = Some((celula, sufixo.into(), tom));
         self
     }
 
@@ -695,7 +708,6 @@ pub fn ctx_de_teste<'a>(
     providers: &'a std::sync::Arc<crate::invest::provider::ProviderSet>,
 ) -> Ctx<'a> {
     Ctx {
-        tick_do_patrimonio: None,
         buscas: crate::invest::store::buscas(),
         patrimonio: &[],
         noticias: NOTICIAS_DE_TESTE.get_or_init(Default::default),

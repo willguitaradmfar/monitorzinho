@@ -265,15 +265,23 @@ pub fn hora(epoch: u64, offset: i64) -> u32 {
     (((epoch as i64 + offset).rem_euclid(86400)) / 3600) as u32
 }
 
-/// Quanto tempo passou, em palavras curtas: «há 4 min», «há 3 d».
+/// Quanto tempo passou, em palavras curtas: «há 12 s», «há 4 min», «há 3 d».
 ///
 /// Existe porque toda cotação desta aba aparece com a idade ao lado. Um número de quatro
 /// minutos atrás é útil; um número de quatro minutos atrás apresentado como agora não é.
+///
+/// **O primeiro minuto sai em segundos.** Ele dizia «agora» inteiro, e isso escondia a
+/// coisa que a idade existe para mostrar: uma volta de busca leva segundos, então «agora»
+/// cobria justamente a faixa em que se quer saber se a busca está viva. Cinquenta e nove
+/// segundos não são agora.
+///
+/// Acima de um minuto a unidade sobe, e não se escreve «há 4 min 12 s»: o selo mora na
+/// borda de um painel, e a precisão que importa ali é a de ordem de grandeza — «minutos»
+/// contra «horas» contra «dias».
 pub fn idade(segundos: u64) -> String {
     match segundos {
-        // O corte é em 60 e não em 45: entre os dois, a divisão por 60 dava zero e a
-        // tela escrevia «há 0 min», que não é uma quantidade de tempo.
-        0..60 => "agora".to_string(),
+        0 => "agora".to_string(),
+        s if s < 60 => format!("há {s} s"),
         s if s < 3600 => format!("há {} min", s / 60),
         s if s < 86400 => format!("há {} h", s / 3600),
         s if s < 86400 * 30 => format!("há {} d", s / 86400),
@@ -414,10 +422,20 @@ mod tests {
 
     #[test]
     fn idade_em_palavras() {
-        assert_eq!(idade(10), "agora");
+        assert_eq!(idade(0), "agora");
         assert_eq!(idade(240), "há 4 min");
         assert_eq!(idade(7200), "há 2 h");
         assert_eq!(idade(86400 * 3), "há 3 d");
+    }
+
+    /// O primeiro minuto dizia «agora» inteiro, e é justamente a faixa em que se quer
+    /// saber se a busca está viva — uma volta leva segundos.
+    #[test]
+    fn o_primeiro_minuto_sai_em_segundos() {
+        assert_eq!(idade(1), "há 1 s");
+        assert_eq!(idade(12), "há 12 s");
+        assert_eq!(idade(59), "há 59 s");
+        assert_eq!(idade(60), "há 1 min");
     }
 
     #[test]

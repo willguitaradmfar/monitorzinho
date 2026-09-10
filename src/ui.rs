@@ -3700,6 +3700,17 @@ fn render_pane_table(
                     (0, d) if d > 0 => format!("{}{texto}", "  ".repeat(d)),
                     _ => texto.clone(),
                 };
+                // O fim da célula pode ter tom próprio — a origem e a idade do preço,
+                // que avisam que o número é velho sem pintar o número. Ver `Row::rabicho`.
+                let rabicho = r
+                    .rabicho
+                    .as_ref()
+                    .filter(|(celula, _, _)| *celula == i)
+                    .and_then(|(_, sufixo, tom)| {
+                        texto
+                            .strip_suffix(sufixo.as_str())
+                            .map(|antes| (antes.to_string(), sufixo.clone(), tone_color(*tom)))
+                    });
                 // A linha seguida é da cor da marca inteira, célula por célula: o tom que
                 // o módulo pediu para cada coluna perde aqui de propósito. A estrela diz
                 // *qual* marca; a cor é o que o olho acha sem procurar, e ela só funciona
@@ -3708,7 +3719,14 @@ fn render_pane_table(
                     Some(cor) => mark_color(cor),
                     None => tone_color(r.cell_tones.get(i).copied().unwrap_or(r.tone)),
                 };
-                Cell::from(com_seta(&texto, Style::default().fg(cor)))
+                // A marca vence o rabicho: uma linha seguida é de uma cor só, e o
+                // amarelo do «não é de agora» dentro dela leria como outra marca.
+                let Some((antes, sufixo, cor_rabicho)) = rabicho.filter(|_| marca.is_none()) else {
+                    return Cell::from(com_seta(&texto, Style::default().fg(cor)));
+                };
+                let mut spans = com_seta(&antes, Style::default().fg(cor)).spans;
+                spans.push(Span::styled(sufixo, Style::default().fg(cor_rabicho)));
+                Cell::from(Line::from(spans))
             }));
             let linha = UiRow::new(celulas);
             match (marca, r.tone) {

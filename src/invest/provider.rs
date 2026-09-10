@@ -264,29 +264,18 @@ pub struct StatusFonte {
     pub peso: Option<u64>,
 }
 
-/// Para onde o preço andou **desde a leitura anterior**. Não é a variação do dia: é o
-/// último passo, e ele responde outra pergunta — «está andando agora, e para que lado».
+/// Se uma volta de um provedor conta como «falei com a fonte», para o carimbo de idade.
 ///
-/// Um papel pode estar em alta no dia e caindo neste minuto, e as duas coisas importam
-/// para quem está olhando a tela. A variação do dia já estava lá e continua onde estava;
-/// isto é o indicador de momento ao lado dela.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tick {
-    Subiu,
-    Desceu,
-}
-
-/// Para que lado o preço andou entre duas leituras.
+/// **Um provedor local não conta, por mais preços que responda.** Foi por não perguntar
+/// isto que o «há quanto tempo» mentia sem internet: o provedor `informado` não faz I/O
+/// nenhum, roda de dois em dois segundos, cobre todo ativo e sempre devolve `Ok` — então
+/// com a rede caída ele carimbava a cotação como recém-buscada a cada duas voltas de
+/// relógio, e a tela dizia «agora» sobre números que ninguém confirmava havia horas.
 ///
-/// `None` quando ele não andou — e aí a seta anterior **fica**. Uma seta que aparece por
-/// uma volta e some não chega a ser lida, e a pergunta que ela responde é «para que lado
-/// foi o último movimento», não «mexeu exatamente nesta volta».
-pub fn tick_entre(novo: f64, anterior: f64) -> Option<Tick> {
-    match novo.total_cmp(&anterior) {
-        std::cmp::Ordering::Greater => Some(Tick::Subiu),
-        std::cmp::Ordering::Less => Some(Tick::Desceu),
-        std::cmp::Ordering::Equal => None,
-    }
+/// Resposta vazia também não conta: uma fonte que respondeu sem nenhum papel não deixou
+/// nada mais novo do que já havia.
+fn conta_como_busca(remoto: bool, quantas: usize) -> bool {
+    remoto && quantas > 0
 }
 
 /// Volume, máxima e mínima de quem os tiver, quando o dono do preço não os tem.
@@ -318,23 +307,11 @@ fn herdar_acessorios(mut q: Quote, anterior: &Quote) -> Quote {
 pub struct MarketSnapshot {
     pub quotes: HashMap<AssetId, Quote>,
     pub fontes: Vec<StatusFonte>,
-    /// Para que lado foi o último movimento de cada papel.
-    ///
-    /// Fora da `Quote` de propósito: um provedor não sabe disto e não tem como saber. É
-    /// uma propriedade do **nosso histórico de leituras**, não do dado — a mesma divisão
-    /// que põe a cor de uma marca fora da linha que a veste.
-    pub ticks: HashMap<AssetId, Tick>,
 }
 
 impl MarketSnapshot {
     pub fn quote(&self, ativo: &AssetId) -> Option<&Quote> {
         self.quotes.get(ativo)
-    }
-
-    /// Para que lado o preço andou na última leitura. `None` enquanto ele não mudou
-    /// nenhuma vez desde que o programa abriu.
-    pub fn tick(&self, ativo: &AssetId) -> Option<Tick> {
-        self.ticks.get(ativo).copied()
     }
 
     /// Converte para BRL. `None` quando não há como — e aí a linha fica de fora do total
@@ -679,7 +656,7 @@ impl ProviderSet {
                         // Só o que ele de fato entregou sai da lista. Um provedor que
                         // devolve metade dos ativos deixa a outra metade para o seguinte.
                         pendentes.retain(|a| !quotes.iter().any(|q| q.ativo == *a));
-                        if !quotes.is_empty() {
+                        if conta_como_busca(provedor.remoto(), quotes.len()) {
                             crate::invest::store::buscas()
                                 .carimbar(crate::invest::store::fonte::COTACAO);
                         }
@@ -757,15 +734,6 @@ impl ProviderSet {
                     && (!andando || q.em.saturating_sub(atual.em) < VALIDADE_DA_ORIGEM)
                 {
                     continue;
-                }
-                // Para que lado o preço andou nesta leitura. **Preço igual mantém a seta
-                // anterior**: uma seta que aparece por uma volta e some não chega a ser
-                // lida, e a pergunta é «para que lado foi o último movimento», não «mexeu
-                // exatamente agora».
-                if let Some(anterior) = s.quotes.get(&q.ativo)
-                    && let Some(t) = tick_entre(q.preco, anterior.preco)
-                {
-                    s.ticks.insert(q.ativo.clone(), t);
                 }
                 let q = match s.quotes.get(&q.ativo) {
                     Some(anterior) => herdar_acessorios(q, anterior),
@@ -851,6 +819,50 @@ pub fn dia_util_br(agora: u64) -> bool {
 mod tests {
     use super::*;
 
+    /// A regressão que a falta de internet revelou: o provedor `informado` não faz I/O,
+    /// roda de dois em dois segundos, cobre todo ativo e sempre devolve `Ok`. Com a rede
+    /// caída ele carimbava a cotação como recém-buscada a cada duas voltas de relógio, e
+    /// a tela dizia «agora» sobre números que ninguém confirmava havia horas.
+    #[test]
+    fn provedor_local_nao_conta_como_ida_a_fonte() {
+        assert!(
+            !conta_como_busca(false, 21),
+            "informado não fala com fonte nenhuma"
+        );
+        assert!(conta_como_busca(true, 1));
+    }
+
+    /// Resposta vazia de fonte remota também não conta: ela não deixou nada mais novo do
+    /// que já havia.
+    #[test]
+    fn resposta_vazia_nao_renova_o_carimbo() {
+        assert!(!conta_como_busca(true, 0));
+        assert!(!conta_como_busca(false, 0));
+    }
+
+    /// A regra amarrada ao conjunto de verdade: nenhum provedor que não faz rede pode
+    /// mexer no relógio, e um provedor local novo entra coberto sem que ninguém lembre.
+    #[test]
+    fn nenhum_provedor_local_mexe_no_relogio() {
+        let manuais = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let todos = crate::invest::providers::todos(std::sync::Arc::clone(&manuais));
+        let locais: Vec<&'static str> = todos
+            .iter()
+            .filter(|p| !p.remoto())
+            .map(|p| p.id())
+            .collect();
+        assert!(
+            !locais.is_empty(),
+            "o teste perde o sentido se não houver provedor local nenhum"
+        );
+        for id in locais {
+            assert!(
+                !conta_como_busca(false, 99),
+                "{id} é local e não pode carimbar"
+            );
+        }
+    }
+
     fn q(em: u64, volume: Option<f64>, max24: Option<f64>) -> Quote {
         Quote {
             ativo: AssetId::new(Market::B3, "PETR4"),
@@ -889,19 +901,6 @@ mod tests {
         let novo = herdar_acessorios(q(hoje, None, None), &q(ontem, Some(1e6), Some(11.0)));
         assert_eq!(novo.volume, None);
         assert_eq!(novo.max24, None);
-    }
-
-    #[test]
-    fn a_seta_diz_para_que_lado_foi_o_ultimo_movimento() {
-        assert_eq!(tick_entre(10.1, 10.0), Some(Tick::Subiu));
-        assert_eq!(tick_entre(9.9, 10.0), Some(Tick::Desceu));
-    }
-
-    /// Preço parado **não** apaga a seta: quem a apagasse faria a seta piscar por uma
-    /// volta e sumir, e ela existe justamente para ficar até o próximo movimento.
-    #[test]
-    fn preco_parado_nao_mexe_na_seta() {
-        assert_eq!(tick_entre(10.0, 10.0), None);
     }
 
     #[test]

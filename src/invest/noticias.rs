@@ -92,7 +92,8 @@ impl Cache {
                             let novos = rss::parse(&texto);
                             // Um feed que responde lixo é marcado como quebrado e os
                             // outros seguem — um feed ruim não derruba o módulo.
-                            match novos.is_empty() {
+                            let vazio = novos.is_empty();
+                            match vazio {
                                 true => anotar(&erros, Some("respondeu sem itens legíveis".into())),
                                 false => anotar(&erros, None),
                             }
@@ -107,11 +108,15 @@ impl Cache {
                                     lista.drain(..n - TETO);
                                 }
                             }
-                            // Só a volta boa carimba. Um feed que caiu não deixou a
-                            // lista mais nova, e dizer «atualizado agora» sobre ela
-                            // seria o engano que o carimbo existe para desfazer.
-                            crate::invest::store::buscas()
-                                .carimbar(crate::invest::store::fonte::NOTICIA);
+                            // Só a volta boa carimba, e **boa é com item dentro**. Um
+                            // feed que caiu não deixou a lista mais nova; um que
+                            // respondeu ilegível também não. Dizer «atualizado agora»
+                            // sobre qualquer um dos dois é o engano que o carimbo existe
+                            // para desfazer.
+                            if !vazio {
+                                crate::invest::store::buscas()
+                                    .carimbar(crate::invest::store::fonte::NOTICIA);
+                            }
                         }
                         Err(erro) => anotar(&erros, Some(erro.frase())),
                     }

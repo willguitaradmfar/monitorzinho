@@ -115,6 +115,31 @@ execução.
 É o primeiro uso concreto do selo, e vale registrar por isso: a defasagem invisível
 escondia um cache congelado havia semanas.
 
+## O que a falta de internet revelou
+
+O selo **renovava sem rede**. Com a internet caída ele dizia «agora» em todos os painéis,
+que é exatamente o contrário do que ele existe para fazer.
+
+O culpado não era o carimbo, era quem o encostava. A cotação era carimbada por qualquer
+provedor que devolvesse `Ok` com pelo menos um preço — e o provedor `informado` não faz
+I/O nenhum, cobre todo ativo, roda de dois em dois segundos e sempre devolve `Ok`. Com a
+rede caída ele carimbava a cotação como recém-buscada a cada duas voltas de relógio.
+
+Agora só conta quem **foi à rede**: `Provider::remoto()`. E um feed que respondeu sem
+nenhum item legível também deixou de contar — ele falou com a fonte, mas não trouxe nada
+mais novo do que já havia, e para «este dado é de quando?» é isso que importa.
+
+Medido rodando o programa dentro de um *network namespace* sem rota nenhuma
+(`unshare -rn`), com os carimbos semeados duas horas atrás:
+
+```
+antes:   agora ┘   agora ┘   agora ┘   agora ┘   agora ┘   agora ┘
+depois:  há 2 h ┘  há 2 h ┘  há 2 h ┘  há 2 h ┘  há 2 h ┘  há 2 h ┘
+```
+
+Os preços continuam na tela nos dois casos — vindos do cache e do informado, que é como
+tem que ser. O que muda é a tela parar de dizer que eles acabaram de chegar.
+
 ## Como testar
 
 ### 1. A idade da consulta em toda parte
@@ -146,20 +171,32 @@ faltava.
 Com a bolsa fechada, essas horas todas são normais e o selo do painel continua dizendo
 `agora`: o mercado é que está parado, não a busca.
 
-### 4. Uma fonte que caiu não mente
+### 4. Sem rede nenhuma, o relógio para
+
+O teste que pega a regressão inteira, e não precisa esperar a internet cair:
+
+```sh
+unshare -rn env XDG_DATA_HOME=/tmp/sandbox monitorzinho
+```
+
+**Esperado:** os selos parados na última busca boa — «há 2 h», «há 1 d» — e **nunca**
+«agora». Os preços continuam aparecendo, vindos do cache e do informado; é a idade que
+tem que dizer a verdade sobre eles.
+
+### 5. Uma fonte que caiu não mente
 
 Derrube a rede e espere. **Esperado:** o selo **para de avançar** e amarela na primeira
 hora; ele não volta para `agora` a cada tentativa falha. O rodapé de Cotações continua
 dizendo qual fonte caiu e por quê.
 
-### 5. Proventos rebusca quando envelhece
+### 6. Proventos rebusca quando envelhece
 
 Abra Proventos. **Esperado:** o selo sai de «nunca buscado» e vira uma idade de verdade
 em alguns segundos, e a tabela `busca` ganha a linha `anunciado`. Feche e reabra dentro
 do mesmo dia: **não** rebusca (o selo mostra a idade acumulada). Mais de 24 h depois,
 rebusca uma vez.
 
-### 6. Notícias com data
+### 7. Notícias com data
 
 Abra Notícias. **Esperado:** nenhuma linha com «sem data», e a coluna *Quando* em ordem
 decrescente de verdade.
@@ -184,6 +221,7 @@ Há teste ao vivo contra os cinco endereços:
 - Preço sem idade ao lado em qualquer módulo
 - «sem data» voltando em Notícias
 - Uma notícia da manhã acima de uma da tarde (o fuso voltou a ser ignorado)
+- Selo dizendo «agora» com a rede caída (voltou a carimbar sem ter ido à rede)
 - Proventos preso em «nunca buscado» depois de aberto (o cache voltou a congelar)
 - O cartão de Gráfico ou de Fundamentos dizendo «nunca buscado» sobre preços ao vivo — o
   cartão deles é uma lista de papéis com o **preço** ao lado, e a idade dali é a do preço

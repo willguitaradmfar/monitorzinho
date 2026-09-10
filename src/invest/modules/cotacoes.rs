@@ -88,7 +88,10 @@ impl InvestModule for Cotacoes {
                 .map(|(a, variacao, preco)| {
                     Row::new(vec![
                         a.short().to_string(),
-                        format!("{}{preco}", mercado::seta(ctx.market.tick(a))),
+                        format!(
+                            "{}{preco}",
+                            mercado::seta_de(a, "preco", ctx.market.quote(a).map(|q| q.preco))
+                        ),
                         variacao.map(calc::pct).unwrap_or_else(|| "—".into()),
                     ])
                     .with_cell_tones(vec![

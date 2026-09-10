@@ -119,7 +119,8 @@ impl InvestModule for Indices {
                     };
                     // Taxa do Banco Central sai com «%»; preço sai como preço. Sem isso
                     // «0,0517» ao lado de «5,09» parece a mesma unidade e não é.
-                    let seta = crate::invest::modules::mercado::seta(ctx.market.tick(&ativo));
+                    let seta =
+                        crate::invest::modules::mercado::seta_de(&ativo, "indice", Some(q.preco));
                     let valor = match mercado {
                         Market::Bcb => {
                             calc::pct_casas(q.preco, if ativo.symbol == "CDI" { 4 } else { 2 })
@@ -207,7 +208,7 @@ impl ModuleView for Vista {
                     // «0,0517» não diz o que é. E taxa diária precisa de quatro casas.
                     let valor = format!(
                         "{}{}",
-                        crate::invest::modules::mercado::seta(ctx.market.tick(&ativo)),
+                        crate::invest::modules::mercado::seta_de(&ativo, "indice", Some(q.preco)),
                         match mercado {
                             Market::Bcb => {
                                 calc::pct_casas(q.preco, if ativo.symbol == "CDI" { 4 } else { 2 })

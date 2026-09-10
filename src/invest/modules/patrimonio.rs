@@ -78,7 +78,7 @@ impl InvestModule for Patrimonio {
             "patrimônio".into(),
             format!(
                 "{}R$ {}",
-                crate::invest::modules::mercado::seta(ctx.tick_do_patrimonio),
+                crate::invest::momento::momento().seta("patrimonio:total", t.mercado),
                 calc::moeda(t.mercado)
             ),
             Tone::Destaque,
@@ -110,9 +110,14 @@ impl InvestModule for Patrimonio {
                 "no dia".into(),
                 // Reais **e** porcentagem: «R$ 10 mil» não diz se o dia foi bom sem se
                 // saber sobre quanto, e a porcentagem sozinha não diz o tamanho.
-                match t.dia_pct() {
-                    Some(p) => format!("R$ {} ({})", calc::moeda(t.dia), calc::pct(p)),
-                    None => format!("R$ {}", calc::moeda(t.dia)),
+                {
+                    let seta = crate::invest::momento::momento().seta("patrimonio:dia", t.dia);
+                    match t.dia_pct() {
+                        Some(p) => {
+                            format!("{seta}R$ {} ({})", calc::moeda(t.dia), calc::pct(p))
+                        }
+                        None => format!("{seta}R$ {}", calc::moeda(t.dia)),
+                    }
                 },
                 crate::invest::modules::heatmap::tom(Some(t.dia)),
             ));
@@ -517,7 +522,7 @@ impl Vista {
             "patrimônio".into(),
             format!(
                 "{}R$ {}",
-                crate::invest::modules::mercado::seta(ctx.tick_do_patrimonio),
+                crate::invest::momento::momento().seta("patrimonio:total", t.mercado),
                 calc::moeda(t.mercado)
             ),
             Tone::Destaque,
@@ -555,9 +560,14 @@ impl Vista {
                 "no dia".into(),
                 // Reais **e** porcentagem: «R$ 10 mil» não diz se o dia foi bom sem se
                 // saber sobre quanto, e a porcentagem sozinha não diz o tamanho.
-                match t.dia_pct() {
-                    Some(p) => format!("R$ {} ({})", calc::moeda(t.dia), calc::pct(p)),
-                    None => format!("R$ {}", calc::moeda(t.dia)),
+                {
+                    let seta = crate::invest::momento::momento().seta("patrimonio:dia", t.dia);
+                    match t.dia_pct() {
+                        Some(p) => {
+                            format!("{seta}R$ {} ({})", calc::moeda(t.dia), calc::pct(p))
+                        }
+                        None => format!("{seta}R$ {}", calc::moeda(t.dia)),
+                    }
                 },
                 crate::invest::modules::heatmap::tom(Some(t.dia)),
             ));

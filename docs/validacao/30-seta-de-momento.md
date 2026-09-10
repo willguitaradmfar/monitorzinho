@@ -27,13 +27,26 @@ movimento», não «mexeu exatamente nesta volta».
 
 ### Onde ela aparece
 
+**Em todo número que anda com o preço, e não só num por linha.** A primeira versão punha
+uma seta por linha e isso deixava metade da tela sem resposta: quem olha o P&L não olha o
+preço ao lado dele.
+
+**E cada número tem a própria direção.** A segunda versão guardava a direção do *preço* e
+repetia a mesma seta em toda coluna — estava errado e era visível: a máxima do dia pode
+subir numa volta em que o preço caiu, e a seta dizia o contrário. Agora a memória é por
+grandeza (`invest::momento`), não por papel.
+
 | Módulo | Em quê |
 | --- | --- |
-| Patrimônio | no total da carteira, cartão e tela |
-| Posições | no valor da posição (cartão) e no preço atual (tela) |
-| Cotações · Cripto · Câmbio | no preço |
+| Patrimônio | no total da carteira **e no «no dia»**, cartão e tela |
+| Posições | no valor da posição, no preço atual, no **Mercado** e no **P&L** |
+| Cotações · Cripto · Câmbio | no preço, na **Var%**, na **Máx 24h** e na **Mín 24h** |
+| Carteiras recomendadas | no **Hoje**, no **Valor** e no **Preço / teto** |
 | Índices e macro | no valor do indicador |
 | Heatmap | na variação, dentro de cada caixa |
+
+Uma linha cujo preço não se move — Tesouro, CDB, qualquer coisa informada à mão — não
+ganha seta nenhuma, e é assim que tem que ser: ela não andou.
 
 O tique do **patrimônio** não é o de nenhum papel: é a soma das posições, e por isso ele
 é medido no estado da aba, que é quem tem a carteira e o mercado na mão ao mesmo tempo —
@@ -77,6 +90,17 @@ no meio.
 
 ## Como testar
 
+### 0. Cada coluna tem a própria seta
+
+Cotações, com o pregão andando. **Esperado:** linhas em que o preço tem `▼` e a *Máx 24h*
+não tem seta nenhuma — o preço caiu, a máxima do dia ficou onde estava. Se as quatro
+colunas de uma linha mostram sempre a mesma seta, a memória voltou a ser por papel.
+
+### 0.1. Ela está em todo número que anda
+
+Posições, com o pregão aberto: a mesma linha com seta no preço, no Mercado **e** no P&L.
+Carteiras: no Hoje, no Valor e no Preço. Patrimônio: no total e no «no dia».
+
 ### 1. A seta aparece e discorda do dia
 
 Aba Invest, deixe uma volta ou duas passarem com o pregão aberto. **Esperado:** setas
@@ -106,6 +130,28 @@ servidas pela Kinvo, e o preço atual entre as duas.
 Em Posições, `Ctrl+U` pelos quatro agrupamentos. **Esperado:** o total de cada grupo
 debaixo de «Mercado», e o peso debaixo de «Peso».
 
+## «Atrasado» virou cor
+
+A palavra ocupava espaço em toda linha — `48,09 kinvo atrasado` — para dizer o que a cor
+diz de relance. Saiu. No lugar dela, **a origem e a idade saem em amarelo** quando o preço
+não é ao vivo, e em cinza quando é:
+
+```
+▼ 18,41 kinvo·há 16 min      ← amarelo: a B3 vem com atraso
+393.917,00 binance·há 37 s   ← cinza: ao vivo
+```
+
+O número em si **não** é pintado: um preço amarelo se leria como um alerta sobre o preço,
+e o que está velho é a leitura, não o valor. É o que `Row::rabicho` existe para permitir —
+o fim de uma célula com tom próprio, sem virar outra coluna.
+
+## O primeiro minuto sai em segundos
+
+`há 12 s`, `há 47 s`. A faixa inteira abaixo de um minuto dizia «agora», e é justamente
+nela que se quer saber se a busca está viva — uma volta leva segundos. Acima de um minuto
+a unidade sobe e não se escreve «há 4 min 12 s»: o selo mora na borda de um painel, e ali
+a precisão que importa é a de ordem de grandeza.
+
 ## Como saber que falhou
 
 - Seta sempre da mesma cor que a variação do dia (herdou a cor da célula)
@@ -113,4 +159,8 @@ debaixo de «Mercado», e o peso debaixo de «Peso».
 - Seta numa coluna separada em vez de colada no número
 - Máx menor que Mín, ou o preço fora do intervalo entre as duas
 - Volume de ontem aparecendo hoje
+- Todas as colunas de uma linha com a mesma seta (a memória voltou a ser por papel)
+- A palavra «atrasado» de volta na coluna do preço
+- Origem e idade em amarelo num preço ao vivo, ou em cinza num atrasado
+- «agora» cobrindo os primeiros cinquenta e nove segundos
 - Total de grupo debaixo do rótulo errado em Posições

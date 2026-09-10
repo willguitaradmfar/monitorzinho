@@ -224,7 +224,7 @@ fn celula(c: &Caixa, ctx: &Ctx, modo: Tamanho) -> Cell {
         sub: match c.variacao {
             Some(v) => format!(
                 "{}{}",
-                crate::invest::modules::mercado::seta(ctx.market.tick(&c.ativo)),
+                crate::invest::modules::mercado::seta_de(&c.ativo, "var", Some(v)),
                 calc::pct(v)
             ),
             None => ctx

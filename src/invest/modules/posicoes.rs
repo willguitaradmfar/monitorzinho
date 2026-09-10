@@ -96,11 +96,15 @@ impl InvestModule for Posicoes {
             .iter()
             .take(8)
             .map(|l| {
-                let seta = crate::invest::modules::mercado::seta(ctx.market.tick(&l.posicao.ativo));
                 Row::new(vec![
                     l.posicao.ativo.short().to_string(),
                     format!(
-                        "{seta}{}",
+                        "{}{}",
+                        crate::invest::modules::mercado::seta_de(
+                            &l.posicao.ativo,
+                            "mercado",
+                            l.mercado_brl
+                        ),
                         l.mercado_brl.map(calc::moeda).unwrap_or_else(|| "—".into())
                     ),
                     l.variacao_pct.map(calc::pct).unwrap_or_else(|| "—".into()),
@@ -265,19 +269,23 @@ impl Vista {
                 grupo_atual = Some(chave);
             }
 
-            let seta = crate::invest::modules::mercado::seta(ctx.market.tick(&l.posicao.ativo));
+            use crate::invest::modules::mercado::seta_de;
+            let seta = seta_de(&l.posicao.ativo, "preco", l.preco);
+            let origem = l.origem();
             let atual = match l.preco {
-                Some(p) => {
-                    let origem = l.origem();
-                    match origem.is_empty() {
-                        true => format!("{seta}{}", calc::preco(p)),
-                        false => format!("{seta}{} {origem}", calc::preco(p)),
-                    }
-                }
+                Some(p) => match origem.is_empty() {
+                    true => format!("{seta}{}", calc::preco(p)),
+                    false => format!("{seta}{} {origem}", calc::preco(p)),
+                },
                 None => "—".to_string(),
             };
             let pnl = match (l.pnl_brl, l.pnl_pct) {
-                (Some(v), Some(p)) => format!("{} ({})", calc::moeda(v), calc::pct(p)),
+                (Some(v), Some(p)) => format!(
+                    "{}{} ({})",
+                    seta_de(&l.posicao.ativo, "pnl", Some(v)),
+                    calc::moeda(v),
+                    calc::pct(p)
+                ),
                 _ => "—".to_string(),
             };
             let tom_pnl = match l.pnl_brl {
@@ -298,7 +306,15 @@ impl Vista {
                         .map(calc::preco)
                         .unwrap_or_else(|| "—".into()),
                     atual,
-                    l.mercado_brl.map(calc::moeda).unwrap_or("—".into()),
+                    l.mercado_brl
+                        .map(|v| {
+                            format!(
+                                "{}{}",
+                                seta_de(&l.posicao.ativo, "mercado", Some(v)),
+                                calc::moeda(v)
+                            )
+                        })
+                        .unwrap_or("—".into()),
                     pnl,
                     carteira::peso(l, &totais)
                         .map(calc::pct_simples)
@@ -317,6 +333,14 @@ impl Vista {
                     tom_pnl,
                     Tone::Dim,
                 ])
+                .com_rabicho(
+                    4,
+                    origem,
+                    match l.nao_e_de_agora() {
+                        true => Tone::Aviso,
+                        false => Tone::Dim,
+                    },
+                )
                 .at_depth(usize::from(self.agrupamento != Agrupamento::Plano)),
             );
         }

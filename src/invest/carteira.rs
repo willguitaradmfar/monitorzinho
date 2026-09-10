@@ -63,9 +63,17 @@ impl Linha {
             Grade::Manual => format!("manual·{quando}"),
             // Sem contrato: a marca vem antes do nome, porque é o aviso.
             Grade::NaoOficial => format!("{} não-oficial·{quando}", self.fonte),
-            Grade::AoVivo => format!("{}·{quando}", self.fonte),
-            _ => format!("{} {}·{quando}", self.fonte, grade.marca()),
+            // «atrasado» e «fech.» saíram: a palavra ocupava espaço em toda linha para
+            // dizer o que a cor diz de relance. Quem não é ao vivo sai em amarelo — ver
+            // `nao_e_de_agora`.
+            _ => format!("{}·{quando}", self.fonte),
         }
+    }
+
+    /// Se o preço desta linha **não** é de agora, para a origem e a idade saírem em
+    /// amarelo. Um preço ao vivo não ganha aviso nenhum, que é o bom estado.
+    pub fn nao_e_de_agora(&self) -> bool {
+        !matches!(self.grade, Some(Grade::AoVivo))
     }
 }
 

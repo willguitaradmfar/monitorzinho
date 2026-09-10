@@ -8,7 +8,7 @@
 use crate::invest::calc;
 use crate::invest::model::AssetId;
 use crate::invest::module::{Ctx, Row, Tone};
-use crate::invest::provider::{Quote, Tick};
+use crate::invest::provider::Quote;
 use crate::invest::tempo;
 
 /// As colunas de uma tabela de cotação.
@@ -28,20 +28,17 @@ pub const COL_VAR: usize = 2;
 #[cfg(test)]
 pub const COL_VOLUME: usize = 5;
 
-/// A seta do último movimento, colada na frente do número a que ela se refere.
+/// A seta do último movimento **deste número**, colada na frente dele.
 ///
 /// Colada, e não numa coluna própria: uma coluna separa a seta do valor que ela
 /// qualifica, e o olho tem que ir e voltar. Ela **é** parte do número.
 ///
-/// Devolve texto e não cor porque quem pinta é o desenho: a seta tem cor própria — verde
-/// sobe, vermelho desce — e ela não pode herdar o tom da célula, senão diria a coisa
-/// errada num papel que está em alta no dia e caindo neste minuto. Ver `ui::com_seta`.
-pub fn seta(tick: Option<Tick>) -> &'static str {
-    match tick {
-        Some(Tick::Subiu) => "▲ ",
-        Some(Tick::Desceu) => "▼ ",
-        None => "",
-    }
+/// Um atalho para `momento::momento().seta_de`, com a chave montada aqui para todos os
+/// módulos a montarem igual. A chave é por **grandeza**, e não por papel: a máxima do dia
+/// pode subir numa volta em que o preço caiu, e uma seta por papel diria o contrário em
+/// uma das duas colunas.
+pub fn seta_de(ativo: &AssetId, campo: &str, valor: Option<f64>) -> &'static str {
+    crate::invest::momento::momento().seta_de(&format!("{ativo}:{campo}"), valor)
 }
 
 /// Uma linha de cotação, com a regra de cor que vale em toda a aba.
@@ -87,27 +84,41 @@ pub fn linha(
     // A fonte sempre aparece, e a marca de qualidade junto quando ela existe. «48,08» não
     // diz nada; «48,08 brapi» diz a quem reclamar, e «48,08 yahoo não-oficial» diz que
     // não há contrato nenhum atrás daquele número.
-    let origem = match (q.grade, q.grade.marca().is_empty()) {
-        (crate::invest::provider::Grade::Manual, _) => "manual".to_string(),
-        (_, true) => q.fonte.to_string(),
-        (crate::invest::provider::Grade::NaoOficial, _) => {
-            format!("{} não-oficial", q.fonte)
-        }
-        (_, false) => format!("{} {}", q.fonte, q.grade.marca()),
+    // **Sem a palavra «atrasado».** Ela ocupava espaço em toda linha para dizer o que a
+    // cor diz de relance — e agora diz: o rabicho da célula (a fonte e a idade) sai em
+    // amarelo quando o preço não é ao vivo. Quem é ao vivo continua sem aviso nenhum,
+    // que é o bom estado.
+    use crate::invest::provider::Grade;
+    let origem = match q.grade {
+        Grade::Manual => "manual".to_string(),
+        Grade::NaoOficial => format!("{} não-oficial", q.fonte),
+        _ => q.fonte.to_string(),
     };
     // A idade vai junto do preço, sempre — é a única coluna em que ela é sobre **este**
     // número. Antes ela só aparecia na coluna de volume, e só nos ativos sem volume: os
     // que tinham volume não diziam de quando era o preço.
+    let rabicho = format!("{origem}·{}", tempo::idade(q.idade(agora)));
     let preco = format!(
-        "{}{} {origem}·{}",
-        seta(ctx.market.tick(ativo)),
-        calc::preco(q.preco),
-        tempo::idade(q.idade(agora))
+        "{}{} {rabicho}",
+        seta_de(ativo, "preco", Some(q.preco)),
+        calc::preco(q.preco)
     );
+    // Amarelo é «este número não é de agora». Um preço ao vivo não ganha cor nenhuma.
+    let tom_rabicho = match q.grade {
+        Grade::AoVivo => Tone::Dim,
+        _ => Tone::Aviso,
+    };
+    // Cada número tem a **própria** seta: a máxima do dia pode subir numa volta em que o
+    // preço caiu, e repetir a seta do preço nas outras colunas diria o contrário numa
+    // delas.
+    let extremo = |campo: &str, v: Option<f64>| {
+        v.map(|v| format!("{}{}", seta_de(ativo, campo, Some(v)), calc::preco(v)))
+            .unwrap_or_default()
+    };
     // A variação só é mostrada onde ela significa alguma coisa.
     let (variacao, tom_var) = match q.variacao().filter(|_| ao_vivo) {
         Some(v) => (
-            calc::pct(v),
+            format!("{}{}", seta_de(ativo, "var", Some(v)), calc::pct(v)),
             match v >= 0.0 {
                 true => Tone::Bom,
                 false => Tone::Ruim,
@@ -125,8 +136,8 @@ pub fn linha(
         nome,
         preco,
         variacao,
-        q.max24.map(calc::preco).unwrap_or_default(),
-        q.min24.map(calc::preco).unwrap_or_default(),
+        extremo("max", q.max24),
+        extremo("min", q.min24),
         volume,
     ])
     .with_cell_tones(vec![
@@ -143,6 +154,7 @@ pub fn linha(
         Tone::Dim,
         Tone::Dim,
     ])
+    .com_rabicho(1, rabicho, tom_rabicho)
 }
 
 /// O estado das fontes, para a linha que responde «por que este número não mexe».
