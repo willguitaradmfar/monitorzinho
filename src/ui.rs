@@ -3135,7 +3135,14 @@ fn render_invest_tab(frame: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     let cartoes = app.invest_home();
-    render_invest_grade(frame, linhas[0], &cartoes, &app.marks);
+    render_invest_grade(
+        frame,
+        linhas[0],
+        &cartoes,
+        &app.marks,
+        crate::invest::store::buscas(),
+        crate::invest::store::agora(),
+    );
 
     // O rodapé diz as duas teclas que a grade não consegue mostrar sozinha, e cede o
     // lugar para um problema de gravação quando há um — um erro ao salvar a carteira
@@ -3233,6 +3240,8 @@ fn render_invest_grade(
     area: Rect,
     cartoes: &[crate::app::Cartao],
     marks: &crate::monitor::mark::Marks,
+    buscas: &crate::invest::store::Buscas,
+    agora: u64,
 ) {
     let desejadas: Vec<u16> = cartoes
         .iter()
@@ -3257,7 +3266,7 @@ fn render_invest_grade(
             let Some(cartao) = cartoes.get(indice) else {
                 return;
             };
-            render_cartao(frame, *celula, cartao, indice, marks);
+            render_cartao(frame, *celula, cartao, indice, marks, buscas, agora);
         }
     }
 }
@@ -3269,14 +3278,19 @@ fn render_cartao(
     cartao: &crate::app::Cartao,
     indice: usize,
     marks: &crate::monitor::mark::Marks,
+    buscas: &crate::invest::store::Buscas,
+    agora: u64,
 ) {
     let (nome, resumo) = (&cartao.nome, &cartao.resumo);
     // O cartão pinta com a declaração do próprio módulo: seguir um papel em Posições
     // acende o cartão de Posições, o de Cotações e o da carteira recomendada em que ele
     // está, porque os três dividem a mesma lista de marcas.
     let pintor = Pintor::novo(marks, cartao.marcavel);
+    let idade = cartao.fonte_externa.map(|fonte| buscas.idade(fonte, agora));
     match cartao.pane.as_ref() {
-        Some(pane) => render_pane(frame, area, pane, &pintor),
+        // A idade da fonte, na borda de baixo — o cartão da home é onde se decide se
+        // vale a pena entrar, e um número de ontem com cara de agora faz decidir errado.
+        Some(pane) => render_pane(frame, area, pane, &pintor, idade),
         // Sem painel o cartão ainda existe, com o resumo: o módulo continua alcançável
         // pela tecla, e a home não ganha um buraco onde havia um nome.
         None => {
@@ -3348,9 +3362,19 @@ fn render_module(frame: &mut Frame, area: Rect, app: &App, mf: &crate::app::Modu
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    fn desenhar(frame: &mut Frame, area: Rect, no: &ML, pintor: &Pintor) {
+    // O selo da idade vai no **primeiro** painel e não em todos: a idade é da tela, e
+    // repeti-la em cada painel seria dizer a mesma coisa três vezes.
+    fn desenhar(
+        frame: &mut Frame,
+        area: Rect,
+        no: &ML,
+        pintor: &Pintor,
+        idade: &mut Option<Option<u64>>,
+    ) {
         match no {
-            ML::Leaf(pane) => render_pane(frame, area, pane, pintor),
+            ML::Leaf(pane) => {
+                render_pane(frame, area, pane, pintor, idade.take());
+            }
             ML::Rows(partes) | ML::Cols(partes) => {
                 let vertical = matches!(no, ML::Rows(_));
                 let pesos: Vec<Constraint> = partes
@@ -3365,12 +3389,16 @@ fn render_module(frame: &mut Frame, area: Rect, app: &App, mf: &crate::app::Modu
                     .constraints(pesos)
                     .split(area);
                 for ((_, filho), &area) in partes.iter().zip(areas.iter()) {
-                    desenhar(frame, area, filho, pintor);
+                    desenhar(frame, area, filho, pintor, idade);
                 }
             }
         }
     }
-    desenhar(frame, partes[0], &layout, &pintor);
+    let mut idade = invest
+        .modulo(&mf.module)
+        .and_then(|m| m.fonte_externa())
+        .map(|fonte| ctx.buscas.idade(fonte, ctx.agora));
+    desenhar(frame, partes[0], &layout, &pintor, &mut idade);
 
     // O `Ctrl+E` não é do módulo, é do programa — então quem o anuncia é quem sabe se a
     // tela aceita marca, e não cada `hint()` repetindo a mesma frase vinte vezes.
@@ -3404,6 +3432,30 @@ fn tone_color(tone: crate::invest::module::Tone) -> Color {
     }
 }
 
+/// A moldura de um painel, com a idade da fonte externa no canto de baixo à direita.
+///
+/// `idade` é `None` num painel que não vive de fonte externa — e aí nada é escrito.
+/// `Some(None)` é «nunca buscado», que é uma resposta diferente de «buscado agora» e
+/// precisa aparecer como tal: um painel vazio porque a busca nunca aconteceu não é o
+/// mesmo que um painel vazio porque não há o que mostrar.
+///
+/// Vai na moldura e não desenhada por cima dela porque o rodapé já tem dono à esquerda —
+/// o total de Posições, a porcentagem de cada carteira — e um selo sobreposto comia o
+/// fim daquele número. Aqui os dois são títulos do mesmo bloco, cada um no seu canto.
+fn selo(idade: Option<Option<u64>>) -> Option<Line<'static>> {
+    let (texto, cor) = match idade? {
+        Some(s) if s >= 3600 => (crate::invest::tempo::idade(s), palette::YELLOW),
+        Some(s) => (crate::invest::tempo::idade(s), palette::DIM),
+        None => ("nunca buscado".to_string(), palette::YELLOW),
+    };
+    Some(Line::styled(format!(" {texto} "), Style::default().fg(cor)).right_aligned())
+}
+
+/// Quanto lugar o selo ocupa na borda, para a nota da esquerda não escrever por baixo.
+fn largura_do_selo(idade: Option<Option<u64>>) -> usize {
+    selo(idade).map(|l| l.width()).unwrap_or(0)
+}
+
 fn moldura(titulo: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
@@ -3414,7 +3466,13 @@ fn moldura(titulo: &str) -> Block<'static> {
         ))
 }
 
-fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane, pintor: &Pintor) {
+fn render_pane(
+    frame: &mut Frame,
+    area: Rect,
+    pane: &crate::invest::module::Pane,
+    pintor: &Pintor,
+    idade: Option<Option<u64>>,
+) {
     use crate::invest::module::Pane;
     match pane {
         Pane::Table {
@@ -3428,6 +3486,7 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane
             frame,
             area,
             pintor,
+            idade,
             &TabelaPane {
                 title,
                 headers,
@@ -3447,6 +3506,7 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane
         } => render_pane_chart(
             frame,
             area,
+            idade,
             &GraficoPane {
                 title,
                 series,
@@ -3456,16 +3516,27 @@ fn render_pane(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane
                 note: note.as_deref(),
             },
         ),
-        Pane::Facts { title, rows } => render_pane_facts(frame, area, title, rows, pintor),
+        Pane::Facts { title, rows } => render_pane_facts(frame, area, title, rows, pintor, idade),
         Pane::Bars { title, rows, full } => {
-            render_pane_bars(frame, area, title, rows, *full, pintor)
+            render_pane_bars(frame, area, title, rows, *full, pintor, idade)
         }
         Pane::Grid {
             title,
             cells,
             selected,
             legend,
-        } => render_pane_grid(frame, area, title, cells, *selected, legend, pintor),
+        } => render_pane_grid(
+            frame,
+            area,
+            pintor,
+            idade,
+            &GradePane {
+                title,
+                cells,
+                selected: *selected,
+                legend,
+            },
+        ),
         Pane::Text {
             title,
             lines,
@@ -3527,7 +3598,13 @@ struct TabelaPane<'a> {
     note: Option<&'a (String, crate::invest::module::Tone)>,
 }
 
-fn render_pane_table(frame: &mut Frame, area: Rect, pintor: &Pintor, pane: &TabelaPane) {
+fn render_pane_table(
+    frame: &mut Frame,
+    area: Rect,
+    pintor: &Pintor,
+    idade: Option<Option<u64>>,
+    pane: &TabelaPane,
+) {
     let TabelaPane {
         title,
         headers,
@@ -3545,10 +3622,16 @@ fn render_pane_table(frame: &mut Frame, area: Rect, pintor: &Pintor, pane: &Tabe
     }
     let mut bloco = moldura(&titulo);
     if let Some((note, tom)) = note.filter(|(n, _)| !n.is_empty()) {
+        // A nota cede o lugar do selo, e não o contrário: ela carrega o total da carteira
+        // e o selo carrega cinco caracteres de ressalva.
+        let cabe = (area.width as usize).saturating_sub(largura_do_selo(idade) + 4);
         bloco = bloco.title_bottom(Line::styled(
-            format!(" {note} "),
+            format!(" {} ", clip(note, cabe)),
             Style::default().fg(tone_color(*tom)),
         ));
+    }
+    if let Some(selo) = selo(idade) {
+        bloco = bloco.title_bottom(selo);
     }
     let dentro = bloco.inner(area);
     frame.render_widget(bloco, area);
@@ -3719,7 +3802,12 @@ struct GraficoPane<'a> {
     note: Option<&'a str>,
 }
 
-fn render_pane_chart(frame: &mut Frame, area: Rect, pane: &GraficoPane) {
+fn render_pane_chart(
+    frame: &mut Frame,
+    area: Rect,
+    idade: Option<Option<u64>>,
+    pane: &GraficoPane,
+) {
     let GraficoPane {
         title,
         series,
@@ -3735,10 +3823,14 @@ fn render_pane_chart(frame: &mut Frame, area: Rect, pane: &GraficoPane) {
     }
     let mut bloco = moldura(&titulo);
     if let Some(note) = note.filter(|n| !n.is_empty()) {
+        let cabe = (area.width as usize).saturating_sub(largura_do_selo(idade) + 4);
         bloco = bloco.title_bottom(Line::styled(
-            format!(" {note} "),
+            format!(" {} ", clip(note, cabe)),
             Style::default().fg(palette::DIM),
         ));
+    }
+    if let Some(selo) = selo(idade) {
+        bloco = bloco.title_bottom(selo);
     }
     let dentro = bloco.inner(area);
     frame.render_widget(bloco, area);
@@ -3921,8 +4013,12 @@ fn render_pane_facts(
     title: &str,
     rows: &[(String, String, crate::invest::module::Tone)],
     pintor: &Pintor,
+    idade: Option<Option<u64>>,
 ) {
-    let bloco = moldura(title);
+    let mut bloco = moldura(title);
+    if let Some(selo) = selo(idade) {
+        bloco = bloco.title_bottom(selo);
+    }
     let dentro = bloco.inner(area);
     frame.render_widget(bloco, area);
 
@@ -3969,8 +4065,12 @@ fn render_pane_bars(
     rows: &[crate::invest::module::Bar],
     full: Option<f64>,
     pintor: &Pintor,
+    idade: Option<Option<u64>>,
 ) {
-    let bloco = moldura(title);
+    let mut bloco = moldura(title);
+    if let Some(selo) = selo(idade) {
+        bloco = bloco.title_bottom(selo);
+    }
     let dentro = bloco.inner(area);
     frame.render_widget(bloco, area);
     if rows.is_empty() || dentro.width < 20 {
@@ -4042,16 +4142,33 @@ fn render_pane_bars(
     frame.render_widget(Paragraph::new(linhas), dentro);
 }
 
+/// As partes de um `Pane::Grid` na hora de desenhar, pelo mesmo motivo de `TabelaPane` e
+/// `GraficoPane`: com meia dúzia de argumentos soltos, trocar dois de lugar compila.
+struct GradePane<'a> {
+    title: &'a str,
+    cells: &'a [crate::invest::module::Cell],
+    selected: Option<usize>,
+    legend: &'a str,
+}
+
 fn render_pane_grid(
     frame: &mut Frame,
     area: Rect,
-    title: &str,
-    cells: &[crate::invest::module::Cell],
-    selected: Option<usize>,
-    legend: &str,
     pintor: &Pintor,
+    idade: Option<Option<u64>>,
+    pane: &GradePane,
 ) {
+    let GradePane {
+        title,
+        cells,
+        selected,
+        legend,
+    } = pane;
+    let (cells, selected, legend) = (*cells, *selected, *legend);
     let mut bloco = moldura(title);
+    if let Some(selo) = selo(idade) {
+        bloco = bloco.title_bottom(selo);
+    }
     if !legend.is_empty() {
         // A legenda é permanente. Um mapa de cores sem legenda é um mapa que cada pessoa
         // lê de um jeito.
@@ -4441,5 +4558,11 @@ mod sparkline_tests {
 /// Desenha um `Pane` isolado, para os testes de largura poderem olhar o resultado.
 #[cfg(test)]
 pub fn render_pane_teste(frame: &mut Frame, area: Rect, pane: &crate::invest::module::Pane) {
-    render_pane(frame, area, pane, &Pintor::nenhum(&Default::default()));
+    render_pane(
+        frame,
+        area,
+        pane,
+        &Pintor::nenhum(&Default::default()),
+        None,
+    );
 }

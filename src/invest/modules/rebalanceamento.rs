@@ -42,6 +42,10 @@ impl InvestModule for Rebalanceamento {
         Group::Carteira
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::COTACAO)
+    }
+
     /// Divide a lista de marcas dos ativos: o que aportar e resgatar por classe.
     fn marcavel(&self) -> Option<Marcavel> {
         Some(crate::invest::marcas::ATIVOS)

@@ -125,6 +125,10 @@ impl InvestModule for Agenda {
         Group::Informacao
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::AGENDA)
+    }
+
     fn marcavel(&self) -> Option<Marcavel> {
         Some(MARCAS)
     }

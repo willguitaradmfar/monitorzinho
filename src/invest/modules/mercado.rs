@@ -65,7 +65,14 @@ pub fn linha(
         }
         (_, false) => format!("{} {}", q.fonte, q.grade.marca()),
     };
-    let preco = format!("{} {origem}", calc::preco(q.preco));
+    // A idade vai junto do preço, sempre — é a única coluna em que ela é sobre **este**
+    // número. Antes ela só aparecia na coluna de volume, e só nos ativos sem volume: os
+    // que tinham volume não diziam de quando era o preço.
+    let preco = format!(
+        "{} {origem}·{}",
+        calc::preco(q.preco),
+        tempo::idade(q.idade(agora))
+    );
     // A variação só é mostrada onde ela significa alguma coisa.
     let (variacao, tom_var) = match q.variacao().filter(|_| ao_vivo) {
         Some(v) => (
@@ -78,15 +85,9 @@ pub fn linha(
         None => (String::new(), Tone::Dim),
     };
 
-    let idade = q.idade(agora);
     let volume = match q.volume {
         Some(v) if v > 0.0 => calc::moeda(v),
-        // Sem volume, a coluna carrega a idade — que numa fonte que parou de responder é
-        // a informação que responde «por que este número não mexe».
-        _ => match idade > 120 {
-            true => tempo::idade(idade),
-            false => String::new(),
-        },
+        _ => String::new(),
     };
 
     Row::new(vec![
@@ -277,10 +278,29 @@ mod tests {
     }
 
     #[test]
-    fn fonte_parada_mostra_a_idade_na_coluna_do_volume() {
+    fn a_idade_do_preco_anda_junto_com_o_preco() {
+        // Na coluna do preço e não na do volume: a idade é sobre **este** número, e um
+        // ativo com volume não pode ficar sem ela só porque a coluna estava ocupada.
         let ativo = AssetId::new(Market::B3, "PETR4");
         let q = quote(Grade::AoVivo, 38.42, None);
-        let r = com_ctx!(|ctx| linha(&ativo, Some(&q), true, 600, ctx));
-        assert!(r.cells[5].contains("min"), "deu «{}»", r.cells[5]);
+        let parada = com_ctx!(|ctx| linha(&ativo, Some(&q), true, 600, ctx));
+        assert!(
+            parada.cells[1].contains("há 10 min"),
+            "deu «{}»",
+            parada.cells[1]
+        );
+        let fresca = com_ctx!(|ctx| linha(&ativo, Some(&q), true, 0, ctx));
+        assert!(
+            fresca.cells[1].contains("agora"),
+            "deu «{}»",
+            fresca.cells[1]
+        );
+    }
+
+    #[test]
+    fn sem_preco_nenhum_a_linha_nao_inventa_idade() {
+        let ativo = AssetId::new(Market::B3, "PETR4");
+        let r = com_ctx!(|ctx| linha(&ativo, None, true, 600, ctx));
+        assert!(!r.cells[1].contains("há "), "deu «{}»", r.cells[1]);
     }
 }

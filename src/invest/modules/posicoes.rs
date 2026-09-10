@@ -38,6 +38,10 @@ impl InvestModule for Posicoes {
         Group::Carteira
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::COTACAO)
+    }
+
     fn marcavel(&self) -> Option<Marcavel> {
         Some(crate::invest::marcas::ATIVOS)
     }

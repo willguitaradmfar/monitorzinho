@@ -191,6 +191,8 @@ pub struct Cartao {
     /// Que marcas as linhas deste cartão podem estar vestindo — a mesma declaração do
     /// módulo. É o que faz a marca posta dentro do módulo aparecer no cartão dele.
     pub marcavel: Option<crate::invest::module::Marcavel>,
+    /// De que fonte externa o cartão vive, para a borda dizer a idade dela.
+    pub fonte_externa: Option<&'static str>,
     /// Que coisa dentro do módulo este cartão abre — ver `InvestModule::cartazes`.
     pub sub: Option<String>,
     pub nome: String,
@@ -4210,6 +4212,7 @@ impl App {
             .flat_map(|m| {
                 let resumo = m.summary(&ctx);
                 let alvo = m.marcavel();
+                let fonte = m.fonte_externa();
                 // Um módulo pode pôr mais de um cartão — ver `InvestModule::cartazes`.
                 m.cartazes(&ctx).into_iter().map(move |mut c| {
                     // O painel nasce sem título: quem manda no título é a home. Titular
@@ -4220,6 +4223,7 @@ impl App {
                     Cartao {
                         id: m.id().to_string(),
                         marcavel: alvo,
+                        fonte_externa: fonte,
                         sub: c.sub,
                         nome: c.titulo,
                         resumo: resumo.clone(),
@@ -4833,6 +4837,7 @@ mod home_tests {
         Cartao {
             id: id.to_string(),
             marcavel: None,
+            fonte_externa: None,
             sub: None,
             nome: id.to_string(),
             resumo: String::new(),

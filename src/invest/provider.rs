@@ -620,6 +620,10 @@ impl ProviderSet {
                         // Só o que ele de fato entregou sai da lista. Um provedor que
                         // devolve metade dos ativos deixa a outra metade para o seguinte.
                         pendentes.retain(|a| !quotes.iter().any(|q| q.ativo == *a));
+                        if !quotes.is_empty() {
+                            crate::invest::store::buscas()
+                                .carimbar(crate::invest::store::fonte::COTACAO);
+                        }
                         novos.extend(quotes);
                         if provedor.remoto() {
                             fontes.push(StatusFonte {

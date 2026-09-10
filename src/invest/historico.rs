@@ -98,6 +98,9 @@ impl Cache {
                     Some(Err(e)) => Estado::Falhou(e.frase()),
                     None => Estado::SemFonte,
                 };
+                if matches!(resultado, Estado::Pronta(_)) {
+                    crate::invest::store::buscas().carimbar(crate::invest::store::fonte::HISTORICO);
+                }
                 if let Ok(mut mapa) = series.lock() {
                     mapa.insert(chave, resultado);
                 }

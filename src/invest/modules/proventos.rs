@@ -38,6 +38,10 @@ impl InvestModule for Proventos {
         Group::Carteira
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::ANUNCIADO)
+    }
+
     fn marcavel(&self) -> Option<Marcavel> {
         Some(crate::invest::marcas::ATIVOS)
     }

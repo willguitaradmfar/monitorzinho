@@ -37,6 +37,10 @@ impl InvestModule for Grafico {
         Group::Mercado
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::HISTORICO)
+    }
+
     /// Divide a lista de marcas dos ativos: o cartão lista os papéis com série; a tela é o gráfico de um deles.
     fn marcavel(&self) -> Option<Marcavel> {
         Some(crate::invest::marcas::ATIVOS)

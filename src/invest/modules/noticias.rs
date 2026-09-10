@@ -52,6 +52,10 @@ impl InvestModule for Noticias {
         Group::Informacao
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::NOTICIA)
+    }
+
     fn marcavel(&self) -> Option<Marcavel> {
         Some(MARCAS)
     }

@@ -41,23 +41,30 @@ impl Linha {
         self.mercado_brl.is_some()
     }
 
-    /// A origem do preço, para a coluna: `brapi`, `manual · há 3 d`, `yahoo não-oficial`.
+    /// A origem do preço **e a idade dele**: `brapi·agora`, `manual·há 3 d`,
+    /// `yahoo não-oficial·há 2 h`.
     ///
     /// Sempre diz **de onde veio**, mesmo quando o dado é ao vivo. Numa aba em que um
     /// preço pode vir de uma exchange, de um agregador de terceiros, de uma fonte sem
     /// contrato ou da própria mão de quem digitou, omitir a fonte é omitir a diferença
     /// que mais importa entre eles.
+    ///
+    /// E sempre diz **de quando**. A idade aparecia só no preço informado, o que fazia o
+    /// caso pior passar batido: um preço de mercado que parou de chegar continua sendo um
+    /// preço de mercado na tela, com a fonte certa ao lado, e não havia nada dizendo que
+    /// ele é de ontem. Um número velho com cara de novo é pior que um número ausente.
     pub fn origem(&self) -> String {
         let Some(grade) = self.grade else {
             return String::new();
         };
+        let quando = crate::invest::tempo::idade(self.idade);
         match grade {
             // Informado: a fonte é óbvia, e o que falta saber é de quando.
-            Grade::Manual => format!("manual·{}", crate::invest::tempo::idade(self.idade)),
+            Grade::Manual => format!("manual·{quando}"),
             // Sem contrato: a marca vem antes do nome, porque é o aviso.
-            Grade::NaoOficial => format!("{} não-oficial", self.fonte),
-            Grade::AoVivo => self.fonte.to_string(),
-            _ => format!("{} {}", self.fonte, grade.marca()),
+            Grade::NaoOficial => format!("{} não-oficial·{quando}", self.fonte),
+            Grade::AoVivo => format!("{}·{quando}", self.fonte),
+            _ => format!("{} {}·{quando}", self.fonte, grade.marca()),
         }
     }
 }
@@ -288,6 +295,69 @@ pub fn preco_medio_consolidado(posicoes: &[&Position]) -> Option<f64> {
     }
     let custo: f64 = com_custo.iter().filter_map(|p| p.custo()).sum();
     Some(custo / quantidade)
+}
+
+#[cfg(test)]
+mod tests_origem {
+    use super::*;
+    use crate::invest::model::{AssetId, Market};
+
+    fn linha(grade: Grade, idade: u64) -> Linha {
+        Linha {
+            grade: Some(grade),
+            idade,
+            fonte: "kinvo",
+            ..Linha {
+                posicao: Position {
+                    fonte: "manual".into(),
+                    conta: String::new(),
+                    ativo: AssetId::new(Market::B3, "PETR4"),
+                    classe: crate::invest::model::Classe::Acao,
+                    quantidade: 1.0,
+                    preco_medio: None,
+                    moeda: crate::invest::model::Moeda::Brl,
+                    preco_manual: None,
+                    preco_manual_em: None,
+                    atualizado_em: 0,
+                    carteira: None,
+                },
+                preco: None,
+                grade: None,
+                idade: 0,
+                fonte: "",
+                mercado_brl: None,
+                custo_brl: None,
+                pnl_brl: None,
+                pnl_pct: None,
+                dia_brl: None,
+                variacao_pct: None,
+            }
+        }
+    }
+
+    /// A idade aparecia só no preço informado, o que escondia o caso pior: um preço de
+    /// mercado que parou de chegar, com a fonte certa ao lado e nada dizendo que ele é
+    /// de ontem.
+    #[test]
+    fn toda_origem_diz_de_quando_e_o_preco() {
+        for grade in [
+            Grade::AoVivo,
+            Grade::Atrasado(900),
+            Grade::Fechamento,
+            Grade::Manual,
+            Grade::NaoOficial,
+        ] {
+            let texto = linha(grade, 7200).origem();
+            assert!(texto.contains("há 2 h"), "{grade:?} deu «{texto}»");
+        }
+    }
+
+    #[test]
+    fn sem_grade_nao_ha_origem_nem_idade() {
+        let mut l = linha(Grade::AoVivo, 7200);
+        l.grade = None;
+        assert_eq!(l.origem(), "");
+    }
 }
 
 #[cfg(test)]

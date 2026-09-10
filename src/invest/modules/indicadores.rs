@@ -79,6 +79,10 @@ impl InvestModule for Indicadores {
     fn group(&self) -> Group {
         Group::Analise
     }
+
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::HISTORICO)
+    }
     fn needs(&self) -> &'static [Need] {
         &[Need::Historico]
     }

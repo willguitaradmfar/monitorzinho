@@ -96,6 +96,9 @@ impl Cache {
             .name("invest-proventos".into())
             .spawn(move || {
                 let achado = providers.proventos(&ativo);
+                if achado.is_some() {
+                    crate::invest::store::buscas().carimbar(crate::invest::store::fonte::ANUNCIADO);
+                }
                 if let Ok(mut m) = por_ativo.lock() {
                     // Um ativo sem proventos entra com a lista vazia, e não fica de fora:
                     // é o que impede a busca de ser repetida para sempre.

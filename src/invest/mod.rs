@@ -157,6 +157,7 @@ impl InvestState {
             anunciados: &self.anunciados,
             calendario: &self.calendario,
             disparos: &self.disparos,
+            buscas: store::buscas(),
             agora: store::agora(),
             somente_leitura: self.somente_leitura,
         }

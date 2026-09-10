@@ -47,6 +47,10 @@ impl InvestModule for Risco {
         Group::Analise
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::HISTORICO)
+    }
+
     fn marcavel(&self) -> Option<Marcavel> {
         Some(crate::invest::marcas::ATIVOS)
     }

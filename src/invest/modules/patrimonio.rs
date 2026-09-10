@@ -45,6 +45,10 @@ impl InvestModule for Patrimonio {
     fn group(&self) -> Group {
         Group::Carteira
     }
+
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::COTACAO)
+    }
     fn needs(&self) -> &'static [Need] {
         &[Need::Posicoes]
     }

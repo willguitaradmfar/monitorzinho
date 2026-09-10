@@ -52,6 +52,10 @@ impl InvestModule for Heatmap {
         Group::Mercado
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::COTACAO)
+    }
+
     /// Divide a lista de marcas dos ativos: cada célula é um papel — a marca acende a moldura dela.
     fn marcavel(&self) -> Option<Marcavel> {
         Some(crate::invest::marcas::ATIVOS)

@@ -200,6 +200,8 @@ impl Cache {
                         if let Ok(mut x) = erro.lock() {
                             *x = None;
                         }
+                        crate::invest::store::buscas()
+                            .carimbar(crate::invest::store::fonte::AGENDA);
                     }
                     Err(e) => {
                         if let Ok(mut x) = erro.lock() {

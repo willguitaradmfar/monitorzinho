@@ -58,11 +58,18 @@ pub struct Migracao {
 /// constante, e continua sendo um binário único que não procura nada no disco para subir.
 /// O arquivo separado é só para o SQL ser lido como SQL — com destaque de sintaxe, e com
 /// um `diff` que mostra a estrutura mudando em vez de uma string mudando.
-pub const TODAS: &[Migracao] = &[Migracao {
-    versao: 1,
-    nome: "0001_estrutura_inicial",
-    sql: include_str!("migracoes/0001_estrutura_inicial.sql"),
-}];
+pub const TODAS: &[Migracao] = &[
+    Migracao {
+        versao: 1,
+        nome: "0001_estrutura_inicial",
+        sql: include_str!("migracoes/0001_estrutura_inicial.sql"),
+    },
+    Migracao {
+        versao: 2,
+        nome: "0002_busca",
+        sql: include_str!("migracoes/0002_busca.sql"),
+    },
+];
 
 /// A maior versão que este binário sabe alcançar.
 pub fn alvo() -> u32 {

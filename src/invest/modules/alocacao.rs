@@ -95,6 +95,10 @@ impl InvestModule for Alocacao {
         Group::Carteira
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::COTACAO)
+    }
+
     /// Divide a lista de marcas dos ativos: as barras são classes, e classe é um dos tipos de marca da lista de ativos.
     fn marcavel(&self) -> Option<Marcavel> {
         Some(crate::invest::marcas::ATIVOS)

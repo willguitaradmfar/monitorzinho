@@ -16,6 +16,7 @@
 //! puseram nela. Ver `docs/invest/03`.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -627,14 +628,26 @@ pub fn load_noticias() -> Vec<(String, crate::invest::rss::Item)> {
         let mut stmt =
             conn.prepare("SELECT fonte, titulo, link, data, resumo, em FROM noticia ORDER BY id")?;
         let linhas = stmt.query_map([], |row| {
+            let data: String = row.get(3)?;
+            // O instante é **relido do texto cru** quando o que está gravado é nulo.
+            //
+            // Não é redundância: o texto é o que o feed disse, e o número é o que a
+            // versão daquele dia conseguiu entender dele. Quando o leitor aprende um
+            // formato novo — e aprendeu, o `2026-09-10 12:08:07` sem `T` que 90% das
+            // linhas usavam —, as já gravadas voltam a ter data sozinhas, sem esperar o
+            // feed republicar nada.
+            let em = row
+                .get::<_, Option<i64>>(5)?
+                .map(|v| v as u64)
+                .or_else(|| crate::invest::rss::instante(&data));
             Ok((
                 row.get::<_, String>(0)?,
                 Item {
                     titulo: row.get(1)?,
                     link: row.get(2)?,
-                    data: row.get(3)?,
+                    data,
                     resumo: row.get(4)?,
-                    em: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    em,
                 },
             ))
         })?;
@@ -712,6 +725,163 @@ pub fn save_anunciados(v: &[crate::invest::provento::Anunciado]) {
         }
         Ok(())
     });
+}
+
+// ---------------------------------------------------------------------------
+// Há quanto tempo cada fonte externa foi consultada.
+// ---------------------------------------------------------------------------
+
+/// O nome de uma fonte externa no registro de buscas. Constantes e não literais soltos:
+/// quem grava e quem lê têm que dizer a mesma palavra, e um erro de digitação aqui não
+/// dá erro nenhum — só faz a tela dizer «nunca» para sempre.
+pub mod fonte {
+    pub const COTACAO: &str = "cotacao";
+    pub const NOTICIA: &str = "noticia";
+    pub const AGENDA: &str = "agenda";
+    pub const ANUNCIADO: &str = "anunciado";
+    pub const HISTORICO: &str = "historico";
+    pub const FUNDAMENTO: &str = "fundamento";
+}
+
+/// Quando cada fonte externa respondeu pela última vez.
+///
+/// A pergunta que isto existe para responder é «este número é de agora ou de ontem?», e
+/// ela não tinha resposta em lugar nenhum da tela: um preço em cache, uma manchete
+/// guardada e um calendário de duas semanas atrás apareciam com exatamente a mesma cara
+/// de dado fresco.
+///
+/// Mora atrás de um `Mutex` global e escreve direto no banco porque quem carimba são as
+/// **threads de busca**, que não têm — e não devem ter — uma referência para o estado da
+/// aba. É a mesma forma de `save_mru`.
+#[derive(Default)]
+pub struct Buscas {
+    por_fonte: Mutex<BTreeMap<String, u64>>,
+}
+
+/// O registro desta execução, semeado do banco na primeira vez que alguém pergunta.
+///
+/// Global e não um campo de `InvestState` porque quem **carimba** são as threads de
+/// busca, que não têm — e não devem ter — uma referência para o estado da aba. É a mesma
+/// forma de `save_mru`, e o banco já é um por processo de qualquer jeito.
+pub fn buscas() -> &'static Buscas {
+    static BUSCAS: std::sync::OnceLock<Buscas> = std::sync::OnceLock::new();
+    BUSCAS.get_or_init(Buscas::carregar)
+}
+
+impl Buscas {
+    /// Semeada com o que ficou do último uso, para a primeira tela já saber a idade em
+    /// vez de dizer «nunca» até a primeira volta da thread.
+    pub fn carregar() -> Self {
+        Self {
+            por_fonte: Mutex::new(load_buscas()),
+        }
+    }
+
+    /// Quando a fonte respondeu pela última vez. `None` = nunca, nem nesta execução nem
+    /// em nenhuma anterior.
+    pub fn quando(&self, chave: &str) -> Option<u64> {
+        self.por_fonte.lock().ok()?.get(chave).copied()
+    }
+
+    /// Há quantos segundos, para quem só quer a idade.
+    pub fn idade(&self, chave: &str, agora: u64) -> Option<u64> {
+        self.quando(chave).map(|em| agora.saturating_sub(em))
+    }
+
+    /// Carimba uma resposta. **Só o sucesso carimba** — uma busca que falhou não deixou
+    /// o dado mais novo, e mover o carimbo nela faria a tela dizer «agora» sobre um
+    /// número de ontem, que é exatamente o engano que este registro existe para desfazer.
+    pub fn carimbar(&self, chave: &str) {
+        let em = crate::db::agora();
+        if let Ok(mut mapa) = self.por_fonte.lock() {
+            mapa.insert(chave.to_string(), em);
+        }
+        save_busca(chave, em);
+    }
+}
+
+pub fn load_buscas() -> BTreeMap<String, u64> {
+    db::ler(BTreeMap::new(), |conn| {
+        let mut stmt = conn.prepare("SELECT chave, em FROM busca")?;
+        let linhas = stmt.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))?;
+        linhas.collect()
+    })
+}
+
+fn save_busca(chave: &str, em: u64) {
+    db::escrever(|conn| {
+        conn.execute(
+            "INSERT INTO busca (chave, em) VALUES (?1, ?2)
+             ON CONFLICT(chave) DO UPDATE SET em = excluded.em",
+            (chave, em as i64),
+        )?;
+        Ok(())
+    });
+}
+
+#[cfg(test)]
+mod tests_noticias {
+    /// Uma notícia gravada por uma versão que não sabia ler o formato dela volta a ter
+    /// data quando a versão nova a lê — o texto cru continua no banco, e é dele que o
+    /// instante sai.
+    #[test]
+    fn a_data_e_relida_do_texto_cru() {
+        // O formato que 215 das 240 linhas gravadas usavam, e que a versão que as gravou
+        // não entendia.
+        let bruto = "2026-09-10 12:08:07";
+        assert!(
+            crate::invest::rss::instante(bruto).is_some(),
+            "o leitor precisa entender o formato para a cura funcionar"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_buscas {
+    use super::*;
+
+    /// Sem perfil aberto — que é o caso num teste — o banco não responde, e o registro
+    /// tem que continuar sendo um mapa em memória que funciona. Um `carimbar` que
+    /// estourasse aqui derrubaria toda thread de busca de quem roda a suíte.
+    #[test]
+    fn o_registro_funciona_em_memoria_sem_banco() {
+        let b = Buscas::default();
+        assert_eq!(b.quando(fonte::NOTICIA), None);
+        assert_eq!(b.idade(fonte::NOTICIA, 1_000), None);
+        b.carimbar(fonte::NOTICIA);
+        let quando = b.quando(fonte::NOTICIA).expect("carimbou");
+        assert_eq!(b.idade(fonte::NOTICIA, quando + 300), Some(300));
+        // Uma fonte não carimba a outra.
+        assert_eq!(b.quando(fonte::AGENDA), None);
+    }
+
+    /// «Nunca» e «agora» são respostas diferentes, e a tela as escreve diferente. Um
+    /// `idade` que devolvesse zero para o que nunca foi buscado apagaria a distinção.
+    #[test]
+    fn nunca_buscado_nao_e_o_mesmo_que_buscado_agora() {
+        let b = Buscas::default();
+        assert!(b.idade(fonte::HISTORICO, 1_000).is_none());
+        b.carimbar(fonte::HISTORICO);
+        assert!(b.idade(fonte::HISTORICO, crate::db::agora()).is_some());
+    }
+
+    /// Os nomes vão para dentro do banco e são lidos de lá na execução seguinte: dois
+    /// iguais fariam duas fontes compartilharem um carimbo calado.
+    #[test]
+    fn cada_fonte_tem_um_nome_so() {
+        let todas = [
+            fonte::COTACAO,
+            fonte::NOTICIA,
+            fonte::AGENDA,
+            fonte::ANUNCIADO,
+            fonte::HISTORICO,
+            fonte::FUNDAMENTO,
+        ];
+        let mut vistos: Vec<&str> = todas.to_vec();
+        vistos.sort_unstable();
+        vistos.dedup();
+        assert_eq!(vistos.len(), todas.len(), "há nome de fonte repetido");
+    }
 }
 
 #[cfg(test)]

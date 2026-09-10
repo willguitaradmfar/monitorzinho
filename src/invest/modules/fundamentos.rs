@@ -34,6 +34,10 @@ impl InvestModule for Fundamentos {
         Group::Analise
     }
 
+    fn fonte_externa(&self) -> Option<&'static str> {
+        Some(crate::invest::store::fonte::FUNDAMENTO)
+    }
+
     fn marcavel(&self) -> Option<Marcavel> {
         Some(crate::invest::marcas::ATIVOS)
     }

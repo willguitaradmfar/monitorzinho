@@ -395,11 +395,15 @@ mod tests {
     #[test]
     #[ignore]
     fn ao_vivo_os_feeds_do_investing_saem_com_data() {
-        // O feed que motivou o leitor tolerante. Sem ele a coluna «Quando» dizia «sem
-        // data» em toda linha, e a ordenação por data ordenava nada.
+        // Os cinco endereços de verdade, e não dois deles: o `market_overview` carimba
+        // «Sep 10, 2026 10:54 GMT» e os outros quatro carimbam «2026-09-10 12:08:07».
+        // Testar só os dois primeiros foi o que deixou passar 215 notícias sem data.
         for url in [
             "https://br.investing.com/rss/286.rss",
             "https://br.investing.com/rss/290.rss",
+            "https://br.investing.com/rss/market_overview.rss",
+            "https://br.investing.com/rss/news.rss",
+            "https://br.investing.com/rss/stock.rss",
         ] {
             let r = crate::invest::feed::get(url).expect("o feed tem que responder");
             let itens = parse(&String::from_utf8_lossy(&r.body));

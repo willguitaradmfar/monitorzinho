@@ -107,6 +107,11 @@ impl Cache {
                                     lista.drain(..n - TETO);
                                 }
                             }
+                            // Só a volta boa carimba. Um feed que caiu não deixou a
+                            // lista mais nova, e dizer «atualizado agora» sobre ela
+                            // seria o engano que o carimbo existe para desfazer.
+                            crate::invest::store::buscas()
+                                .carimbar(crate::invest::store::fonte::NOTICIA);
                         }
                         Err(erro) => anotar(&erros, Some(erro.frase())),
                     }

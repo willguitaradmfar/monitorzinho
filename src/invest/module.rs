@@ -100,6 +100,11 @@ pub struct Ctx<'a> {
     /// Os disparos de alerta desde que a aba abriu, do mais recente para o mais antigo.
     /// Vêm do estado da aba e não do módulo, porque acontecem também com ele fechado.
     pub disparos: &'a [(u64, String)],
+    /// Há quanto tempo cada fonte externa respondeu — ver `InvestModule::buscado_em`.
+    ///
+    /// Um `&'static` no meio de referências emprestadas porque o registro é global: quem
+    /// carimba são as threads de busca, e elas não têm o estado da aba na mão.
+    pub buscas: &'static crate::invest::store::Buscas,
     pub agora: u64,
     /// Gravar está proibido — o arquivo é de uma versão futura. Um módulo que edita tem
     /// que dizer isso na tela em vez de aceitar a edição e perdê-la.
@@ -490,6 +495,20 @@ pub trait InvestModule: Send + Sync {
         &[]
     }
 
+    /// De que fonte externa esta tela vive, para a moldura dizer há quanto tempo ela foi
+    /// consultada. `None` numa tela que só faz conta sobre o que já está em disco.
+    ///
+    /// Um dos nomes de `store::fonte`. Um módulo que lê duas fontes declara a que é o
+    /// **assunto** dele — Fundamentos vive dos fundamentos e só usa a cotação para
+    /// comparar, e é a idade dos fundamentos que responde «isto ainda vale?».
+    ///
+    /// Existe porque a defasagem era invisível: um preço em cache, uma manchete guardada
+    /// e um calendário de duas semanas atrás apareciam com exatamente a mesma cara de
+    /// dado fresco, e não havia nada na tela que dissesse o contrário.
+    fn fonte_externa(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Que marcas a lista deste módulo aceita — `None` quando não é uma lista de coisas
     /// que se acompanha.
     ///
@@ -657,6 +676,7 @@ pub fn ctx_de_teste<'a>(
     providers: &'a std::sync::Arc<crate::invest::provider::ProviderSet>,
 ) -> Ctx<'a> {
     Ctx {
+        buscas: crate::invest::store::buscas(),
         patrimonio: &[],
         noticias: NOTICIAS_DE_TESTE.get_or_init(Default::default),
         historico: HISTORICO_DE_TESTE.get_or_init(Default::default),

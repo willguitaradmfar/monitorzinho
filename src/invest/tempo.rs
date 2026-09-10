@@ -52,33 +52,87 @@ pub fn data_de_dias(dias: i64) -> Data {
     }
 }
 
-/// O epoch de uma data ISO 8601 — `2026-08-10T03:00:00.000Z`.
+/// O epoch de uma data com a data em números: `2026-08-10T03:00:00.000Z`,
+/// `2026-09-10 12:08:07`, `2026-08-10T00:00:00-03:00`, `2026-08-10`.
 ///
 /// Mora aqui e não no leitor de RSS porque data não é assunto de RSS: a API da Kinvo
 /// carimba as séries no mesmo formato, e duas cópias desta função seriam duas chances de
 /// só uma delas ser corrigida.
 ///
-/// O fuso do texto é ignorado — o `Z` e um `+03:00` dão o mesmo número. É o suficiente
-/// para ordenar notícias e para datar velas diárias, que é tudo o que se pede dela.
+/// **O separador pode ser espaço, e a hora pode faltar.** O `T` do ISO 8601 é o que a
+/// norma manda e não é o que os feeds mandam: quatro dos cinco endereços do investing.com
+/// carimbam `2026-09-10 12:08:07`, com espaço e sem fuso. Exigir o `T` deixava 215 de 240
+/// notícias sem data — e sem data elas iam para o fim da lista, que é onde nenhuma
+/// notícia de hoje deveria estar.
+///
+/// **Sem fuso escrito, vale UTC.** Não é chute: o item mais novo desses feeds fica
+/// sempre alguns minutos atrás do relógio UTC, e nunca três horas à frente dele, que é o
+/// que aconteceria se o carimbo fosse horário de Brasília.
 pub fn epoch_de_iso(texto: &str) -> Option<u64> {
-    let (data, resto) = texto.split_once('T')?;
+    let texto = texto.trim();
+    // Sem hora nenhuma, a data vale meia-noite — melhor que descartar o item por isso.
+    let (data, resto) = texto.split_once(['T', 't', ' ']).unwrap_or((texto, ""));
     let mut d = data.split('-');
     let ano: i32 = d.next()?.parse().ok()?;
     let mes: u32 = d.next()?.parse().ok()?;
     let dia: u32 = d.next()?.parse().ok()?;
-    let hora = resto.trim_end_matches('Z');
+    if d.next().is_some() {
+        return None;
+    }
+
+    let (hora, deslocamento) = separar_fuso(resto.trim());
     let mut h = hora.split(':');
-    let hh: i64 = h.next()?.parse().ok()?;
+    let hh: i64 = match hora.is_empty() {
+        true => 0,
+        false => h.next()?.parse().ok()?,
+    };
     let mm: i64 = h.next().unwrap_or("0").parse().unwrap_or(0);
+    // Os segundos podem trazer fração — `03:00:00.000`. A fração não interessa a nada
+    // que esta aba faça com o número.
     let ss: i64 = h
         .next()
         .unwrap_or("0")
-        .split(['.', '+', '-'])
-        .next()?
+        .split('.')
+        .next()
+        .unwrap_or("0")
         .parse()
         .unwrap_or(0);
     let dias = dias_de(ano, mes, dia);
-    Some((dias * 86400 + hh * 3600 + mm * 60 + ss).max(0) as u64)
+    Some((dias * 86400 + hh * 3600 + mm * 60 + ss - deslocamento).max(0) as u64)
+}
+
+/// Separa a hora do fuso escrito atrás dela, devolvendo o deslocamento em segundos.
+///
+/// O fuso era **descartado** aqui: `Z` e `+03:00` davam o mesmo número, e a justificativa
+/// era que ordenar notícias não precisa de tanto. Precisa — três horas de erro põem a
+/// notícia da manhã depois da notícia da tarde, e é justamente essa ordem que a lista
+/// existe para acertar.
+fn separar_fuso(resto: &str) -> (&str, i64) {
+    if let Some(hora) = resto.strip_suffix(['Z', 'z']) {
+        return (hora, 0);
+    }
+    // Procurado a partir do fim: o `-` do fuso é o único que aparece depois da hora, e a
+    // data já ficou para trás.
+    let Some(corte) = resto.rfind(['+', '-']) else {
+        return (resto, 0);
+    };
+    let sinal = match resto.as_bytes()[corte] {
+        b'-' => -1,
+        _ => 1,
+    };
+    let digitos: String = resto[corte + 1..]
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    let (horas, minutos) = match digitos.len() {
+        4 => (digitos[..2].parse::<i64>(), digitos[2..].parse::<i64>()),
+        2 => (digitos.parse::<i64>(), Ok(0)),
+        _ => return (resto, 0),
+    };
+    match (horas, minutos) {
+        (Ok(h), Ok(m)) => (&resto[..corte], sinal * (h * 3600 + m * 60)),
+        _ => (resto, 0),
+    }
 }
 
 /// A hora e o minuto de um epoch, no fuso pedido.
@@ -308,6 +362,54 @@ mod tests {
             }
             .fim_de_semana()
         );
+    }
+
+    #[test]
+    fn a_data_com_espaco_no_lugar_do_t_e_lida() {
+        // Quatro dos cinco feeds do investing.com carimbam assim, e exigir o `T` deixava
+        // 215 de 240 notícias sem data — 90% da lista, mandada para o fim dela.
+        assert_eq!(
+            epoch_de_iso("2026-09-10 12:08:07"),
+            epoch_de_iso("2026-09-10T12:08:07Z")
+        );
+    }
+
+    #[test]
+    fn a_data_sem_hora_vale_meia_noite() {
+        assert_eq!(
+            epoch_de_iso("2026-08-10"),
+            epoch_de_iso("2026-08-10T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn o_fuso_escrito_é_descontado_em_vez_de_ignorado() {
+        let z = epoch_de_iso("2026-08-10T00:00:00Z").expect("lê");
+        // Meia-noite em Brasília é três da manhã em Greenwich.
+        assert_eq!(
+            epoch_de_iso("2026-08-10T00:00:00-03:00"),
+            Some(z + 3 * 3600)
+        );
+        assert_eq!(epoch_de_iso("2026-08-10T00:00:00-0300"), Some(z + 3 * 3600));
+        assert_eq!(
+            epoch_de_iso("2026-08-10T00:00:00+02:00"),
+            Some(z - 2 * 3600)
+        );
+        // E a fração de segundo continua não atrapalhando.
+        assert_eq!(epoch_de_iso("2026-08-10T00:00:00.000Z"), Some(z));
+    }
+
+    #[test]
+    fn o_que_nao_tem_data_em_numeros_nao_vira_um_instante_qualquer() {
+        for texto in [
+            "",
+            "ontem",
+            "Sep 10, 2026 10:54 GMT",
+            "Mon, 08 Sep 2026 14:22:00 -0300",
+            "2026-09-10-11T00:00:00Z",
+        ] {
+            assert_eq!(epoch_de_iso(texto), None, "«{texto}» virou instante");
+        }
     }
 
     #[test]
