@@ -26,7 +26,32 @@ use crate::tools::rewrite::{self, Rule};
 use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, Stage, State, lock_log};
 
 const TAB_BAR_HEIGHT: u16 = 2;
-const COLS: usize = 3;
+
+/// A largura em que um cartão fica **bom** — não a menor em que ele cabe.
+///
+/// É o número que decide quantas colunas a tela ganha, e por isso é uma largura
+/// confortável e não um mínimo: dividir a tela pelo mínimo enche a janela de cartões
+/// espremidos em vez de deixá-los respirar. Quarenta colunas é onde um título como
+/// «CPU temp — 54 °C (coretemp · Package id 0)» ainda diz alguma coisa e uma linha de
+/// tabela cabe com o ticker, o valor e a variação.
+const COLUNA_BOA: u16 = 40;
+
+/// O teto de colunas de qualquer grade. Acima disso a tela fica larga e os cartões
+/// pequenos outra vez, e um monitor ultrawide vira uma parede de painéis estreitos em
+/// vez de painéis grandes.
+const COLUNAS_MAX: usize = 4;
+
+/// Quantas colunas uma grade de painéis ganha nesta largura.
+///
+/// É a regra fluida que as duas grades do programa dividem — a de gráficos da Visão
+/// Geral e a de cartões da Invest —, e ela é a mesma coisa que um `grid-template-columns:
+/// repeat(auto-fit, minmax(40ch, 1fr))` faz numa página: cabe mais uma coluna, entra mais
+/// uma coluna. Uma contagem fixa deixava a Visão Geral em três colunas de vinte e seis
+/// caracteres num terminal de oitenta, e em três colunas de setenta num de duzentos e
+/// dez — apertada demais de um lado e desperdiçada do outro.
+fn colunas_para(largura: u16) -> usize {
+    ((largura / COLUNA_BOA) as usize).clamp(1, COLUNAS_MAX)
+}
 /// Height of the two throughput sparklines at the top of a detail view — one line of
 /// chart between its borders, which is all a rate needs to show its shape.
 const RATE_PANEL_HEIGHT: u16 = 3;
@@ -1001,17 +1026,21 @@ fn signal_color(monitor: &dyn Monitor, value: f64) -> Color {
 }
 
 /// Packs `App::chart_monitor_order()` (already grouped so related panels like Net
-/// down/up stay together) into a strict grid of `COLS` panels per row — a row is
+/// down/up stay together) into a strict grid of `colunas` panels per row — a row is
 /// topped up with the next group's panels instead of leaving a gap.
-fn build_chart_rows(app: &App) -> Vec<Vec<usize>> {
+///
+/// The count comes from the window's width (`colunas_para`), so the same eight panels
+/// are two rows of four on a wide terminal and four rows of two on a narrow one.
+fn build_chart_rows(app: &App, colunas: usize) -> Vec<Vec<usize>> {
     app.chart_monitor_order()
-        .chunks(COLS)
+        .chunks(colunas.max(1))
         .map(<[usize]>::to_vec)
         .collect()
 }
 
 fn render_charts(frame: &mut Frame, area: Rect, app: &App, shortcuts: &ShortcutMap) {
-    let rows = build_chart_rows(app);
+    let colunas = colunas_para(area.width);
+    let rows = build_chart_rows(app, colunas);
     if rows.is_empty() {
         return;
     }
@@ -1023,11 +1052,12 @@ fn render_charts(frame: &mut Frame, area: Rect, app: &App, shortcuts: &ShortcutM
         .split(area);
 
     for (indices, &row_area) in rows.iter().zip(row_areas.iter()) {
-        // Always split into a fixed `COLS`-wide grid — even a row with fewer panels
-        // than `COLS` gets full-width column slots, leaving the rest blank, so the
-        // grid reads as a consistent 3-column layout instead of stretching to fill.
-        let col_constraints: Vec<Constraint> = (0..COLS)
-            .map(|_| Constraint::Ratio(1, COLS as u32))
+        // Every row is split into the **same** number of slots, even the last one with
+        // fewer panels in it: the leftover slots stay blank instead of the panels
+        // stretching to fill them. A last row of two wide panels under rows of four
+        // narrow ones reads as a different grid, not as the end of this one.
+        let col_constraints: Vec<Constraint> = (0..colunas)
+            .map(|_| Constraint::Ratio(1, colunas as u32))
             .collect();
         let col_areas = Layout::default()
             .direction(Direction::Horizontal)
@@ -3162,9 +3192,10 @@ fn grade_de(area: Rect, desejadas: &[u16]) -> (usize, Vec<u16>) {
     if desejadas.is_empty() || area.width < CARTAO_MIN_L || area.height < CARTAO_MIN_A {
         return (0, Vec::new());
     }
-    let colunas = ((area.width / CARTAO_MIN_L) as usize)
-        .clamp(1, 4)
-        .min(desejadas.len());
+    // A mesma regra da grade de gráficos — ver `colunas_para`. O `CARTAO_MIN_L` acima
+    // continua sendo o «cabe alguma coisa?»; quem decide **quantas** colunas é a largura
+    // boa, e não a mínima.
+    let colunas = colunas_para(area.width).min(desejadas.len());
     let mut alturas = Vec::new();
     let mut usado = 0;
     for faixa in desejadas.chunks(colunas) {
@@ -4182,6 +4213,37 @@ mod invest_tests {
             y: 0,
             width,
             height,
+        }
+    }
+
+    #[test]
+    fn a_grade_flui_com_a_largura_e_para_em_quatro() {
+        // Os pontos de virada, escritos: é o que se confere quando alguém diz «numa tela
+        // dessas devia caber mais uma coluna».
+        assert_eq!(super::colunas_para(0), 1);
+        assert_eq!(super::colunas_para(39), 1);
+        assert_eq!(super::colunas_para(40), 1);
+        assert_eq!(super::colunas_para(79), 1);
+        assert_eq!(super::colunas_para(80), 2);
+        assert_eq!(super::colunas_para(119), 2);
+        assert_eq!(super::colunas_para(120), 3);
+        assert_eq!(super::colunas_para(159), 3);
+        assert_eq!(super::colunas_para(160), 4);
+        // O teto vale mesmo num ultrawide: quatro painéis grandes, não oito estreitos.
+        assert_eq!(super::colunas_para(400), 4);
+        assert_eq!(super::colunas_para(u16::MAX), 4);
+    }
+
+    #[test]
+    fn a_largura_de_uma_coluna_nunca_fica_abaixo_do_confortavel() {
+        // Enquanto houver largura para isso — abaixo de uma coluna boa a grade desce
+        // para uma coluna só e entrega a tela inteira a ela.
+        for largura in (super::COLUNA_BOA..=400).step_by(7) {
+            let colunas = super::colunas_para(largura) as u16;
+            assert!(
+                largura / colunas >= super::COLUNA_BOA,
+                "{largura} colunas em {colunas} deixa cartão estreito demais"
+            );
         }
     }
 
