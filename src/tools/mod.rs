@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub mod cert;
+pub mod db;
 pub mod dns;
 pub mod egress;
 pub mod http;
@@ -33,6 +34,23 @@ pub mod tls;
 pub mod tunnel;
 pub mod wol;
 pub mod x509;
+
+/// The marks a tool puts at the front of a line that is a *finding* rather than
+/// narration: something worth acting on, something happening right now, and the
+/// suggestion that belongs to the line above it.
+///
+/// They exist as constants because two places have to agree on them — the tool writing
+/// the line and the monitor offering to show only those lines (Ctrl+A). A tool that
+/// never marks anything simply has no findings to filter down to.
+pub const MARK_AVISO: char = '\u{25b2}';
+pub const MARK_ALERTA: char = '\u{25cf}';
+pub const MARK_SUGESTAO: char = '\u{21b3}';
+
+/// Whether this line is one of those marks — the test behind "só alertas".
+pub fn is_finding(text: &str) -> bool {
+    text.trim_start()
+        .starts_with([MARK_AVISO, MARK_ALERTA, MARK_SUGESTAO])
+}
 
 /// How one parameter is edited in the add-execution wizard.
 #[derive(Clone)]
@@ -208,6 +226,21 @@ pub trait Tool: Send + Sync {
     /// Asked for again, explicitly ('r'). Only reached for an on-demand tool — for
     /// anything else 'r' recreates the execution from its configuration instead.
     fn rerun(&self, _execution: &Execution, _params: &HashMap<&'static str, String>) {}
+
+    /// Whether this execution's monitor is the screen the user is looking at right now.
+    ///
+    /// Called on the transition in each direction, and the reason it exists is the one
+    /// tool whose work is only worth doing while somebody is watching: a database
+    /// inspection that keeps a connection open and asks what is running every couple of
+    /// seconds has no business doing that to a production server after the screen is
+    /// closed. A tool that costs nothing to leave running ignores this.
+    fn set_watched(
+        &self,
+        _execution: &Execution,
+        _params: &HashMap<&'static str, String>,
+        _watched: bool,
+    ) {
+    }
 
     /// The two result columns of this execution's row: a headline figure and a summary
     /// beside it. Both empty until there is something to say, which for an on-demand
@@ -431,6 +464,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(stun::StunTool),
         Box::new(egress::EgressTool),
         Box::new(wol::WolTool),
+        Box::new(db::SherlockTool),
     ]
 }
 
@@ -778,6 +812,142 @@ impl Recorder {
     }
 }
 
+/// What a tool has found, as a screen instead of as a stream.
+///
+/// The event log is the right shape for a tool that *watches* something: a tunnel, a
+/// probe, a file. It is the wrong shape for one that *examines* something, because an
+/// examination has sections, every section has a current state, and the state is
+/// replaced rather than appended to — a log of an inspection repeated every five seconds
+/// is thirty screens of the same report.
+///
+/// So a tool of that kind publishes a board: named cards, each holding what the grid
+/// shows and what its shortcut key opens, each replaced in place as the next pass
+/// rewrites it. The log goes on being written alongside it, and stays one keypress away.
+#[derive(Default)]
+pub struct Board {
+    pub cards: Vec<Card>,
+    /// The whole board in one line: what the last pass concluded.
+    pub note: String,
+    /// Whether a pass is running right now — what the screen says instead of going
+    /// still and looking broken.
+    pub working: bool,
+    /// When the last pass finished.
+    pub updated: Option<Instant>,
+}
+
+impl Board {
+    /// Puts a card on the board, replacing the one with the same key.
+    ///
+    /// Replacing rather than appending is what keeps the grid still: a card stays in the
+    /// position it was first given, and therefore under the shortcut key the user
+    /// already learned, however many times it is rewritten. And the scroll position of
+    /// whatever was being read inside it survives the rewrite, so a card refreshed under
+    /// someone's eyes doesn't jump back to its first line.
+    pub fn put(&mut self, mut card: Card) {
+        if let Some(old) = self.cards.iter().position(|other| other.key == card.key) {
+            card.set_scroll(
+                self.cards[old]
+                    .scroll
+                    .min(card.lines().saturating_sub(1) as u16),
+            );
+            self.cards[old] = card;
+            return;
+        }
+        self.cards.push(card);
+    }
+}
+
+/// One section of a board.
+pub struct Card {
+    /// Stable across passes. What makes the card the same card.
+    pub key: String,
+    pub title: String,
+    /// What the grid draws.
+    pub summary: crate::painel::Pane,
+    /// What the shortcut key opens: everything the section found. An arrangement rather
+    /// than a single panel, because most sections have two halves — the listing, and what
+    /// it means — and a table is the right shape for the first and the wrong one for the
+    /// second.
+    pub detail: crate::painel::Layout,
+    /// How many rows the card asks for in the grid, content only — the frame is added
+    /// by whoever draws it.
+    pub height: u16,
+    /// How far down its detail is scrolled. Lives on the card rather than on the screen
+    /// so it survives both a refresh and leaving and coming back.
+    pub scroll: u16,
+    /// Whether this card is reporting a problem, and how bad — what the mark next to its
+    /// title says, so the one card worth opening is visible without opening any.
+    pub tone: crate::painel::Tone,
+}
+
+impl Card {
+    pub fn new(key: impl Into<String>, title: impl Into<String>) -> Self {
+        let title = title.into();
+        Self {
+            key: key.into(),
+            summary: crate::painel::Pane::Empty {
+                title: title.clone(),
+                note: String::new(),
+            },
+            detail: crate::painel::Layout::one(crate::painel::Pane::Empty {
+                title: title.clone(),
+                note: String::new(),
+            }),
+            title,
+            height: 5,
+            scroll: 0,
+            tone: crate::painel::Tone::Normal,
+        }
+    }
+
+    /// How many lines the detail's prose has — what the scroll is clamped against. A
+    /// table scrolls by itself.
+    pub fn lines(&self) -> usize {
+        fn conta(no: &crate::painel::Layout) -> usize {
+            match no {
+                crate::painel::Layout::Leaf(pane) => match &**pane {
+                    crate::painel::Pane::Text { lines, .. } => lines.len(),
+                    _ => 0,
+                },
+                crate::painel::Layout::Rows(partes) | crate::painel::Layout::Cols(partes) => {
+                    partes.iter().map(|(_, filho)| conta(filho)).sum()
+                }
+            }
+        }
+        conta(&self.detail)
+    }
+
+    /// Moves the detail's viewport. Written into the panel as well as onto the card,
+    /// because the panel is what the renderer reads.
+    pub fn set_scroll(&mut self, at: u16) {
+        fn rolar(no: &mut crate::painel::Layout, at: u16) {
+            match no {
+                crate::painel::Layout::Leaf(pane) => {
+                    if let crate::painel::Pane::Text { scroll, .. } = &mut **pane {
+                        *scroll = at;
+                    }
+                }
+                crate::painel::Layout::Rows(partes) | crate::painel::Layout::Cols(partes) => {
+                    for (_, filho) in partes {
+                        rolar(filho, at);
+                    }
+                }
+            }
+        }
+        self.scroll = at;
+        rolar(&mut self.detail, at);
+    }
+}
+
+/// A poisoned board mutex means a tool thread panicked mid-write. Same reasoning as
+/// `lock_log`: what is there is still readable, and losing the screen over it would be
+/// the worse outcome.
+pub fn lock_board(board: &Mutex<Board>) -> MutexGuard<'_, Board> {
+    board
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// One running instance of a tool.
 pub struct Execution {
     pub id: u64,
@@ -815,6 +985,9 @@ pub struct Execution {
     /// The series this execution publishes for a chart panel, for a tool that measures
     /// something over time. `None` for the ones that don't.
     chart: Option<Chart>,
+    /// The board this execution publishes, for a tool whose result is a screen rather
+    /// than a stream. `None` — the usual case — is a tool that only has a log.
+    board: Option<Arc<Mutex<Board>>>,
 }
 
 /// A line on the Overview tab fed by a running execution.
@@ -868,9 +1041,25 @@ impl Execution {
             findings,
             spec: None,
             chart: None,
+            board: None,
             off: false,
         };
         (execution, recorder)
+    }
+
+    /// Gives this execution a board, and hands its tool the handle to write it.
+    ///
+    /// Called by the tool in `start`, before anything has been found: the screen exists
+    /// from the first moment the execution does, saying it has nothing yet, which is a
+    /// better answer than a blank rectangle.
+    pub fn with_board(mut self, board: Arc<Mutex<Board>>) -> Self {
+        self.board = Some(board);
+        self
+    }
+
+    /// This execution's board, for whoever is drawing it.
+    pub fn board(&self) -> Option<&Arc<Mutex<Board>>> {
+        self.board.as_ref()
     }
 
     /// Gives this execution a chart panel on the Overview tab, fed by `chart.series`.

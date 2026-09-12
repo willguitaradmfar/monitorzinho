@@ -1301,6 +1301,11 @@ pub const PAGE_ROWS: i32 = 10;
 /// renderer: it's the only place that knows how many lines the log currently occupies,
 /// which of them match, and how tall the viewport is.
 pub struct ToolMonitorFocus {
+    /// Show only the lines the tool marked as findings (Ctrl+A). The counterpart of the
+    /// "achados" gesture elsewhere: on a log built by a tool that grades what it sees —
+    /// a database investigation, above all — this is the difference between a report and
+    /// a list of what to do about it.
+    pub only_alerts: bool,
     /// Held by id, not index: the list can be reordered or shortened underneath.
     pub execution_id: u64,
     /// Free-text search, typed directly like the tables'. Matching text is highlighted
@@ -1370,6 +1375,18 @@ impl ToolMonitorFocus {
     }
 }
 
+/// Uma execução aberta no formato de painel: a grade de cartões, ou um cartão em tela
+/// cheia.
+///
+/// Guarda só onde o usuário está. O conteúdo é do `tools::Board`, que a ferramenta
+/// reescreve por conta própria — é isso que faz a tela se atualizar sozinha sem que nada
+/// aqui precise saber quando.
+pub struct BoardFocus {
+    pub execution_id: u64,
+    /// Qual cartão está ampliado, pelo índice na grade. `None` é a grade.
+    pub card: Option<usize>,
+}
+
 pub enum Focus {
     None,
     Chart(usize),
@@ -1379,6 +1396,9 @@ pub enum Focus {
     Detail(Box<DetailFocus>),
     Wizard(ToolWizard),
     ToolMonitor(ToolMonitorFocus),
+    /// O painel de uma execução que publica um quadro em vez de um log — ver
+    /// `tools::Board`. Boxed como os outros focos grandes.
+    Board(Box<BoardFocus>),
     /// O menu de operações de uma linha da aba Containers. Boxed pela mesma razão do
     /// detalhe: carrega a tabela inteira de onde veio.
     Actions(Box<ActionMenu>),
@@ -1511,6 +1531,11 @@ pub struct App {
     /// A caixa do endereço da engine, enquanto está aberta.
     pub endpoint_editor: Option<EndpointEditor>,
     pub tools_available: Vec<Box<dyn Tool>>,
+    /// Which execution's monitor is on screen, as of the last tick. Compared against
+    /// what's on screen now so a tool is told once when its screen opens and once when
+    /// it closes — there is more than one way out of a fullscreen view, and a watch that
+    /// keeps a connection to production open has to stop on every one of them.
+    tool_watched: Option<u64>,
     pub tools: ToolsState,
     pub focus: Focus,
     pub tab: Tab,
@@ -1673,6 +1698,7 @@ impl App {
             marks_screen: None,
             endpoint_editor: None,
             tools_available,
+            tool_watched: None,
             tools,
             focus: Focus::None,
             tab: Tab::Overview,
@@ -1794,7 +1820,7 @@ impl App {
     /// writing something is worth a redraw between samples — anywhere else the next
     /// tick is soon enough, because nothing on screen changed.
     pub fn shows_tools(&self) -> bool {
-        self.tab == Tab::Tools || matches!(self.focus, Focus::ToolMonitor(_))
+        self.tab == Tab::Tools || matches!(self.focus, Focus::ToolMonitor(_) | Focus::Board(_))
     }
 
     /// Switches to `tab` and immediately samples it (rather than waiting for the next
@@ -1906,6 +1932,7 @@ impl App {
             });
         }
         self.tick_module();
+        self.tick_watched_tool();
         // Executions come and go between ticks — from the wizard, from a hand-off, from
         // being removed — and the panels follow whatever exists now.
         self.sync_tool_charts();
@@ -4063,8 +4090,19 @@ impl App {
         let Some(execution) = self.tools.selected() else {
             return;
         };
+        // Uma ferramenta que publica um quadro abre no quadro. O log continua lá,
+        // completo, a um Tab de distância — quem quiser ler a investigação como narrativa
+        // ainda pode.
+        if execution.board().is_some() {
+            self.focus = Focus::Board(Box::new(BoardFocus {
+                execution_id: execution.id,
+                card: None,
+            }));
+            return;
+        }
         self.focus = Focus::ToolMonitor(ToolMonitorFocus {
             execution_id: execution.id,
+            only_alerts: false,
             query: String::new(),
             only_matches: false,
             hex: false,
@@ -4077,6 +4115,35 @@ impl App {
             anchor_seq: Cell::new(0),
             anchor_offset: Cell::new(0),
         });
+    }
+
+    /// Tells a tool when its monitor comes on screen and when it leaves.
+    ///
+    /// Said here rather than at each keypress for the same reason the container engine's
+    /// cadence is: leaving a fullscreen view happens through Esc, through 'q', through a
+    /// tab change and through the execution being removed, and a tool that has to be
+    /// told on every one of those would eventually be told on all but one.
+    fn tick_watched_tool(&mut self) {
+        let open = match &self.focus {
+            Focus::ToolMonitor(monitor) => Some(monitor.execution_id),
+            Focus::Board(board) => Some(board.execution_id),
+            _ => None,
+        };
+        if open == self.tool_watched {
+            return;
+        }
+        for (id, watched) in [(self.tool_watched.take(), false), (open, true)] {
+            let Some(id) = id else {
+                continue;
+            };
+            let Some(execution) = self.tools.by_id(id) else {
+                continue;
+            };
+            if let Some((tool, params)) = self.params_of(execution) {
+                tool.set_watched(execution, &params, watched);
+            }
+        }
+        self.tool_watched = open;
     }
 
     /// Where the picker lives for whichever view is open. Two surfaces offer the
@@ -4716,6 +4783,102 @@ impl App {
         }
     }
 
+    /// A tecla de um cartão (1-9, letras) amplia aquele cartão.
+    pub fn board_open_card(&mut self, key: char) -> bool {
+        let Some(index) = shortcut_index(key) else {
+            return false;
+        };
+        let Focus::Board(board) = &self.focus else {
+            return false;
+        };
+        let existe = self
+            .tools
+            .by_id(board.execution_id)
+            .and_then(|execution| execution.board().cloned())
+            .is_some_and(|quadro| index < tools::lock_board(&quadro).cards.len());
+        if !existe {
+            return false;
+        }
+        if let Focus::Board(board) = &mut self.focus {
+            board.card = Some(index);
+        }
+        true
+    }
+
+    /// Esc no painel: volta do cartão para a grade, e só então sai.
+    pub fn board_escape(&mut self) {
+        let Focus::Board(board) = &mut self.focus else {
+            return;
+        };
+        if board.card.is_some() {
+            board.card = None;
+            return;
+        }
+        self.focus = Focus::None;
+    }
+
+    /// ↑/↓ e PgUp/PgDn dentro de um cartão ampliado.
+    ///
+    /// A posição fica gravada no próprio cartão, e não aqui: a ferramenta reescreve o
+    /// cartão a cada volta, e um cartão que voltasse para a primeira linha toda vez seria
+    /// ilegível justamente enquanto estivesse sendo lido.
+    pub fn board_scroll(&mut self, delta: i32) {
+        let Focus::Board(board) = &self.focus else {
+            return;
+        };
+        let (Some(index), Some(execution)) = (board.card, self.tools.by_id(board.execution_id))
+        else {
+            return;
+        };
+        let Some(quadro) = execution.board().cloned() else {
+            return;
+        };
+        let mut quadro = tools::lock_board(&quadro);
+        let Some(card) = quadro.cards.get_mut(index) else {
+            return;
+        };
+        let altura = card.lines() as i32;
+        card.scroll = (card.scroll as i32 + delta).clamp(0, altura.saturating_sub(1)) as u16;
+        let scroll = card.scroll;
+        card.set_scroll(scroll);
+    }
+
+    /// Tab no painel: o log da mesma execução, que é a investigação como narrativa.
+    pub fn board_log(&mut self) {
+        let Focus::Board(board) = &self.focus else {
+            return;
+        };
+        let id = board.execution_id;
+        self.focus = Focus::ToolMonitor(ToolMonitorFocus {
+            execution_id: id,
+            only_alerts: false,
+            query: String::new(),
+            only_matches: false,
+            hex: false,
+            scroll: Cell::new(0),
+            follow: true,
+            max_scroll: Cell::new(0),
+            handoff: None,
+            matches: RefCell::new(Vec::new()),
+            match_index: Cell::new(None),
+            anchor_seq: Cell::new(0),
+            anchor_offset: Cell::new(0),
+        });
+    }
+
+    /// Ctrl+R: pede uma passada completa agora, em vez de esperar a próxima.
+    pub fn board_refresh(&mut self) {
+        let Focus::Board(board) = &self.focus else {
+            return;
+        };
+        let Some(execution) = self.tools.by_id(board.execution_id) else {
+            return;
+        };
+        if let Some((tool, params)) = self.params_of(execution) {
+            tool.rerun(execution, &params);
+        }
+    }
+
     /// ↑/↓ in the monitor. With a search active these step between hits instead of
     /// between lines — in a log you're searching, jumping is the whole point, and it's
     /// what the fullscreen tables already do with the same keys.
@@ -4763,6 +4926,22 @@ impl App {
         monitor.anchor_seq.set(0);
         monitor.anchor_offset.set(0);
         monitor.match_index.set(None);
+    }
+
+    /// Hides everything but the lines the tool flagged (Ctrl+A).
+    pub fn tool_monitor_toggle_alerts(&mut self) {
+        if let Some(monitor) = match &mut self.focus {
+            Focus::ToolMonitor(monitor) => Some(monitor),
+            _ => None,
+        } {
+            monitor.only_alerts = !monitor.only_alerts;
+            // The viewport was anchored to a line that may not be in the filtered list
+            // at all, so it goes back to the live edge rather than somewhere arbitrary.
+            monitor.follow = true;
+            monitor.anchor_seq.set(0);
+            monitor.anchor_offset.set(0);
+            monitor.match_index.set(None);
+        }
     }
 
     pub fn tool_monitor_toggle_hex(&mut self) {

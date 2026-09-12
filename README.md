@@ -867,6 +867,73 @@ accepts, but what can leave from here. A refused connection counts as success �
 the refusal had to get out — while a blocked port simply goes quiet, which is why
 it waits three seconds and not three hundred milliseconds.
 
+#### Sherlock Database
+
+A whole Postgres or MongoDB read end to end, and nothing written to either.
+
+The form asks four things: which engine, the connection string, optionally a
+database to point at instead of the one in the string, and how deep to look.
+Depth is the honest part of the bargain — `raso` reads catalogues and counters
+(indexes, settings, connections, locks), `médio` adds the statistics that need
+the views a busy server keeps (slow queries, vacuum debt, replication), and
+`profundo` adds the measurements that cost: every relation's size, foreign keys
+with no index behind them, sequences about to overflow.
+
+`Enter` opens a **board**, not a log: a grid of cards, one per section, each with
+its own shortcut key, each opening onto the full table of what it found. What is
+worth acting on carries a mark in the card's title, so which card to open is
+visible without opening any.
+
+Nothing refreshes on its own. The board is the snapshot of the last reading and
+the header says how old it is; `Ctrl+R` takes another. That is not frugality for
+its own sake: a panel that re-investigated itself every few seconds would be,
+against a production database, precisely the kind of load it exists to find. The
+connection stays open and idle between readings, which is what makes `Ctrl+R`
+instant — and what gives the **Queries recentes** card its meaning, since it
+compares this reading's counters against the previous one. Close the screen and
+the connection closes with it.
+
+That card is the monitor: every query shape that ran since the last reading, how
+long each took on average, how many times, and how long ago. On Postgres it comes
+from `pg_stat_statements`; where the extension isn't installed, the same card
+falls back to what every server has — per-table counters, so you still see what
+was read by index, what was read whole, and what was written. On MongoDB it comes
+from the server's own slow-query log or, where somebody has already switched the
+profiler on, from `system.profile`; failing both, from `top`, which measures time
+per collection without anything being enabled.
+
+Query text is shown as its *shape*, never its values: `WHERE email = $1` on the
+Postgres side (which is how the server itself stores it) and `{email: "…"}` on
+the MongoDB side, where the log hands over the filter in full and this tool drops
+the literals before drawing them. A screen like this is read over somebody's
+shoulder and pasted into tickets; what answers "why is this slow" is the shape,
+and a customer's data is never part of the answer.
+
+**It cannot write, and it says so out loud.** On Postgres the session declares
+itself read-only to the server before the first question — `SET SESSION
+CHARACTERISTICS AS TRANSACTION READ ONLY`, plus a statement timeout and a lock
+timeout — and then asks the server to confirm it, which is the line the Servidor
+card shows. On MongoDB the command list is short enough to read by eye and every
+entry on it is a reader: `hello`, `buildInfo`, `serverStatus`, `listDatabases`,
+`listCollections`, `listIndexes`, `dbStats`, `currentOp`, `getLog`,
+`replSetGetStatus`, `$collStats`, `$indexStats`, `find` over `system.profile`,
+and `profile: -1` — which is the form that *reads* the profiler level. Turning
+the profiler on is a persistent change to a production database and this tool
+will not make it; where it is off, the card says what it is missing and moves on
+to the next-best source.
+
+Every suggestion is text. `CREATE INDEX CONCURRENTLY …`, `createIndex({…})` — put
+there to be read, copied and thought about, never run. The MongoDB suggestions
+follow the equality-sort-range rule, which is the part a hand-written index gets
+wrong most often.
+
+The protocols are spoken by hand, like everything else here: the Postgres wire
+protocol with MD5 and SCRAM-SHA-256 authentication, the MongoDB `OP_MSG` envelope
+with BSON encoded and decoded byte by byte, SCRAM-SHA-1 and SCRAM-SHA-256 on top
+of it, TLS through the same rustls the certificate reader uses, and
+`mongodb+srv://` resolved through the same DNS client the DNS investigation is
+built on.
+
 #### Scanner de rede
 
 What's alive on the local network, with a MAC, a vendor and a name for each.
@@ -928,6 +995,9 @@ at it properly.
 | `a` / `e` / `r` / `Del` | Ferramentas | add / edit / restart (or re-run) / remove an execution |
 | `Espaço` | Ferramentas | switch that execution off — or back on |
 | `Enter` | Ferramentas | open that execution's live log — and run it, for an on-demand tool |
+| the card's key | a tool's board | open that card's full findings |
+| `Tab`, `Ctrl+R` | a tool's board | its log instead of its board, investigate again |
+| `Ctrl+A` | an execution's log | show only the lines the tool marked as findings |
 | `Tab`, `Ctrl+F` | an execution's log | hex view, matches-only filter |
 | `Ctrl+L`, `End` | an execution's log | clear the scrollback, jump back to the live edge |
 | `Ctrl+P` | a detail view | turn what's on screen into an execution — a tunnel to either end of a connection, a recording of a port, a sweep of an interface's network |

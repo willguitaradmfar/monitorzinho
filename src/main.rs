@@ -18,6 +18,7 @@ mod history;
 mod invest;
 mod legado;
 mod monitor;
+mod painel;
 mod perfil;
 mod tmux;
 mod tools;
@@ -347,6 +348,40 @@ fn run(
                     // inteiras, não caixas sobre a tabela.
                     code if app.actions_open() => app.actions_key(code),
                     code if app.text_open() => app.text_key(code),
+                    // --- o painel de uma execução ---
+                    // Antes do Esc e do Tab globais: numa grade de cartões essas duas
+                    // teclas são da grade (voltar um nível, ver o log), e não da janela.
+                    KeyCode::Esc if matches!(app.focus, Focus::Board(_)) => app.board_escape(),
+                    KeyCode::Char('q')
+                        if matches!(app.focus, Focus::Board(_))
+                            && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.board_escape();
+                    }
+                    KeyCode::Tab if matches!(app.focus, Focus::Board(_)) => app.board_log(),
+                    KeyCode::Char('r')
+                        if matches!(app.focus, Focus::Board(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.board_refresh();
+                    }
+                    KeyCode::Up if matches!(app.focus, Focus::Board(_)) => app.board_scroll(-1),
+                    KeyCode::Down if matches!(app.focus, Focus::Board(_)) => app.board_scroll(1),
+                    KeyCode::PageUp if matches!(app.focus, Focus::Board(_)) => {
+                        app.board_scroll(-15);
+                    }
+                    KeyCode::PageDown if matches!(app.focus, Focus::Board(_)) => {
+                        app.board_scroll(15);
+                    }
+                    // As letras e os números são dos cartões. Com Ctrl não: aqueles são
+                    // os gestos do programa inteiro, e eles continuam valendo aqui.
+                    KeyCode::Char(c)
+                        if matches!(app.focus, Focus::Board(_))
+                            && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.board_open_card(c);
+                    }
+
                     // A fullscreened table's search box swallows every letter, including
                     // 'q' — so Esc is its only way out, and it first clears an active
                     // query rather than leaving fullscreen outright.
@@ -455,6 +490,13 @@ fn run(
                             && key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
                         app.open_handoffs();
+                    }
+                    // Ctrl+A rather than 'a': the search box owns every bare letter.
+                    KeyCode::Char('a')
+                        if matches!(app.focus, Focus::ToolMonitor(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.tool_monitor_toggle_alerts();
                     }
                     KeyCode::Tab if matches!(app.focus, Focus::ToolMonitor(_)) => {
                         app.tool_monitor_toggle_hex();

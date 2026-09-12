@@ -23,7 +23,9 @@ use crate::invest::marcas::Pintor;
 use crate::monitor::mark::MarkColor;
 use crate::monitor::{Detail, Monitor, TableRow};
 use crate::tools::rewrite::{self, Rule};
-use crate::tools::{Direction as Flow, EventKind, Execution, ParamKind, Stage, State, lock_log};
+use crate::tools::{
+    self, Direction as Flow, EventKind, Execution, ParamKind, Stage, State, lock_log,
+};
 
 const TAB_BAR_HEIGHT: u16 = 2;
 
@@ -326,6 +328,10 @@ fn render_screen(frame: &mut Frame, area: Rect, app: &App) {
         }
         Focus::ToolMonitor(monitor) => {
             render_tool_monitor(frame, area, app, monitor);
+            return;
+        }
+        Focus::Board(board) => {
+            render_board(frame, area, app, board);
             return;
         }
         Focus::Actions(menu) => {
@@ -2398,8 +2404,20 @@ fn wizard_param_lines(wizard: &ToolWizard, text_width: usize) -> Vec<Line<'stati
                 label_style,
             ),
         ];
-        row.extend(field_value(field, focused));
+        // The value column starts after the marker and the label, and what doesn't fit
+        // in it wraps under itself. A connection string is one word a hundred characters
+        // long, and a form that shows the first sixty of it is a form where the password
+        // can't be checked.
+        let value_width = text_width.saturating_sub(PARAM_LABEL_WIDTH + 4).max(24);
+        let (spans, rest) = field_value(field, focused, value_width);
+        row.extend(spans);
         lines.push(Line::from(row));
+        for chunk in rest {
+            lines.push(Line::styled(
+                format!("{}{chunk}", " ".repeat(PARAM_LABEL_WIDTH + 5)),
+                value_style(focused),
+            ));
+        }
     }
     // The focused field's help sits below the whole form rather than beside its row, so
     // a long explanation never pushes the value column around as focus moves.
@@ -2432,27 +2450,65 @@ fn wizard_param_lines(wizard: &ToolWizard, text_width: usize) -> Vec<Line<'stati
 /// is both, and shows both — plus, when the value is one of them, the note that says
 /// what it is: the whole point of offering the machine's own networks is that a CIDR
 /// alone doesn't say which one is the wifi.
-fn field_value(field: &ParamField, focused: bool) -> Vec<Span<'static>> {
+/// Returns the spans for the field's own row, plus whatever had to wrap onto the lines
+/// below it — empty for every value that fits, which is most of them.
+fn field_value(
+    field: &ParamField,
+    focused: bool,
+    width: usize,
+) -> (Vec<Span<'static>>, Vec<String>) {
     let value = |text: String| Span::styled(text, value_style(focused));
     match field.spec.kind {
-        ParamKind::Choice(_) => vec![value(format!("◂ {} ▸", field.value))],
-        ParamKind::Rules => vec![value(rules_summary(&field.value))],
-        ParamKind::Text if field.spec.suggestions.is_empty() && focused => {
-            vec![value(format!("{}▏", field.value))]
+        ParamKind::Choice(_) => (vec![value(format!("◂ {} ▸", field.value))], Vec::new()),
+        ParamKind::Rules => (vec![value(rules_summary(&field.value))], Vec::new()),
+        ParamKind::Text if field.spec.suggestions.is_empty() => {
+            let caret = if focused { "▏" } else { "" };
+            let mut chunks = wrap(&format!("{}{caret}", field.value), width);
+            if chunks.is_empty() {
+                chunks.push(caret.to_string());
+            }
+            (vec![value(chunks.remove(0))], chunks)
         }
-        ParamKind::Text if field.spec.suggestions.is_empty() => vec![value(field.value.clone())],
         ParamKind::Text => {
             let caret = if focused { "▏" } else { "" };
-            let mut spans = vec![value(format!("◂ {}{caret} ▸", field.value))];
-            if let Some(note) = suggestion_note(field) {
+            // The arrows have to stay on the row with the field, so only the value wraps
+            // and the closing arrow rides the last line of it.
+            let mut chunks = wrap(&format!("{}{caret}", field.value), width.saturating_sub(4));
+            if chunks.is_empty() {
+                chunks.push(caret.to_string());
+            }
+            let last = chunks.len() == 1;
+            let mut spans = vec![value(format!(
+                "◂ {}{}",
+                chunks.remove(0),
+                if last { " ▸" } else { "" }
+            ))];
+            if last && let Some(note) = suggestion_note(field) {
                 spans.push(Span::styled(
                     format!("   {note}"),
                     Style::default().fg(palette::DIM),
                 ));
             }
-            spans
+            if let Some(final_line) = chunks.last_mut() {
+                final_line.push_str(" ▸");
+            }
+            (
+                spans,
+                chunks.into_iter().map(|line| format!("  {line}")).collect(),
+            )
         }
     }
+}
+
+/// The value column on the confirmation screen: the box, less its borders, the indent
+/// and the label column.
+fn confirm_value_width() -> usize {
+    (WIZARD_WIDTH as usize).saturating_sub(WIZARD_TEXT_MARGIN + PARAM_LABEL_WIDTH)
+}
+
+/// The first wrapped line of `text`, or the whole of it when it fits.
+fn first_chunk(text: &str, width: usize) -> String {
+    wrap(text, width).into_iter().next().unwrap_or_default()
 }
 
 /// What the field's current value *is*, when it's one of the offered ones. `None` for
@@ -2539,9 +2595,20 @@ fn wizard_confirm_lines(app: &App, wizard: &ToolWizard) -> Vec<Line<'static>> {
                 // An optional field left blank still gets a line, so the confirmation
                 // shows the whole form rather than quietly hiding part of it.
                 ("", None) => Span::styled("(vazio)", Style::default().fg(palette::DIM)),
-                (value, _) => Span::raw(value.to_string()),
+                (value, _) => Span::raw(first_chunk(value, confirm_value_width())),
             },
         ]));
+        // The rest of a long value, under itself: the last screen before something
+        // connects should show the whole of what it is about to connect to.
+        for chunk in wrap(&field.value, confirm_value_width())
+            .into_iter()
+            .skip(1)
+        {
+            lines.push(Line::styled(
+                format!("   {}{chunk}", " ".repeat(PARAM_LABEL_WIDTH + 2)),
+                Style::default().fg(palette::DIM),
+            ));
+        }
     }
     lines.push(Line::raw(""));
     // What Enter actually does here differs by tool, and saying "a porta passa a ser
@@ -2590,6 +2657,9 @@ struct LogLine {
     gutter: String,
     text: String,
     style: Style,
+    /// Whether this line is something the tool flagged rather than something it
+    /// narrated. What Ctrl+A keeps.
+    alert: bool,
 }
 
 /// `mm:ss.mmm` since the execution started.
@@ -2681,6 +2751,7 @@ fn log_lines(execution: &Execution, hex: bool, width: usize) -> Vec<LogLine> {
                 log.dropped()
             ),
             style: Style::default().fg(palette::DIM),
+            alert: false,
         });
     }
 
@@ -2740,6 +2811,7 @@ fn log_lines(execution: &Execution, hex: bool, width: usize) -> Vec<LogLine> {
                         Stage::Original => Style::default().fg(palette::DIM),
                         Stage::Wire => Style::default().fg(color).add_modifier(Modifier::BOLD),
                     },
+                    alert: false,
                 });
                 // The pre-rewrite copy is dimmed: it's there to be compared against and
                 // it never crossed the wire.
@@ -2770,20 +2842,73 @@ fn log_lines(execution: &Execution, hex: bool, width: usize) -> Vec<LogLine> {
                         } else {
                             payload_style
                         },
+                        alert: false,
                     });
                 }
                 continue;
             }
         };
-        lines.push(LogLine {
-            seq: event.seq,
-            gutter,
-            text,
-            style,
-        });
+        // Wrapped rather than cut: a note is a sentence, and a tool that explains what
+        // it found in one loses the half of the explanation that falls off the right
+        // edge. Continuation lines sit under the gutter, the same shape a payload takes.
+        let alert = matches!(event.kind, EventKind::Error(_)) || tools::is_finding(&text);
+        let indent = text.len() - text.trim_start().len();
+        for (index, chunk) in fold(&text, payload_width).into_iter().enumerate() {
+            lines.push(LogLine {
+                seq: event.seq,
+                gutter: if index == 0 {
+                    gutter.clone()
+                } else {
+                    blank.clone()
+                },
+                // Continuation lines keep the indent of the line they belong to, so a
+                // wrapped listing still reads as one column.
+                text: if index == 0 {
+                    chunk
+                } else {
+                    format!("{}{chunk}", " ".repeat(indent + 2))
+                },
+                style,
+                alert,
+            });
+        }
     }
 
     lines
+}
+
+/// Breaks an already-formatted line to fit a width, keeping its spacing.
+///
+/// Not `wrap`, which rebuilds the line out of its words and so flattens the padding that
+/// lines a report's columns up. Here the first piece is the original text, cut at the
+/// last space that fits, and what's left goes on the next line — which is what a log
+/// line needs, since it arrives already laid out.
+fn fold(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(20);
+    let mut out = Vec::new();
+    let mut rest: Vec<char> = text.chars().collect();
+    while rest.len() > width {
+        // Back up to a space, but not past the point where breaking stops being
+        // wrapping and starts being hyphenation of a very long word.
+        let cut = rest[..=width]
+            .iter()
+            .rposition(|c| *c == ' ')
+            .filter(|at| *at > width / 2)
+            .unwrap_or(width);
+        out.push(
+            rest[..cut]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_string(),
+        );
+        rest = rest[cut..].to_vec();
+        while rest.first() == Some(&' ') {
+            rest.remove(0);
+        }
+    }
+    out.push(rest.into_iter().collect());
+    out
 }
 
 /// Splits `text` into spans with every occurrence of `query` picked out, so a search
@@ -2922,10 +3047,10 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
     };
 
     let hint = if monitor.query.is_empty() {
-        "digite p/ buscar · Tab hex · Ctrl+L limpar · ↑/↓ e PgUp/PgDn rolar · End seguir · Esc voltar"
+        "digite p/ buscar · Ctrl+A só alertas · Tab hex · Ctrl+L limpar · ↑/↓ e PgUp/PgDn rolar · End seguir · Esc voltar"
             .to_string()
     } else {
-        "↑/↓ resultado anterior/próximo · Ctrl+F filtrar · Tab hex · Ctrl+L limpar log · End seguir · Esc limpar busca"
+        "↑/↓ resultado anterior/próximo · Ctrl+F filtrar · Ctrl+A só alertas · Tab hex · Ctrl+L limpar log · End seguir · Esc limpar busca"
             .to_string()
     };
     // The borders are drawn only once the title is known, and the title carries the
@@ -2934,6 +3059,20 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
     let inner = outer.inner(area);
 
     let mut lines = log_lines(execution, monitor.hex, inner.width as usize);
+    // Alerts first, search second: the two filters compose, and asking for alerts is a
+    // statement about which part of the log to read at all.
+    if monitor.only_alerts {
+        lines.retain(|line| line.alert);
+        if lines.is_empty() {
+            lines.push(LogLine {
+                seq: 0,
+                gutter: " ".repeat(GUTTER_WIDTH),
+                text: "nada marcado como alerta neste log — Ctrl+A mostra tudo de novo".to_string(),
+                style: Style::default().fg(palette::DIM),
+                alert: false,
+            });
+        }
+    }
     if monitor.only_matches && !monitor.query.is_empty() {
         lines.retain(|line| format::find_ci(&line.text, &monitor.query, 0).is_some());
     }
@@ -2956,6 +3095,9 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
     monitor.matches.replace(matches);
 
     let mut title = format!(" {} — {} ", execution.tool, execution.summary);
+    if monitor.only_alerts {
+        title = format!("{title}— só alertas ");
+    }
     if !monitor.query.is_empty() {
         let position = match (current, match_count) {
             (_, 0) => " (nenhum resultado)".to_string(),
@@ -3054,6 +3196,184 @@ fn render_tool_monitor(frame: &mut Frame, area: Rect, app: &App, monitor: &ToolM
     frame.render_widget(
         Paragraph::new(rendered).scroll((monitor.scroll.get(), 0)),
         inner,
+    );
+}
+
+/// Como a grade do painel se divide. Como a da home da Invest, menos a sobra.
+///
+/// A diferença é de propósito: na home a sobra é dividida entre as faixas porque são
+/// poucos cartões e um deles é o assunto da tela. Aqui são quinze seções de uma
+/// investigação, todas do mesmo tamanho de importância, e esticá-las para encher a tela
+/// daria molduras de dezesseis linhas com três linhas dentro — e ainda empurraria as
+/// últimas para fora.
+fn grade_do_quadro(area: Rect, necessarias: &[u16]) -> (usize, Vec<u16>) {
+    /// Quanto um cartão pede ao empacotar, e quanto ele pode crescer depois com a sobra.
+    /// Um cartão com vinte achados tem vinte linhas a dizer, e deixá-lo pedir vinte
+    /// tiraria da tela os outros treze — então primeiro todo mundo entra apertado, e só o
+    /// que sobrar é repartido entre os que têm o que fazer com ele.
+    const PEDIDO: u16 = 7;
+    const TETO: u16 = 12;
+
+    if necessarias.is_empty() || area.width < CARTAO_MIN_L || area.height < CARTAO_MIN_A {
+        return (0, Vec::new());
+    }
+    let colunas = colunas_para(area.width).min(necessarias.len());
+    let (mut alturas, mut precisam) = (Vec::new(), Vec::new());
+    let mut usado = 0;
+    for faixa in necessarias.chunks(colunas) {
+        let precisa = (faixa.iter().copied().max().unwrap_or(1) + 2).min(TETO);
+        let altura = precisa.min(PEDIDO);
+        if usado + altura > area.height {
+            break;
+        }
+        usado += altura;
+        alturas.push(altura);
+        precisam.push(precisa);
+    }
+    if alturas.is_empty() {
+        return (colunas, vec![area.height]);
+    }
+    // A sobra vai para as faixas que têm o que mostrar nela, e só até onde elas têm — uma
+    // moldura de dezesseis linhas com três dentro é pior que espaço em branco no fim.
+    let mut sobra = area.height - usado;
+    while sobra > 0 {
+        let mut usou = false;
+        for (altura, precisa) in alturas.iter_mut().zip(&precisam) {
+            if sobra > 0 && *altura < *precisa {
+                *altura += 1;
+                sobra -= 1;
+                usou = true;
+            }
+        }
+        if !usou {
+            break;
+        }
+    }
+    (colunas, alturas)
+}
+
+/// O painel de uma execução que publica um quadro: a grade de cartões, ou um cartão em
+/// tela cheia.
+///
+/// Desenha com o mesmo vocabulário da aba Invest — `Pane`, a grade que empacota por
+/// altura pedida, o crachá da tecla no canto. Não por economia: é o que faz a inspeção de
+/// um banco parecer com o resto do programa em vez de parecer com um programa diferente
+/// aberto dentro dele.
+fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::BoardFocus) {
+    let Some(execution) = app.tools.by_id(focus.execution_id) else {
+        return;
+    };
+    let Some(quadro) = execution.board() else {
+        return;
+    };
+    let quadro = tools::lock_board(quadro);
+
+    let partes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // A idade da leitura no cabeçalho, e não na borda de cada cartão: a passada é uma só,
+    // e repetir «há 2s» em doze molduras seria dizer a mesma coisa doze vezes.
+    // Um retrato precisa dizer de quando é, e com mais insistência do que um monitor: o
+    // painel não se atualiza sozinho, e um número de dez minutos atrás com cara de agora
+    // faz decidir errado.
+    let idade = match (quadro.working, quadro.updated) {
+        (true, _) => "investigando…".to_string(),
+        (false, Some(quando)) => format!(
+            "investigado há {} · Ctrl+R investiga de novo",
+            format::human_duration(quando.elapsed().as_secs())
+        ),
+        (false, None) => "ainda não investigou nada".to_string(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                match focus.card.and_then(|index| quadro.cards.get(index)) {
+                    Some(card) => format!(
+                        " {} — {} · {} ",
+                        execution.tool, execution.summary, card.title
+                    ),
+                    None => format!(" {} — {} ", execution.tool, execution.summary),
+                },
+                Style::default()
+                    .fg(palette::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(idade, Style::default().fg(palette::DIM)),
+        ])),
+        partes[0],
+    );
+
+    let pintor = Pintor::novo(&app.marks, None);
+    let mut desenhados = quadro.cards.len();
+    match focus.card.and_then(|index| quadro.cards.get(index)) {
+        Some(card) => render_layout(frame, partes[1], &card.detail, &pintor, &mut None),
+        None => {
+            let desejadas: Vec<u16> = quadro.cards.iter().map(|card| card.height + 2).collect();
+            let (colunas, alturas) = grade_do_quadro(partes[1], &desejadas);
+            desenhados = (colunas * alturas.len()).min(quadro.cards.len());
+            if colunas > 0 {
+                let faixas = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(alturas.iter().map(|a| Constraint::Length(*a)))
+                    .split(partes[1]);
+                for (l, faixa) in faixas.iter().enumerate() {
+                    let celulas = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints(vec![Constraint::Ratio(1, colunas as u32); colunas])
+                        .split(*faixa);
+                    for (c, celula) in celulas.iter().enumerate() {
+                        let indice = l * colunas + c;
+                        let Some(card) = quadro.cards.get(indice) else {
+                            break;
+                        };
+                        render_pane(frame, *celula, &card.summary, &pintor, None);
+                        if let Some(badge) = shortcut_badge(crate::app::shortcut_key(indice))
+                            && celula.width > 2
+                        {
+                            frame.render_widget(
+                                Paragraph::new(badge),
+                                Rect {
+                                    x: celula.x,
+                                    y: celula.y,
+                                    width: celula.width - 1,
+                                    height: 1,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Os cartões que não couberam na tela continuam acessíveis pela tecla, e o rodapé é
+    // onde isso é dito: um cartão que existe, tem achado e não aparece em lugar nenhum é
+    // um achado perdido.
+    let rodape = match focus.card {
+        Some(_) => " ↑/↓ e PgUp/PgDn rolar · Esc volta para a grade · Tab log · Ctrl+R investigar de novo"
+            .to_string(),
+        None if desenhados < quadro.cards.len() => {
+            let resto: Vec<String> = quadro.cards[desenhados..]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, card)| {
+                    crate::app::shortcut_key(desenhados + i)
+                        .map(|tecla| format!("[{tecla}] {}", card.title))
+                })
+                .collect();
+            format!(" não coube na tela: {}", resto.join(" · "))
+        }
+        None => " a tecla de cada cartão abre o que ele achou · Tab log · Ctrl+R investigar de novo · Esc voltar".to_string(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(rodape, Style::default().fg(palette::DIM))),
+        partes[2],
     );
 }
 
@@ -3352,6 +3672,44 @@ fn invest_nota(app: &App) -> Option<String> {
     None
 }
 
+/// Desenha um arranjo de painéis: a árvore de `Layout` virando retângulos.
+///
+/// O selo da idade vai no **primeiro** painel e não em todos: a idade é da tela, e
+/// repeti-la em cada painel seria dizer a mesma coisa três vezes.
+///
+/// Fora de `render_module` porque deixou de ser só dele: o detalhe de um cartão do painel
+/// de banco de dados é um arranjo pela mesma razão que um módulo é — uma tabela em cima,
+/// o que ela quer dizer embaixo.
+fn render_layout(
+    frame: &mut Frame,
+    area: Rect,
+    no: &crate::painel::Layout,
+    pintor: &Pintor,
+    idade: &mut Option<Option<u64>>,
+) {
+    use crate::painel::Layout as ML;
+    match no {
+        ML::Leaf(pane) => render_pane(frame, area, pane, pintor, idade.take()),
+        ML::Rows(partes) | ML::Cols(partes) => {
+            let vertical = matches!(no, ML::Rows(_));
+            let pesos: Vec<Constraint> = partes
+                .iter()
+                .map(|(peso, _)| Constraint::Fill((*peso).max(1)))
+                .collect();
+            let areas = Layout::default()
+                .direction(match vertical {
+                    true => Direction::Vertical,
+                    false => Direction::Horizontal,
+                })
+                .constraints(pesos)
+                .split(area);
+            for ((_, filho), &area) in partes.iter().zip(areas.iter()) {
+                render_layout(frame, area, filho, pintor, idade);
+            }
+        }
+    }
+}
+
 /// Desenha um módulo em tela cheia.
 ///
 /// Aqui está o outro lado da decisão de `invest::module`: o módulo não recebe o `Frame`.
@@ -3359,8 +3717,6 @@ fn invest_nota(app: &App) -> Option<String> {
 /// o ratatui — que os transforma em pixels. Um módulo desenha bem porque não tem como
 /// desenhar diferente.
 fn render_module(frame: &mut Frame, area: Rect, app: &App, mf: &crate::app::ModuleFocus) {
-    use crate::invest::module::Layout as ML;
-
     let Some(invest) = &app.invest else { return };
     let ctx = invest.ctx();
     let layout = mf.view.layout(&ctx);
@@ -3375,43 +3731,11 @@ fn render_module(frame: &mut Frame, area: Rect, app: &App, mf: &crate::app::Modu
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    // O selo da idade vai no **primeiro** painel e não em todos: a idade é da tela, e
-    // repeti-la em cada painel seria dizer a mesma coisa três vezes.
-    fn desenhar(
-        frame: &mut Frame,
-        area: Rect,
-        no: &ML,
-        pintor: &Pintor,
-        idade: &mut Option<Option<u64>>,
-    ) {
-        match no {
-            ML::Leaf(pane) => {
-                render_pane(frame, area, pane, pintor, idade.take());
-            }
-            ML::Rows(partes) | ML::Cols(partes) => {
-                let vertical = matches!(no, ML::Rows(_));
-                let pesos: Vec<Constraint> = partes
-                    .iter()
-                    .map(|(peso, _)| Constraint::Fill((*peso).max(1)))
-                    .collect();
-                let areas = Layout::default()
-                    .direction(match vertical {
-                        true => Direction::Vertical,
-                        false => Direction::Horizontal,
-                    })
-                    .constraints(pesos)
-                    .split(area);
-                for ((_, filho), &area) in partes.iter().zip(areas.iter()) {
-                    desenhar(frame, area, filho, pintor, idade);
-                }
-            }
-        }
-    }
     let mut idade = invest
         .modulo(&mf.module)
         .and_then(|m| m.fonte_externa())
         .map(|fonte| ctx.buscas.idade(fonte, ctx.agora));
-    desenhar(frame, partes[0], &layout, &pintor, &mut idade);
+    render_layout(frame, partes[0], &layout, &pintor, &mut idade);
 
     // O `Ctrl+E` não é do módulo, é do programa — então quem o anuncia é quem sabe se a
     // tela aceita marca, e não cada `hint()` repetindo a mesma frase vinte vezes.
@@ -4827,6 +5151,75 @@ mod sparkline_tests {
         // 182 pontos em 80 colunas. Sem reamostrar, a `Sparkline` descarta o excedente.
         let dados: Vec<u64> = (0..182).map(|_| 500).collect();
         assert_eq!(colunas_vazias(&dados, 80), 0);
+    }
+}
+
+#[cfg(test)]
+mod quadro_tests {
+    use super::*;
+
+    fn area(width: u16, height: u16) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn a_grade_cabe_na_tela_e_nao_estica_a_moldura_vazia() {
+        // Catorze cartões pequenos e um grande, como uma inspeção de Postgres devolve.
+        let mut necessarias = vec![3u16; 14];
+        necessarias[1] = 9;
+        let (colunas, alturas) = grade_do_quadro(area(150, 40), &necessarias);
+        assert!(colunas >= 2, "uma tela larga divide em colunas");
+        let total: u16 = alturas.iter().sum();
+        assert!(total <= 40, "a grade não pode passar da tela: {total}");
+        // A faixa de um cartão de três linhas não vira uma moldura de dezesseis.
+        let menor = *alturas.iter().min().unwrap();
+        assert!(menor <= 12, "faixa esticada demais: {menor}");
+    }
+
+    #[test]
+    fn tela_baixa_ainda_desenha_a_primeira_faixa() {
+        let (colunas, alturas) = grade_do_quadro(area(150, 5), &[3, 3, 3]);
+        assert!(colunas > 0);
+        assert_eq!(alturas.len(), 1, "cabe uma faixa, e ela é desenhada");
+    }
+
+    #[test]
+    fn tela_impossivel_nao_desenha_nada() {
+        assert_eq!(grade_do_quadro(area(10, 40), &[3]).0, 0);
+        assert_eq!(grade_do_quadro(area(150, 2), &[3]).0, 0);
+        assert_eq!(grade_do_quadro(area(150, 40), &[]).0, 0);
+    }
+
+    #[test]
+    fn dobrar_uma_linha_preserva_o_alinhamento_da_primeira() {
+        let linha = format!(
+            "  {:<26}{}",
+            "acerto de cache", "99.87% (1 263 lidos do disco)"
+        );
+        // Cabendo, a linha é entregue exatamente como veio — é isto que mantém as duas
+        // colunas de um relatório alinhadas, e é o que `wrap` não faria.
+        assert_eq!(fold(&linha, 60), vec![linha.clone()]);
+
+        let partes = fold(&linha, 30);
+        assert!(partes.len() > 1, "uma linha longa quebra");
+        assert!(partes[0].starts_with("  acerto de cache"));
+        assert!(partes.iter().all(|parte| parte.chars().count() <= 30));
+        // Nada se perde no caminho.
+        let junto: String = partes.join(" ");
+        assert!(junto.contains("99.87%"), "{junto}");
+    }
+
+    #[test]
+    fn uma_palavra_maior_que_a_largura_e_cortada_e_nao_perdida() {
+        let url = "postgresql://usuario:senha@host.muito.comprido.example.com:5432/base";
+        let partes = fold(url, 20);
+        assert!(partes.iter().all(|parte| parte.chars().count() <= 20));
+        assert_eq!(partes.concat(), url);
     }
 }
 
