@@ -192,13 +192,14 @@ impl Session {
         self.last_tables = agora;
 
         report.line("sem pg_stat_statements: sem o texto das queries, o rastro delas por tabela");
+        let conselho = instalar_statements(&self.settings);
         if primeira {
             report.line(
                 "primeira leitura: o que acontecer daqui em diante aparece aqui a cada Ctrl+R",
             );
             report.aviso(
-                "pg_stat_statements não está instalado nesta base",
-                "CREATE EXTENSION pg_stat_statements, com a biblioteca em shared_preload_libraries: é o que traz a query em si, com o tempo de cada uma",
+                "pg_stat_statements não está instalado nesta base — é ele que traz a query em si, com o tempo de cada uma",
+                conselho,
             );
             return Ok(());
         }
@@ -243,8 +244,8 @@ impl Session {
             );
         }
         report.aviso(
-            "pg_stat_statements não está instalado nesta base",
-            "CREATE EXTENSION pg_stat_statements, com a biblioteca em shared_preload_libraries: é o que traz a query em si, com o tempo de cada uma",
+            "pg_stat_statements não está instalado nesta base — é ele que traz a query em si, com o tempo de cada uma",
+            conselho,
         );
         Ok(())
     }
@@ -771,7 +772,7 @@ fn settings_card(report: &mut Report, map: &HashMap<String, Setting>, depth: Dep
     {
         report.aviso(
             "pg_stat_statements não está em shared_preload_libraries: sem ele não há como saber quais queries custam o quê",
-            "adicione pg_stat_statements a shared_preload_libraries (exige reinício) e depois CREATE EXTENSION pg_stat_statements",
+            instalar_statements(map),
         );
     }
     if let Some(max) = get("max_connections")
@@ -1271,6 +1272,26 @@ struct Stmt {
     query: String,
 }
 
+/// O que falta para haver `pg_stat_statements`, e o que fazer a respeito.
+///
+/// São dois passos e eles falham de jeitos bem diferentes: a biblioteca entra no processo
+/// do servidor (`shared_preload_libraries`, e isso exige reinício), e a extensão é criada
+/// em cada base (`CREATE EXTENSION`, e isso não exige nada). Quase sempre só falta o
+/// segundo — e mandar alguém agendar uma janela de manutenção para uma coisa que levava um
+/// segundo é o tipo de conselho que faz ninguém seguir conselho nenhum.
+///
+/// Por isso a frase sai daqui, olhando o `shared_preload_libraries` que já foi lido, e não
+/// de uma constante que diz as duas coisas sempre.
+fn instalar_statements(settings: &HashMap<String, Setting>) -> String {
+    let carregada = settings
+        .get("shared_preload_libraries")
+        .is_some_and(|setting| setting.value.contains("pg_stat_statements"));
+    if carregada {
+        return "a biblioteca já está carregada neste servidor: falta só `CREATE EXTENSION pg_stat_statements;` nesta base — um comando, sem reinício e sem janela de manutenção".to_string();
+    }
+    "dois passos: `shared_preload_libraries = 'pg_stat_statements'` no servidor (no RDS/Aurora é o parameter group, no Cloud SQL é uma flag, no Azure é um server parameter — nos três exige reinício), e depois `CREATE EXTENSION pg_stat_statements;` em cada base que você quiser enxergar".to_string()
+}
+
 /// Whether the timing columns are the 13+ names. The rename split `total_time` into
 /// planning and execution, and a query written for one spelling is a syntax error
 /// against the other.
@@ -1291,7 +1312,10 @@ fn statements(
 ) -> Result<Vec<Stmt>, String> {
     report.section("Queries");
     if !present {
-        report.line("sem pg_stat_statements nesta base — ver o cartão Movimento");
+        report.aviso(
+            "sem pg_stat_statements não há registro de quanto cada query custou",
+            instalar_statements(settings),
+        );
         return Ok(Vec::new());
     }
 
