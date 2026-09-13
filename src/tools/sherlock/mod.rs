@@ -1,11 +1,16 @@
-//! Sherlock Database: lendo um banco de produção até ele confessar.
+//! Sherlock: lendo um sistema de produção até ele confessar.
 //!
-//! Tudo aqui é pergunta, nunca ordem. Nenhum `CREATE`, nenhum `ANALYZE`, nenhum
-//! `pg_stat_statements_reset`, nenhum profiler ligado pelas costas de ninguém — uma
-//! ferramenta apontada para produção ganha o lugar dela sendo impossível de culpar, e o
-//! único jeito de ser impossível de culpar é nunca ter tido como mudar nada. O lado
-//! Postgres diz isso ao próprio servidor (`pg::Conn::harden`) e pede confirmação; o lado
-//! MongoDB só manda comandos de uma lista fixa de leitores.
+//! Três engines hoje — Postgres, MongoDB e uma máquina inteira por SSH — e a mesma
+//! promessa nas três: **só leitura**. Nenhum `CREATE`, nenhum `ALTER`, nenhum profiler
+//! ligado pelas costas de ninguém, nenhum arquivo tocado, nenhum serviço reiniciado,
+//! nenhum pacote instalado. Uma ferramenta apontada para produção ganha o lugar dela
+//! sendo impossível de culpar, e o único jeito de ser impossível de culpar é nunca ter
+//! tido como mudar nada.
+//!
+//! Cada engine prova isso do jeito dela: o lado Postgres diz ao próprio servidor que a
+//! sessão é somente leitura (`pg::Conn::harden`) e pede confirmação; o lado MongoDB só
+//! manda comandos de uma lista fixa de leitores; o lado SSH roda um script que é lido
+//! inteiro em `ssh::SCRIPT` e não contém um único comando que escreva.
 //!
 //! O custo é a outra metade da promessa. Ler catálogo é barato; medir o tamanho de cada
 //! tabela e estimar o inchaço não é, e num servidor ocupado a diferença importa mais que
@@ -15,12 +20,12 @@
 //! A tela não é um log: é um quadro de cartões — ver `tools::Board`. Ele é preenchido por
 //! uma investigação inteira quando a tela abre, e depois **só** quando alguém pede outra
 //! com Ctrl+R. Não há laço de atualização: um painel que se reinvestigasse sozinho a cada
-//! poucos segundos seria, num banco de produção, exatamente o tipo de carga que ele
+//! poucos segundos seria, num sistema de produção, exatamente o tipo de carga que ele
 //! existe para encontrar. O que está na tela é o retrato da última leitura, e o cabeçalho
 //! diz de quando ela é.
 //!
 //! Fechou a tela, nada mais é perguntado e a conexão é fechada: uma ferramenta que
-//! continuasse falando com seis bancos de produção porque as execuções ficaram salvas
+//! continuasse falando com seis sistemas de produção porque as execuções ficaram salvas
 //! seria pior do que ferramenta nenhuma.
 
 use std::collections::{HashMap, HashSet};
@@ -41,10 +46,23 @@ mod mongo;
 mod mongo_checks;
 mod pg;
 mod pg_checks;
+mod ssh;
+mod ssh_checks;
+
+/// A variável que carrega a senha do SSH até o `ssh`, e o sinal de que este processo foi
+/// chamado para digitá-la. Ver o começo do `main`.
+pub use ssh::SENHA_ENV;
 pub(crate) mod scram;
 mod url;
 
-const ENGINES: &[&str] = &["PostgreSQL", "MongoDB"];
+/// As engines, pelo nome que aparece na tela. Nunca mude um destes textos sem migrar o
+/// que está gravado: é o valor do parâmetro, e uma execução salva volta procurando
+/// exatamente esta palavra.
+const ENGINES: &[&str] = &[
+    "PostgreSQL — diagnóstico do banco",
+    "MongoDB — diagnóstico do banco",
+    "Linux por SSH — diagnóstico da máquina",
+];
 const DEPTHS: &[&str] = &["raso", "médio", "profundo"];
 
 /// How long a single question may take before the server is told to abandon it. Also the
@@ -64,6 +82,25 @@ const IDLE_SLICE: Duration = Duration::from_millis(120);
 pub enum Engine {
     Postgres,
     Mongo,
+    /// Uma máquina inteira, alcançada pelo `ssh` que já está instalado aqui.
+    Ssh,
+}
+
+impl Engine {
+    /// Do texto guardado no parâmetro. Compara pelo começo porque o rótulo carrega a
+    /// explicação junto, e a explicação é a parte que pode melhorar depois.
+    fn from(texto: &str) -> Self {
+        match texto {
+            t if t.starts_with("MongoDB") => Engine::Mongo,
+            t if t.starts_with("Linux") || t.starts_with("SSH") => Engine::Ssh,
+            _ => Engine::Postgres,
+        }
+    }
+
+    /// Os valores de `ENGINES` que são banco de dados — o que decide quais campos o
+    /// formulário mostra.
+    const BANCOS: &'static [&'static str] = &[ENGINES[0], ENGINES[1]];
+    const MAQUINA: &'static [&'static str] = &[ENGINES[2]];
 }
 
 /// How hard to look, and therefore how much of the server's time to spend.
@@ -72,14 +109,14 @@ pub enum Engine {
 /// each level is the one below it plus more.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Depth {
-    /// Catalogue and counters only. Indexes, settings, connections, locks — everything
-    /// the server already knows without touching a table.
+    /// Só o que o sistema já sabe de cor: catálogo, contadores, o que está rodando
+    /// agora. Nada que precise medir.
     Raso,
-    /// Plus the statistics that need the extensions and views a busy server keeps: slow
-    /// queries, vacuum debt, replication, temp files.
+    /// Mais o que exige estatística acumulada: queries lentas, dívida de vacuum,
+    /// replicação, processos, pressão, registros de erro.
     Medio,
-    /// Plus the measurements that cost: every relation's size, sequence exhaustion,
-    /// foreign keys with no index behind them.
+    /// Mais o que custa: tamanho de cada relação, estimativa de inchaço, chaves sem
+    /// índice, inventário de pacotes, configuração de serviço.
     Profundo,
 }
 
@@ -134,38 +171,75 @@ impl Tool for SherlockTool {
     }
 
     fn name(&self) -> &'static str {
-        "Sherlock Database"
+        "Sherlock"
     }
 
     fn description(&self) -> &'static str {
-        "Investiga um Postgres ou MongoDB inteiro sem escrever nada: queries lentas, índices que faltam e que sobram, vacuum, bloqueios, volumes e ajustes — num painel que se atualiza sozinho enquanto estiver aberto"
+        "Diagnóstico completo, e só de leitura: um Postgres, um MongoDB ou uma máquina Linux inteira por SSH — o que está lento, o que está faltando, o que está prestes a acabar e o que está aberto para o mundo"
     }
 
     fn params(&self) -> Vec<ParamSpec> {
         vec![
             ParamSpec::choice(
                 "motor",
-                "Banco de dados",
+                "Engine",
                 ENGINES,
-                "Qual servidor está do outro lado. Decide o protocolo e o repertório de perguntas",
+                "O que está do outro lado. Decide o protocolo, o repertório de perguntas e os campos abaixo",
             ),
             ParamSpec::text(
                 "url",
                 "String de conexão",
                 "",
                 "postgres://usuario:senha@host:5432/base ou mongodb://usuario:senha@host:27017/base. Fica gravada junto com a execução, senha inclusive",
-            ),
+            )
+            .only_when("motor", Engine::BANCOS),
             ParamSpec::text(
                 "base",
                 "Base (opcional)",
                 "",
                 "Vazio usa a base que vier na URL. Preencha para investigar outra base do mesmo servidor sem reescrever a string",
-            ),
+            )
+            .only_when("motor", Engine::BANCOS),
+            ParamSpec::text(
+                "host",
+                "Máquina",
+                "",
+                "IP, nome, ou um apelido do ~/.ssh/config — e aí vale tudo que estiver escrito lá, ProxyJump inclusive. «usuario@host» também é aceito aqui",
+            )
+            .only_when("motor", Engine::MAQUINA),
+            ParamSpec::text(
+                "usuario",
+                "Usuário SSH",
+                "",
+                "Vazio deixa o ssh decidir: o que o ~/.ssh/config disser para essa máquina, ou o seu login. Um usuário comum já responde quase tudo — o que ele não alcança aparece dito como não alcançado",
+            )
+            .only_when("motor", Engine::MAQUINA),
+            ParamSpec::text(
+                "porta_ssh",
+                "Porta do SSH",
+                "",
+                "Vazio deixa o ssh decidir: 22, ou o que estiver no ~/.ssh/config",
+            )
+            .only_when("motor", Engine::MAQUINA),
+            ParamSpec::text(
+                "chave",
+                "Chave privada",
+                "",
+                "Arquivo da chave (-i). Vazio usa o agente e as chaves que já estão nesta máquina, que é o caminho normal. Chave com passphrase só funciona pelo agente: o ssh daqui nunca pergunta nada",
+            )
+            .only_when("motor", Engine::MAQUINA),
+            ParamSpec::text(
+                "senha",
+                "Senha SSH (opcional)",
+                "",
+                "Só se a máquina não aceita chave. Fica gravada junto com a execução, e chega ao ssh por uma variável de ambiente só dele — nunca pela linha de comando, que qualquer ps da máquina leria. Vazio usa chave e agente",
+            )
+            .only_when("motor", Engine::MAQUINA),
             ParamSpec::choice(
                 "nivel",
                 "Profundidade",
                 DEPTHS,
-                "Quanto do servidor investigar. 'raso' lê catálogo e contadores (índices, ajustes, conexões); 'médio' soma queries lentas, vacuum e replicação; 'profundo' mede tamanho de cada tabela, chaves sem índice e sequências — mais achados, mais leitura no servidor",
+                "Quanto investigar. 'raso' lê o que o sistema já sabe de cor; 'médio' soma o que exige estatística acumulada — queries lentas, vacuum, processos, erros registrados; 'profundo' mede tamanho de cada tabela, inchaço, inventário de pacotes e configuração de serviço. Mais achados, mais leitura do outro lado",
             ),
         ]
     }
@@ -284,27 +358,46 @@ impl Tool for SherlockTool {
 /// Everything the form amounts to, already validated.
 pub struct Plan {
     engine: Engine,
+    /// A string de conexão, ou — para a engine de máquina — o host.
     url: String,
     database: String,
     depth: Depth,
+    /// Os três que só a engine de máquina usa. Vazios querem dizer «o que o ssh decidir»,
+    /// que quase sempre é o que o ~/.ssh/config já diz.
+    usuario: String,
+    porta: String,
+    chave: String,
+    /// Vazia quer dizer «use o agente e as chaves que já estão nesta máquina», que é o
+    /// caminho normal e o melhor. Preenchida, a senha vai até o `ssh` por uma variável de
+    /// ambiente só dele — ver `ssh::Target::run`.
+    senha: String,
 }
 
 impl Plan {
     fn from(params: &HashMap<&'static str, String>) -> Result<Self, String> {
         let get = |key| params.get(key).map(String::as_str).unwrap_or("").trim();
-        let engine = match get("motor") {
-            "MongoDB" => Engine::Mongo,
-            _ => Engine::Postgres,
+        let engine = Engine::from(get("motor"));
+        let url = match engine {
+            // A máquina não tem string de conexão: o que a identifica é o host, e o resto
+            // do que o `ssh` precisa saber está em campos próprios.
+            Engine::Ssh => get("host").to_string(),
+            _ => get("url").to_string(),
         };
-        let url = get("url").to_string();
         if url.is_empty() {
-            return Err("informe a string de conexão".to_string());
+            return Err(match engine {
+                Engine::Ssh => "informe a máquina".to_string(),
+                _ => "informe a string de conexão".to_string(),
+            });
         }
         let plan = Self {
             engine,
             url,
             database: get("base").to_string(),
             depth: Depth::from(get("nivel")),
+            usuario: get("usuario").to_string(),
+            porta: get("porta_ssh").to_string(),
+            chave: get("chave").to_string(),
+            senha: get("senha").to_string(),
         };
         // Parsed here, while the user is still looking at the form: a URL that can't be
         // read is the one failure that must never wait until someone opens the module.
@@ -316,6 +409,7 @@ impl Plan {
         match self.engine {
             Engine::Postgres => pg::Target::parse(&self.url, &self.database).map(|_| ()),
             Engine::Mongo => mongo::Target::parse(&self.url, &self.database).map(|_| ()),
+            Engine::Ssh => ssh::Target::parse(self).map(|_| ()),
         }
     }
 
@@ -327,6 +421,9 @@ impl Plan {
                 .unwrap_or_default(),
             Engine::Mongo => mongo::Target::parse(&self.url, &self.database)
                 .map(|target| format!("mongo {}", target.summary()))
+                .unwrap_or_default(),
+            Engine::Ssh => ssh::Target::parse(self)
+                .map(|target| format!("ssh {}", target.summary()))
                 .unwrap_or_default(),
         }
     }
@@ -410,6 +507,7 @@ fn investigate(plan: &Plan, rec: &Recorder, board: &Arc<Mutex<Board>>, stop: &At
 enum Session {
     Postgres(Box<pg_checks::Session>),
     Mongo(Box<mongo_checks::Session>),
+    Maquina(Box<ssh_checks::Session>),
 }
 
 impl Session {
@@ -417,6 +515,7 @@ impl Session {
         Ok(match plan.engine {
             Engine::Postgres => Session::Postgres(Box::new(pg_checks::Session::open(plan)?)),
             Engine::Mongo => Session::Mongo(Box::new(mongo_checks::Session::open(plan)?)),
+            Engine::Ssh => Session::Maquina(Box::new(ssh_checks::Session::open(plan)?)),
         })
     }
 
@@ -424,6 +523,7 @@ impl Session {
         match self {
             Session::Postgres(session) => session.pass(report),
             Session::Mongo(session) => session.pass(report),
+            Session::Maquina(session) => session.pass(report),
         }
     }
 }
@@ -920,26 +1020,26 @@ impl<'a> Report<'a> {
                 ),
                 (String::new(), Tone::Normal),
                 (
-                    "  Isto é um retrato, não um monitor: nada é perguntado ao banco entre uma"
+                    "  Isto é um retrato, não um monitor: nada é perguntado ao outro lado entre"
                         .to_string(),
                     Tone::Normal,
                 ),
                 (
-                    "  investigação e a próxima. Ctrl+R faz outra.".to_string(),
+                    "  uma investigação e a próxima. Ctrl+R faz outra.".to_string(),
                     Tone::Normal,
                 ),
                 (String::new(), Tone::Normal),
                 (
-                    "  Nada aqui altera o banco: nenhum índice é criado, nenhum profiler é"
+                    "  Nada aqui altera nada: nenhum índice é criado, nenhum profiler é ligado,"
                         .to_string(),
                     Tone::Dim,
                 ),
                 (
-                    "  ligado, nenhum contador é zerado. As sugestões são texto para você levar"
+                    "  nenhum serviço é tocado. As sugestões são texto para você levar para uma"
                         .to_string(),
                     Tone::Dim,
                 ),
-                ("  para uma janela de manutenção.".to_string(), Tone::Dim),
+                ("  janela de manutenção.".to_string(), Tone::Dim),
             ],
             scroll: 0,
         });

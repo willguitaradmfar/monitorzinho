@@ -1579,7 +1579,7 @@ fn osc52(texto: &str) -> bool {
     /// O maior payload que os terminais costumam aceitar, já em base64.
     const LIMITE: usize = 74_000;
 
-    let codificado = crate::tools::db::scram::b64_encode(texto.as_bytes());
+    let codificado = crate::tools::sherlock::scram::b64_encode(texto.as_bytes());
     if codificado.len() > LIMITE {
         return false;
     }
@@ -5029,7 +5029,7 @@ impl App {
                     .map(|quando| format::human_duration(quando.elapsed().as_secs()))
                     .unwrap_or_else(|| "—".to_string())
             ),
-            "Somente leitura: nada foi criado, alterado nem removido neste banco.".to_string(),
+            "Somente leitura: nada foi criado, alterado nem removido neste sistema.".to_string(),
         ];
         for card in &tools::lock_board(&quadro).cards {
             linhas.push(String::new());

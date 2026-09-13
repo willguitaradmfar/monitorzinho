@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub mod cert;
-pub mod db;
 pub mod dns;
 pub mod egress;
 pub mod http;
@@ -26,6 +25,7 @@ pub mod replay;
 pub mod rewrite;
 pub mod rota;
 pub mod scan;
+pub mod sherlock;
 pub mod smtp;
 pub mod sshfwd;
 pub mod stun;
@@ -464,7 +464,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(stun::StunTool),
         Box::new(egress::EgressTool),
         Box::new(wol::WolTool),
-        Box::new(db::SherlockTool),
+        Box::new(sherlock::SherlockTool),
     ]
 }
 

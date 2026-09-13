@@ -131,6 +131,20 @@ fn handle_flags() -> Option<perfil::Pedido> {
 }
 
 fn main() -> io::Result<()> {
+    // Antes de tudo: este mesmo binário é quem digita a senha de SSH para o Sherlock.
+    //
+    // O `ssh` chama o programa apontado por `SSH_ASKPASS` quando precisa de uma senha e
+    // espera a resposta na saída padrão. Apontar para nós mesmos evita duas coisas ruins:
+    // depender do `sshpass`, que nem sempre está instalado, e passar a senha na linha de
+    // comando, onde qualquer `ps` da máquina a leria. Aqui ela viaja numa variável de
+    // ambiente do processo filho e sai por um `println`.
+    //
+    // A variável é o sinal, e não um argumento, porque quem escolhe os argumentos é o
+    // `ssh` — ele passa o texto do prompt, que não podemos prever.
+    if let Ok(senha) = std::env::var(tools::sherlock::SENHA_ENV) {
+        println!("{senha}");
+        return Ok(());
+    }
     let Some(pedido) = handle_flags() else {
         return Ok(());
     };

@@ -867,12 +867,14 @@ accepts, but what can leave from here. A refused connection counts as success �
 the refusal had to get out — while a blocked port simply goes quiet, which is why
 it waits three seconds and not three hundred milliseconds.
 
-#### Sherlock Database
+#### Sherlock
 
-A whole Postgres or MongoDB read end to end, and nothing written to either.
+A whole Postgres, a whole MongoDB, or a whole Linux machine read end to end, and
+nothing written to any of them.
 
-The form asks four things: which engine, the connection string, optionally a
-database to point at instead of the one in the string, and how deep to look.
+The first field is the engine, and it decides the ones under it: a connection
+string for the two databases, or a host, user, port, key and optional password for
+a machine over SSH. The last field is always the same question — how deep to look.
 Depth is the honest part of the bargain — `raso` reads catalogues and counters
 (indexes, settings, connections, locks), `médio` adds the statistics that need
 the views a busy server keeps (slow queries, vacuum debt, replication), and
@@ -909,7 +911,10 @@ the literals before drawing them. A screen like this is read over somebody's
 shoulder and pasted into tickets; what answers "why is this slow" is the shape,
 and a customer's data is never part of the answer.
 
-**It cannot write, and it says so out loud.** On Postgres the session declares
+**It cannot write, and it says so out loud.** On a machine, the script is the
+proof: it is one constant in one file and every line of it is `cat`, `ps`, `df`,
+`ss`, `getent`, `grep`, a `list`, a `status`, or a package manager in simulation
+mode. On Postgres the session declares
 itself read-only to the server before the first question — `SET SESSION
 CHARACTERISTICS AS TRANSACTION READ ONLY`, plus a statement timeout and a lock
 timeout — and then asks the server to confirm it, which is the line the Servidor
@@ -941,6 +946,28 @@ age against wraparound, replication slots and lag, checkpoints, WAL generation
 and who is writing the dirty pages, relation sizes with a bloat estimate, foreign
 keys with no index behind them, sequences about to overflow the column they feed,
 tables with no primary key, and who can log in with what powers.
+
+On a machine over SSH: what it is and how long it has been up, where the CPU time
+went since the last look — including the share stolen by the hypervisor, which is
+the one number that cannot be fixed from inside — load against cores, memory with
+the number that matters (available, not used) and swap pressure, every filesystem
+with its space *and* its inodes, a filesystem the kernel remounted read-only,
+kernel pressure stalls for CPU/memory/IO, every listening port and which of them
+answer the whole world, connections piling up in CLOSE-WAIT or SYN-SENT, the
+heaviest processes and the ones stuck in uninterruptible sleep, failed systemd
+units, the OOM killer's victims, errors in the journal, who is logged in and who
+*can* log in — including a second account with uid 0, which is a backdoor wearing
+a username — pending updates and a kernel that has been replaced but not booted,
+the sshd settings that matter, whether there is a firewall at all, and an
+inventory of packages, containers, kernel knobs and scheduled jobs.
+
+It reaches the machine through the `ssh` that is already installed here, so
+`~/.ssh/config`, the agent, `known_hosts` and `ProxyJump` all work exactly as they
+do in a terminal. Where the machine only takes a password, monitorzinho becomes
+its own `SSH_ASKPASS` helper: no `sshpass` to install, and the password never
+appears in a command line where any `ps` on the machine would read it. The whole
+diagnosis is one connection and one script — readable end to end in `ssh.rs` —
+and there is not a single command in it that writes.
 
 On the MongoDB side: version, engine and feature state, connections and churn,
 WiredTiger cache fill and dirty ratio and who is doing the eviction, tickets,
