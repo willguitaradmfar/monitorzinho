@@ -359,6 +359,14 @@ fn run(
                         app.board_escape();
                     }
                     KeyCode::Tab if matches!(app.focus, Focus::Board(_)) => app.board_log(),
+                    // Ctrl+T de texto: a investigação inteira em texto corrido, para
+                    // selecionar com o mouse e colar onde ela vai ser resolvida.
+                    KeyCode::Char('t')
+                        if matches!(app.focus, Focus::Board(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.board_report();
+                    }
                     KeyCode::Char('r')
                         if matches!(app.focus, Focus::Board(_))
                             && key.modifiers.contains(KeyModifiers::CONTROL) =>

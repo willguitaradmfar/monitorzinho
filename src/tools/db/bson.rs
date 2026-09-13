@@ -298,9 +298,22 @@ impl Doc {
             .iter()
             .filter(|(chave, _)| !RUIDO.contains(&chave.as_str()))
             .take(6)
-            .map(|(chave, valor)| match NOMES.contains(&chave.as_str()) {
-                true => format!("{chave}: {}", valor.render()),
-                false => format!("{chave}: {}", valor.forma()),
+            .map(|(chave, valor)| match (chave.as_str(), valor) {
+                // Um pipeline vira os nomes dos estágios: é o que diz o que a agregação
+                // faz, e é a parte dela que não é dado de ninguém.
+                ("pipeline", Value::List(estagios)) => format!(
+                    "pipeline: [{}]",
+                    estagios
+                        .iter()
+                        .filter_map(|estagio| estagio.as_doc()?.0.first())
+                        .map(|(nome, _)| nome.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => match NOMES.contains(&chave.as_str()) {
+                    true => format!("{chave}: {}", valor.render()),
+                    false => format!("{chave}: {}", valor.forma()),
+                },
             })
             .collect();
         format!("{{{}}}", dentro.join(", "))

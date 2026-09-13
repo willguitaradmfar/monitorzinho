@@ -922,6 +922,37 @@ the profiler on is a persistent change to a production database and this tool
 will not make it; where it is off, the card says what it is missing and moves on
 to the next-best source.
 
+`Ctrl+T` turns the whole board into one plain-text report — every section, every
+table, every suggestion, no borders and no colour — and `c` there takes it out of
+the terminal: the clipboard of *your* terminal through OSC 52, which is the only
+route that works when monitorzinho runs on one machine and you are sitting at
+another, plus a file under `relatorios/` that always works and that a `cat` or an
+`scp` can reach. Selecting with the mouse would do if the report fit on a screen;
+twenty-three sections don't.
+
+What it looks for, on the Postgres side: the settings that lose data or blind the
+server, connections and what each of them is doing, lock chains with the blocker
+named, cache hit globally and per table, the queries that cost the most and the
+ones that spill to disk, sequential scans with the column that would have stopped
+them, unused and redundant indexes with their sizes, vacuum debt and statistics
+that are older than the table, **who is holding the vacuum horizon** — a long
+transaction, a stale replication slot, a forgotten prepared transaction — freeze
+age against wraparound, replication slots and lag, checkpoints, WAL generation
+and who is writing the dirty pages, relation sizes with a bloat estimate, foreign
+keys with no index behind them, sequences about to overflow the column they feed,
+tables with no primary key, and who can log in with what powers.
+
+On the MongoDB side: version, engine and feature state, connections and churn,
+WiredTiger cache fill and dirty ratio and who is doing the eviction, tickets,
+checkpoint and journal-sync times, average latency per operation class, documents
+examined per document returned, in-memory sorts, collection scans, write
+conflicts, cursors left open without a timeout, TTL deletions, transaction abort
+rate, network bytes per request, every index with how many times it was used,
+collections with nothing but `_id`, slow operations from the profiler or from the
+server's own log with the plan they used, replication lag and the oplog window,
+storage and the space freed but not returned, and — on a router — shards and the
+balancer.
+
 Every suggestion is text. `CREATE INDEX CONCURRENTLY …`, `createIndex({…})` — put
 there to be read, copied and thought about, never run. The MongoDB suggestions
 follow the equality-sort-range rule, which is the part a hand-written index gets
@@ -997,6 +1028,8 @@ at it properly.
 | `Enter` | Ferramentas | open that execution's live log — and run it, for an on-demand tool |
 | the card's key | a tool's board | open that card's full findings |
 | `Tab`, `Ctrl+R` | a tool's board | its log instead of its board, investigate again |
+| `Ctrl+T` | a tool's board | the whole investigation as one plain-text report |
+| `c` | a text report | copy all of it — your terminal's clipboard (works over SSH) and a file |
 | `Ctrl+A` | an execution's log | show only the lines the tool marked as findings |
 | `Tab`, `Ctrl+F` | an execution's log | hex view, matches-only filter |
 | `Ctrl+L`, `End` | an execution's log | clear the scrollback, jump back to the live edge |

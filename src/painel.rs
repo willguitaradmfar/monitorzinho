@@ -274,3 +274,128 @@ impl Layout {
         }
     }
 }
+
+impl Pane {
+    /// O painel como texto puro, para quem quer **copiar** em vez de olhar.
+    ///
+    /// Sem moldura, sem cor e sem corte: uma tabela vira colunas alinhadas com espaço, um
+    /// texto vira as linhas dele. É o mesmo conteúdo da tela, no formato que sobrevive a
+    /// ser colado num chamado — que é onde um achado de banco de dados costuma terminar.
+    pub fn como_texto(&self) -> Vec<String> {
+        match self {
+            Pane::Table {
+                title,
+                headers,
+                rows,
+                note,
+                ..
+            } => {
+                let mut linhas = vec![title.clone()];
+                // As larguras saem do conteúdo, não de um palpite: a coluna de query é a
+                // única larga, e dar a todas a largura dela seria uma tabela de espaços.
+                let colunas = headers
+                    .len()
+                    .max(rows.iter().map(|r| r.cells.len()).max().unwrap_or(0));
+                let mut larguras = vec![0usize; colunas];
+                for (i, header) in headers.iter().enumerate() {
+                    larguras[i] = header.chars().count();
+                }
+                for row in rows {
+                    for (i, cell) in row.cells.iter().enumerate() {
+                        larguras[i] = larguras[i].max(cell.chars().count());
+                    }
+                }
+                let alinhar = |celulas: &[String]| -> String {
+                    let mut linha = String::new();
+                    for (i, celula) in celulas.iter().enumerate() {
+                        // A última coluna não é preenchida: espaço no fim da linha é
+                        // sujeira que aparece na hora de colar.
+                        if i + 1 == celulas.len() {
+                            linha.push_str(celula);
+                        } else {
+                            linha.push_str(&format!("{celula:<largura$}  ", largura = larguras[i]));
+                        }
+                    }
+                    linha.trim_end().to_string()
+                };
+                if !headers.is_empty() {
+                    linhas.push(alinhar(headers));
+                    linhas.push("-".repeat(larguras.iter().sum::<usize>() + 2 * colunas));
+                }
+                for row in rows {
+                    linhas.push(alinhar(&row.cells));
+                }
+                if let Some((nota, _)) = note {
+                    linhas.push(nota.clone());
+                }
+                linhas
+            }
+            Pane::Facts { title, rows } => {
+                let largura = rows
+                    .iter()
+                    .map(|(rotulo, _, _)| rotulo.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                let mut linhas = vec![title.clone()];
+                for (rotulo, valor, _) in rows {
+                    linhas.push(
+                        format!("{rotulo:<largura$}  {valor}")
+                            .trim_end()
+                            .to_string(),
+                    );
+                }
+                linhas
+            }
+            Pane::Text { title, lines, .. } => {
+                let mut linhas = vec![title.clone()];
+                linhas.extend(lines.iter().map(|(texto, _)| texto.trim_end().to_string()));
+                linhas
+            }
+            Pane::Bars { title, rows, .. } => {
+                let mut linhas = vec![title.clone()];
+                linhas.extend(
+                    rows.iter()
+                        .map(|bar| format!("{}  {}", bar.label, bar.text)),
+                );
+                linhas
+            }
+            Pane::Grid { title, cells, .. } => {
+                let mut linhas = vec![title.clone()];
+                linhas.extend(
+                    cells
+                        .iter()
+                        .map(|cell| format!("{}  {}  {}", cell.label, cell.sub, cell.detalhe)),
+                );
+                linhas
+            }
+            Pane::Chart { title, note, .. } => {
+                let mut linhas = vec![title.clone()];
+                linhas.extend(note.clone());
+                linhas
+            }
+            Pane::Empty { title, note } => vec![title.clone(), note.clone()],
+            Pane::Form { title, fields, .. } => {
+                let mut linhas = vec![title.clone()];
+                linhas.extend(
+                    fields
+                        .iter()
+                        .map(|field| format!("{}: {}", field.label, field.value)),
+                );
+                linhas
+            }
+        }
+    }
+}
+
+impl Layout {
+    /// O arranjo inteiro como texto, na ordem em que é desenhado.
+    pub fn como_texto(&self) -> Vec<String> {
+        match self {
+            Layout::Leaf(pane) => pane.como_texto(),
+            Layout::Rows(partes) | Layout::Cols(partes) => partes
+                .iter()
+                .flat_map(|(_, filho)| filho.como_texto())
+                .collect(),
+        }
+    }
+}

@@ -14,10 +14,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::bson::{Doc, Value};
-use super::{Depth, Plan, Report, bytes, count, duration, millis, mongo, one_line};
+use super::{Depth, Plan, Report, bytes, count, duration, millis, mongo, one_line, plural};
 use crate::painel::Tone;
-
-const TOP: usize = 12;
 
 /// One live inspection of one MongoDB cluster.
 ///
@@ -43,6 +41,9 @@ pub struct Session {
     recentes: Vec<Lenta>,
     /// `serverStatus` as of the previous pass.
     last_status: Doc,
+    /// A máquina por baixo: núcleos e RAM, para comparar com o cache e as conexões. Lido
+    /// uma vez — não é coisa que mude entre uma investigação e a próxima.
+    host: Doc,
     /// O `top` da passada anterior: tempo e contagem por coleção.
     last_top: HashMap<String, (f64, f64)>,
     last_pass: std::time::Instant,
@@ -69,6 +70,7 @@ impl Session {
             running: HashSet::new(),
             recentes: Vec::new(),
             last_status: Doc::new(),
+            host: Doc::new(),
             last_top: HashMap::new(),
             last_pass: std::time::Instant::now(),
             passadas: 0,
@@ -104,12 +106,20 @@ impl Session {
         )?
         .unwrap_or_default();
 
+        if self.host.0.is_empty() {
+            self.host = self
+                .conn
+                .run("admin", Doc::new().with("hostInfo", 1))
+                .unwrap_or_default();
+        }
         self.server(report, &status)?;
         self.now(report)?;
         self.movement(report, &status, window)?;
         connections(report, &status);
         cache(report, &status);
+        engine(report, &status);
         operations(report, &status);
+        health(report, &status, &self.host);
         self.last_status = status;
         if report.stopping() {
             return Ok(());
@@ -119,7 +129,8 @@ impl Session {
         self.collections = collections(&mut self.conn, report, &target, self.depth)?;
         if self.depth >= Depth::Medio {
             let collections = std::mem::take(&mut self.collections);
-            indexes(&mut self.conn, report, &target, &collections, self.depth)?;
+            indexes(&mut self.conn, report, &target, &collections)?;
+            index_shape(report, &collections);
             self.collections = collections;
             slow(&mut self.conn, report, &target)?;
             replication(&mut self.conn, report)?;
@@ -129,6 +140,11 @@ impl Session {
             storage(&mut self.conn, report, &target, &collections)?;
             self.collections = collections;
             oplog(&mut self.conn, report)?;
+            // `listShards` só existe no roteador. Perguntar a um mongod avulso devolve um
+            // erro que não é notícia nenhuma.
+            if self.conn.hello.text("msg") == "isdbgrid" {
+                sharding(&mut self.conn, report)?;
+            }
             configuration(&mut self.conn, report, &target)?;
         }
         Ok(())
@@ -258,10 +274,13 @@ impl Session {
         report.section("Queries recentes");
         let novas = self.slow_since();
         for lenta in novas {
+            // Pela forma da operação, e não pelo texto inteiro: a mesma query com «40 000
+            // examinados → 101» e com «40 000 → 36» é a mesma query, e listar as duas é
+            // gastar a tela repetindo o que já foi dito.
             match self
                 .recentes
                 .iter_mut()
-                .find(|antiga| antiga.ns == lenta.ns && antiga.resumo == lenta.resumo)
+                .find(|antiga| antiga.ns == lenta.ns && antiga.forma == lenta.forma)
             {
                 Some(antiga) => *antiga = lenta,
                 None => self.recentes.push(lenta),
@@ -550,6 +569,11 @@ struct Lenta {
     millis: f64,
     ns: String,
     plano: String,
+    /// O comando sem as contagens: é o que identifica duas execuções como a mesma query.
+    forma: String,
+    /// Quantos documentos foram abertos para responder — a conta que separa «devolveu
+    /// pouco porque há pouco» de «leu tudo para devolver pouco».
+    examinados: String,
     resumo: String,
     fix: String,
 }
@@ -617,7 +641,18 @@ fn forma_json(command: Option<&serde_json::Value>) -> String {
             serde_json::Value::Number(n) => n.to_string(),
             serde_json::Value::Bool(b) => b.to_string(),
             serde_json::Value::Null => "null".to_string(),
-            serde_json::Value::Array(itens) => format!("[…{}]", itens.len()),
+            serde_json::Value::Array(itens) => {
+                // Um pipeline vira os nomes dos estágios: é o que diz o que a agregação
+                // faz, e é a parte dela que não é dado de ninguém.
+                let estagios: Vec<String> = itens
+                    .iter()
+                    .filter_map(|estagio| estagio.as_object()?.keys().next().cloned())
+                    .collect();
+                match estagios.len() == itens.len() && !estagios.is_empty() {
+                    true => format!("[{}]", estagios.join(", ")),
+                    false => format!("[…{}]", itens.len()),
+                }
+            }
             serde_json::Value::Object(campos) => {
                 // `{"$date": "…"}` e companhia são como o log escreve um tipo do BSON:
                 // dizer «data» é mais legível do que mostrar o embrulho.
@@ -1178,31 +1213,40 @@ fn collections(
     Ok(out)
 }
 
+/// Todo índice desta base numa tabela só: o que ele indexa, quantas vezes foi usado, e o
+/// que isso quer dizer.
+///
+/// Uma linha por índice, e não uma lista de nunca usados ao lado de outra lista de
+/// declarados: é a mesma pergunta («este índice vale o que custa?») e ela se responde
+/// olhando as duas colunas juntas.
 fn indexes(
     conn: &mut mongo::Conn,
     report: &mut Report,
     target: &mongo::Target,
     collections: &[Collection],
-    depth: Depth,
 ) -> Result<(), String> {
     report.section("Índices");
-    let mut unused: Vec<(String, String, f64)> = Vec::new();
-    let mut bare: Vec<&Collection> = Vec::new();
-    let mut heavy: Vec<&Collection> = Vec::new();
+    report.table(&["coleção", "índice", "chaves", "usos", "situação"]);
+    let mut sem_uso = 0;
+    let mut sem_indice: Vec<&Collection> = Vec::new();
+    let mut pesados: Vec<&Collection> = Vec::new();
 
     for collection in collections {
         if report.stopping() {
             break;
         }
-        // A collection with nothing but the automatic `_id` index can only be queried
-        // one way: by _id. Every other filter reads all of it.
+        // Uma coleção com nada além do `_id` só pode ser buscada por `_id`. Todo outro
+        // filtro lê ela inteira.
         if collection.indexes <= 1.0 && collection.documents > 10_000.0 {
-            bare.push(collection);
+            sem_indice.push(collection);
         }
-        if collection.index_bytes > collection.size && collection.size > 50.0 * 1024.0 * 1024.0 {
-            heavy.push(collection);
+        if collection.index_bytes > collection.size && collection.size > 8.0 * 1024.0 * 1024.0 {
+            pesados.push(collection);
         }
-        let stats = conn.cursor(
+
+        // Quantas vezes cada índice foi usado desde que o servidor subiu.
+        let mut usos: HashMap<String, f64> = HashMap::new();
+        if let Ok(stats) = conn.cursor(
             &target.database,
             Doc::new()
                 .with("aggregate", collection.name.clone())
@@ -1211,40 +1255,77 @@ fn indexes(
                     vec![Value::Doc(Doc::new().with("$indexStats", Doc::new()))],
                 )
                 .with("cursor", Doc::new()),
-        );
-        let Ok(stats) = stats else { continue };
-        for index in stats {
-            let name = index.text("name");
-            if name == "_id_" {
-                continue;
-            }
-            let ops = index.num("accesses.ops");
-            if ops == 0.0 {
-                unused.push((collection.name.clone(), name, index.num("accesses.since")));
+        ) {
+            for index in stats {
+                usos.insert(index.text("name"), index.num("accesses.ops"));
             }
         }
-    }
 
-    if unused.is_empty() {
-        report.ok("todo índice desta base já foi usado desde a última reinicialização");
-    } else {
-        report.aviso(
-            format!("{} índice(s) nunca usados desde que o servidor subiu", unused.len()),
-            "cada índice é escrito em todo insert e update da coleção. Confira se não servem a um relatório raro antes de largar — e lembre que o contador zera quando o mongod reinicia",
-        );
-        report.table(&["coleção", "índice", "situação"]);
-        for (collection, index, _) in unused.iter() {
+        let Ok(list) = conn.cursor(
+            &target.database,
+            Doc::new()
+                .with("listIndexes", collection.name.clone())
+                .with("cursor", Doc::new()),
+        ) else {
+            continue;
+        };
+        for index in list {
+            let nome = index.text("name");
+            let chaves: Vec<String> = index
+                .doc("key")
+                .map(|doc| {
+                    doc.0
+                        .iter()
+                        .map(|(chave, valor)| format!("{chave}: {}", valor.render()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ops = usos.get(&nome).copied().unwrap_or(-1.0);
+            let mut situacao: Vec<String> = Vec::new();
+            if index.flag("unique") {
+                situacao.push("único".to_string());
+            }
+            if index.path("expireAfterSeconds").is_some() {
+                situacao.push(format!(
+                    "TTL, apaga depois de {}",
+                    duration(index.num("expireAfterSeconds"))
+                ));
+            }
+            if index.flag("sparse") {
+                situacao.push("esparso".to_string());
+            }
+            if nome != "_id_" && ops == 0.0 {
+                situacao.push("nunca usado".to_string());
+                sem_uso += 1;
+            }
             report.cells(
                 vec![
-                    collection.clone(),
-                    index.clone(),
-                    "nunca usado desde que o servidor subiu".to_string(),
+                    collection.name.clone(),
+                    nome,
+                    format!("{{ {} }}", chaves.join(", ")),
+                    match ops {
+                        desconhecido if desconhecido < 0.0 => "—".to_string(),
+                        usado => count(usado),
+                    },
+                    situacao.join(" · "),
                 ],
-                Tone::Aviso,
+                match ops == 0.0 {
+                    true => Tone::Aviso,
+                    false => Tone::Normal,
+                },
             );
         }
     }
-    for collection in bare {
+
+    if sem_uso == 0 {
+        report.ok("todo índice desta base já foi usado desde que o servidor subiu");
+    } else {
+        report.aviso(
+            format!("{sem_uso} índice(s) nunca usados desde que o servidor subiu"),
+            "cada índice é escrito em todo insert e update da coleção. Confira se não servem a um relatório raro antes de largar — e lembre que o contador zera quando o mongod reinicia",
+        );
+    }
+    for collection in sem_indice {
         report.aviso(
             format!(
                 "{} tem {} documentos e nenhum índice além de _id",
@@ -1254,7 +1335,7 @@ fn indexes(
             "qualquer filtro diferente de _id lê a coleção inteira. Veja pelo que a aplicação busca aqui e indexe",
         );
     }
-    for collection in heavy {
+    for collection in pesados {
         report.aviso(
             format!(
                 "{} tem mais índice ({}) do que dado ({})",
@@ -1262,50 +1343,13 @@ fn indexes(
                 bytes(collection.index_bytes),
                 bytes(collection.size)
             ),
-            "quase sempre é índice sobrando: veja a lista de não usados acima",
+            "quase sempre é índice sobrando: veja a coluna de usos acima",
         );
-    }
-
-    if depth >= Depth::Profundo && !collections.is_empty() {
-        report.line("índices declarados, coleção por coleção:");
-        report.table(&["coleção", "índice", "chaves", "situação"]);
-        for collection in collections.iter().take(TOP) {
-            let list = conn.cursor(
-                &target.database,
-                Doc::new()
-                    .with("listIndexes", collection.name.clone())
-                    .with("cursor", Doc::new()),
-            );
-            let Ok(list) = list else { continue };
-            for index in list {
-                let keys: Vec<String> = index
-                    .doc("key")
-                    .map(|doc| {
-                        doc.0
-                            .iter()
-                            .map(|(key, value)| format!("{key}: {}", value.render()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                report.cells(
-                    vec![
-                        collection.name.clone(),
-                        index.text("name"),
-                        format!("{{ {} }}", keys.join(", ")),
-                        if index.flag("unique") {
-                            "único".to_string()
-                        } else {
-                            String::new()
-                        },
-                    ],
-                    Tone::Normal,
-                );
-            }
-        }
     }
     Ok(())
 }
 
+/// Sem repetir, preservando a ordem em que apareceram.
 fn unique(values: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     values
@@ -1314,10 +1358,16 @@ fn unique(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// As operações lentas que o servidor já tinha registrado antes de a gente chegar.
+///
+/// Duas fontes para a mesma pergunta, e as duas entram na mesma tabela: a `system.profile`
+/// (quando alguém já ligou o profiler) e o log do próprio servidor, que grava as lentas
+/// por conta própria em qualquer instalação. Uma linha por **forma** de operação — o
+/// profiler grava cada execução, e cinco linhas iguais não dizem mais do que uma.
 fn slow(conn: &mut mongo::Conn, report: &mut Report, target: &mongo::Target) -> Result<(), String> {
     report.section("Queries lentas");
-    // `profile: -1` asks what the profiler is set to. Any other value would set it, and
-    // setting it is a change to a production database this tool will not make.
+    // `profile: -1` pergunta em que nível o profiler está. Qualquer outro valor o
+    // *mudaria*, e mudar coisa em banco de produção é o que esta ferramenta não faz.
     let level = ask(
         conn,
         report,
@@ -1343,7 +1393,8 @@ fn slow(conn: &mut mongo::Conn, report: &mut Report, target: &mongo::Target) -> 
         );
     }
 
-    let mut found = false;
+    let mut achadas: Vec<Lenta> = Vec::new();
+    let mut vistas: HashSet<String> = HashSet::new();
     if level.int("was") > 0 {
         let profiled = ask_many(
             conn,
@@ -1354,15 +1405,16 @@ fn slow(conn: &mut mongo::Conn, report: &mut Report, target: &mongo::Target) -> 
                 .with("find", "system.profile")
                 .with(
                     "filter",
-                    Doc::new().with("millis", Doc::new().with("$gte", 50)),
+                    Doc::new().with("millis", Doc::new().with("$gte", 20)),
                 )
                 .with("sort", Doc::new().with("ts", -1))
-                .with("limit", 25),
+                .with("limit", 200),
         )?;
-        for entry in profiled.iter().take(TOP) {
-            found = true;
+        for entry in profiled.iter().filter(|entry| !nossa(entry)) {
             let lenta = from_profile(entry);
-            report.aviso(lenta.linha(), lenta.fix.clone());
+            if vistas.insert(format!("{}{}", lenta.ns, lenta.forma)) {
+                achadas.push(lenta);
+            }
         }
     } else {
         report.line(
@@ -1370,40 +1422,56 @@ fn slow(conn: &mut mongo::Conn, report: &mut Report, target: &mongo::Target) -> 
         );
     }
 
-    // The log carries the same information the profiler would, for free, and is the one
-    // place a slow query is recorded on a server nobody prepared in advance.
-    if let Some(log) = ask(
-        conn,
-        report,
-        "log do servidor",
-        "admin",
-        Doc::new().with("getLog", "global"),
-    )? {
-        let lines = log.list("log");
-        let mut shown = 0;
-        for value in lines.iter().rev() {
-            if shown >= 8 {
-                break;
-            }
+    // O log só entra quando o profiler não está ligado: com os dois, a mesma operação
+    // aparece duas vezes escrita de dois jeitos, e nenhuma deduplicação junta as duas sem
+    // mentir sobre qual é qual.
+    if level.int("was") == 0
+        && let Some(log) = ask(
+            conn,
+            report,
+            "log do servidor",
+            "admin",
+            Doc::new().with("getLog", "global"),
+        )?
+    {
+        for value in log.list("log").iter().rev() {
             let Some(text) = value.as_text() else {
                 continue;
             };
             let Some(lenta) = from_log(text) else {
                 continue;
             };
-            found = true;
-            shown += 1;
-            report.aviso(lenta.linha(), lenta.fix.clone());
-        }
-        if shown == 0 {
-            report.line(format!(
-                "nenhuma query lenta nas últimas {} linhas de log do servidor",
-                lines.len()
-            ));
+            if vistas.insert(format!("{}{}", lenta.ns, lenta.forma)) {
+                achadas.push(lenta);
+            }
         }
     }
-    if !found {
+
+    if achadas.is_empty() {
         report.ok("nenhuma operação lenta registrada");
+        return Ok(());
+    }
+    achadas.sort_by(|a, b| b.millis.total_cmp(&a.millis));
+    report.table(&["duração", "coleção", "plano", "examinados", "operação"]);
+    for lenta in &achadas {
+        report.cells(
+            vec![
+                millis(lenta.millis),
+                lenta.ns.clone(),
+                lenta.plano.clone(),
+                lenta.examinados.clone(),
+                one_line(&lenta.forma, 140),
+            ],
+            match lenta.millis >= 1000.0 {
+                true => Tone::Ruim,
+                false => Tone::Aviso,
+            },
+        );
+    }
+    // A sugestão é o que ninguém copia de uma tabela: vai embaixo, e só para as que têm
+    // uma para dar.
+    for lenta in achadas.iter().filter(|lenta| !lenta.fix.is_empty()).take(6) {
+        report.aviso(lenta.linha(), lenta.fix.clone());
     }
     Ok(())
 }
@@ -1447,27 +1515,32 @@ fn from_profile(entry: &Doc) -> Lenta {
         true => format!("{} examinados → {}", count(examined), count(returned)),
         false => String::new(),
     };
+    let (do_pipeline, ordem_do_pipeline) = stages_of(entry.doc("command"));
     let filter = entry
         .doc("command.filter")
         .or_else(|| entry.doc("query.filter"))
-        .or_else(|| entry.doc("command.q"));
+        .or_else(|| entry.doc("command.q"))
+        .or(do_pipeline.as_ref());
     let sort = entry
         .doc("command.sort")
-        .or_else(|| entry.doc("query.sort"));
+        .or_else(|| entry.doc("query.sort"))
+        .or(ordem_do_pipeline.as_ref());
     let mut fix = suggestion_from_doc(filter, sort).unwrap_or_default();
     if plano.contains("COLLSCAN") {
         fix = format!("varreu a coleção inteira. {fix}");
     }
+    let comando = entry
+        .doc("command")
+        .map(|doc| doc.render_forma())
+        .unwrap_or_default();
     Lenta {
         visto: std::time::Instant::now(),
         millis: entry.num("millis"),
         ns: entry.text("ns"),
         plano,
-        resumo: format!(
-            "{} {esforco} {}",
-            entry.text("op"),
-            one_line(&entry.text("command"), 80)
-        ),
+        forma: comando.clone(),
+        examinados: count(examined),
+        resumo: format!("{} {esforco} {}", entry.text("op"), one_line(&comando, 100)),
         fix: fix.trim().to_string(),
     }
 }
@@ -1556,20 +1629,43 @@ fn from_log(text: &str) -> Option<Lenta> {
         true => format!("{} examinados → {}", count(examined), count(returned)),
         false => String::new(),
     };
+    // Numa agregação, o índice que faltou é o do primeiro `$match` e do primeiro `$sort`:
+    // depois de um `$group` o filtro é sobre outra coisa e nenhum índice alcança.
+    let estagio = |nome: &str| -> Option<&serde_json::Value> {
+        let pipeline = command.and_then(|c| c.get("pipeline"))?.as_array()?;
+        for estagio in pipeline {
+            let objeto = estagio.as_object()?;
+            let (primeiro, valor) = objeto.iter().next()?;
+            if primeiro == nome {
+                return Some(valor);
+            }
+            if ["$group", "$bucket", "$unwind"].contains(&primeiro.as_str()) {
+                return None;
+            }
+        }
+        None
+    };
     let mut fix = suggestion_from_json(
-        command.and_then(|c| c.get("filter")),
-        command.and_then(|c| c.get("sort")),
+        command
+            .and_then(|c| c.get("filter"))
+            .or_else(|| estagio("$match")),
+        command
+            .and_then(|c| c.get("sort"))
+            .or_else(|| estagio("$sort")),
     )
     .unwrap_or_default();
     if plano.contains("COLLSCAN") {
         fix = format!("varreu a coleção inteira. {fix}");
     }
+    let comando = forma_json(command);
     Some(Lenta {
         visto: std::time::Instant::now(),
         millis: duration,
         ns: namespace.to_string(),
         plano,
-        resumo: format!("{esforco} {}", forma_json(command)),
+        forma: comando.clone(),
+        examinados: count(examined),
+        resumo: format!("{esforco} {comando}"),
         fix: fix.trim().to_string(),
     })
 }
@@ -1603,6 +1699,27 @@ fn ranged(operator: &str) -> bool {
         operator,
         "$gt" | "$gte" | "$lt" | "$lte" | "$ne" | "$nin" | "$regex" | "$exists" | "$not"
     )
+}
+
+/// O `$match` e o `$sort` de um pipeline de agregação, que é onde mora o índice que ela
+/// queria ter. Só os primeiros: depois de um `$group` a ordem e o filtro já são sobre
+/// outra coisa, e um índice não alcança mais.
+fn stages_of(comando: Option<&Doc>) -> (Option<Doc>, Option<Doc>) {
+    let Some(pipeline) = comando.map(|doc| doc.list("pipeline")) else {
+        return (None, None);
+    };
+    let (mut filtro, mut ordem) = (None, None);
+    for estagio in pipeline.iter().filter_map(Value::as_doc) {
+        match estagio.0.first().map(|(nome, _)| nome.as_str()) {
+            Some("$match") if filtro.is_none() => filtro = estagio.doc("$match").cloned(),
+            Some("$sort") if ordem.is_none() => ordem = estagio.doc("$sort").cloned(),
+            // Depois de agrupar, o que se filtra e ordena são os resultados, e nenhum
+            // índice da coleção serve para isso.
+            Some("$group") | Some("$bucket") | Some("$unwind") => break,
+            _ => {}
+        }
+    }
+    (filtro, ordem)
 }
 
 fn suggestion_from_doc(filter: Option<&Doc>, sort: Option<&Doc>) -> Option<String> {
@@ -1792,7 +1909,7 @@ fn storage(
     // given back to the filesystem. Normal in small amounts; a third of the collection
     // means a lot of deleting happened.
     for collection in collections {
-        if collection.storage < 50.0 * 1024.0 * 1024.0 || collection.reusable == 0.0 {
+        if collection.storage < 8.0 * 1024.0 * 1024.0 || collection.reusable == 0.0 {
             continue;
         }
         let share = collection.reusable / collection.storage;
@@ -1906,4 +2023,281 @@ fn configuration(
         );
     }
     Ok(())
+}
+
+/// Latência, memória, cursores e conflitos: o que o `serverStatus` responde sobre a saúde
+/// do processo, e que nenhuma query isolada revela.
+///
+/// A latência média por operação é a métrica que um cliente sente e que quase nenhum
+/// painel mostra: `opLatencies` guarda o tempo somado e a contagem, e a divisão dos dois é
+/// a resposta para «o banco está lento?» antes de qualquer investigação de query.
+fn health(report: &mut Report, status: &Doc, host: &Doc) {
+    report.section("Saúde do servidor");
+
+    for (nome, caminho) in [
+        ("leituras", "opLatencies.reads"),
+        ("escritas", "opLatencies.writes"),
+        ("comandos", "opLatencies.commands"),
+    ] {
+        let total = status.num(&format!("{caminho}.latency"));
+        let ops = status.num(&format!("{caminho}.ops"));
+        if ops <= 0.0 {
+            continue;
+        }
+        // O MongoDB conta em microssegundos.
+        let media = total / ops / 1000.0;
+        report.field(
+            format!("latência média — {nome}"),
+            format!(
+                "{} em {}",
+                millis(media),
+                plural(ops, "operação", "operações")
+            ),
+        );
+        if media > 100.0 {
+            report.aviso(
+                format!("{nome} levam {} em média", millis(media)),
+                "média alta assim raramente é uma query só: costuma ser disco saturado, cache pequeno demais, ou fila de tickets",
+            );
+        }
+    }
+
+    let residente = status.num("mem.resident") * 1024.0 * 1024.0;
+    let ram = host.num("system.memSizeMB") * 1024.0 * 1024.0;
+    if residente > 0.0 {
+        report.field(
+            "memória do processo",
+            match ram > 0.0 {
+                true => format!(
+                    "{} de {} da máquina ({:.0}%)",
+                    bytes(residente),
+                    bytes(ram),
+                    100.0 * residente / ram
+                ),
+                false => bytes(residente),
+            },
+        );
+    }
+    if host.num("system.numCores") > 0.0 {
+        report.field(
+            "máquina",
+            format!(
+                "{} núcleos, {}",
+                count(host.num("system.numCores")),
+                host.text("os.name")
+            ),
+        );
+    }
+
+    let abertos = status.num("metrics.cursor.open.total");
+    let sem_prazo = status.num("metrics.cursor.open.noTimeout");
+    if abertos > 0.0 || sem_prazo > 0.0 {
+        report.field(
+            "cursores abertos",
+            format!("{} ({} sem prazo)", count(abertos), count(sem_prazo)),
+        );
+    }
+    if sem_prazo > 0.0 {
+        report.aviso(
+            format!("{} cursor(es) abertos com noTimeout", count(sem_prazo)),
+            "um cursor sem prazo que o cliente esqueceu fica segurando recursos até o servidor reiniciar. Quase sempre é driver configurado com noCursorTimeout sem necessidade",
+        );
+    }
+
+    // Conflito de escrita é o WiredTiger mandando a operação tentar de novo porque outra
+    // mexeu no mesmo documento. Um punhado é normal; muitos são duas partes do sistema
+    // brigando pela mesma linha.
+    let conflitos = status.num("metrics.operation.writeConflicts");
+    let escritas = status.num("opcounters.update") + status.num("opcounters.delete");
+    if conflitos > 0.0 {
+        report.field("conflitos de escrita", count(conflitos));
+        if escritas > 1000.0 && conflitos / escritas > 0.01 {
+            report.aviso(
+                format!(
+                    "{:.1}% das escritas foram refeitas por conflito",
+                    100.0 * conflitos / escritas
+                ),
+                "duas partes da aplicação disputam os mesmos documentos. Cada conflito é a operação inteira repetida — e repetida sem ninguém ver",
+            );
+        }
+    }
+
+    let abortadas = status.num("transactions.totalAborted");
+    let commitadas = status.num("transactions.totalCommitted");
+    if abortadas + commitadas > 0.0 {
+        report.field(
+            "transações multi-documento",
+            format!(
+                "{} confirmadas, {} abortadas",
+                count(commitadas),
+                count(abortadas)
+            ),
+        );
+        if abortadas > commitadas * 0.1 && abortadas > 10.0 {
+            report.aviso(
+                format!(
+                    "{:.0}% das transações são abortadas",
+                    100.0 * abortadas / (abortadas + commitadas)
+                ),
+                "transação abortada é trabalho jogado fora, e no MongoDB costuma ser transação longa demais (o limite padrão é 60s) ou conflito de escrita",
+            );
+        }
+    }
+
+    let ttl = status.num("metrics.ttl.deletedDocuments");
+    if ttl > 0.0 {
+        report.field(
+            "documentos apagados por TTL",
+            format!(
+                "{} em {} passagens",
+                count(ttl),
+                count(status.num("metrics.ttl.passes"))
+            ),
+        );
+    }
+
+    let requisicoes = status.num("network.numRequests");
+    if requisicoes > 0.0 {
+        report.field(
+            "rede",
+            format!(
+                "{} entraram, {} saíram, {} por requisição",
+                bytes(status.num("network.bytesIn")),
+                bytes(status.num("network.bytesOut")),
+                bytes(status.num("network.bytesOut") / requisicoes)
+            ),
+        );
+        // Muitos bytes por requisição é quase sempre projeção faltando: a aplicação pede o
+        // documento inteiro e usa três campos dele.
+        if status.num("network.bytesOut") / requisicoes > 256.0 * 1024.0 {
+            report.aviso(
+                format!(
+                    "cada requisição devolve {} em média",
+                    bytes(status.num("network.bytesOut") / requisicoes)
+                ),
+                "devolver documento inteiro quando a tela usa três campos custa rede, cache e serialização. Uma projeção no find corta isso sem mudar mais nada",
+            );
+        }
+    }
+}
+
+/// O que o WiredTiger diz sobre o próprio trabalho: sujeira no cache, despejo, checkpoint
+/// e journal. É onde uma latência que não aparece em query nenhuma costuma estar.
+fn engine(report: &mut Report, status: &Doc) {
+    let Some(wt) = status.doc("wiredTiger") else {
+        return;
+    };
+    let cache = wt.doc("cache").cloned().unwrap_or_default();
+    let max = cache.num("maximum bytes configured");
+    let sujas = cache.num("tracked dirty bytes in the cache");
+    if max > 0.0 && sujas > 0.0 {
+        let pct = 100.0 * sujas / max;
+        // Acima de 20% o WiredTiger passa a frear as escritas para conseguir acompanhar o
+        // checkpoint, e a aplicação sente isso como latência sem causa aparente.
+        if pct > 20.0 {
+            report.grave(
+                format!("{pct:.0}% do cache está sujo (páginas por gravar)"),
+                "acima de 20% o próprio motor começa a segurar as escritas para o checkpoint alcançar. É disco não dando conta do ritmo de escrita",
+            );
+        }
+    }
+
+    let checkpoint = wt.num("transaction.transaction checkpoint most recent time (msecs)");
+    if checkpoint > 0.0 {
+        report.field("último checkpoint levou", millis(checkpoint));
+        if checkpoint > 60_000.0 {
+            report.aviso(
+                format!("o último checkpoint levou {}", millis(checkpoint)),
+                "o intervalo padrão entre checkpoints é 60s: um que demora mais que isso nunca termina antes do próximo começar",
+            );
+        }
+    }
+
+    let sync_tempo = wt.num("log.log sync time duration (usecs)");
+    let sync_ops = wt.num("log.log sync operations");
+    if sync_ops > 0.0 {
+        let media = sync_tempo / sync_ops / 1000.0;
+        report.field("sincronização do journal", millis(media));
+        if media > 30.0 {
+            report.aviso(
+                format!("cada sincronização do journal leva {}", millis(media)),
+                "é o disco respondendo devagar no caminho do commit: todo write com journal espera por isso",
+            );
+        }
+    }
+
+    let faltas = status.num("extra_info.page_faults");
+    if faltas > 0.0 {
+        report.field("faltas de página", count(faltas));
+    }
+}
+
+/// Um cluster fragmentado: shards, balanceador, e os pedaços que não cabem mais.
+fn sharding(conn: &mut mongo::Conn, report: &mut Report) -> Result<(), String> {
+    let Some(shards) = ask(
+        conn,
+        report,
+        "listShards",
+        "admin",
+        Doc::new().with("listShards", 1),
+    )?
+    else {
+        return Ok(());
+    };
+    report.section("Sharding");
+    report.table(&["shard", "endereço", "estado"]);
+    for shard in shards.list("shards").iter().filter_map(Value::as_doc) {
+        report.cells(
+            vec![
+                shard.text("_id"),
+                one_line(&shard.text("host"), 90),
+                match shard.text("state").as_str() {
+                    "1" => "ativo".to_string(),
+                    outro => outro.to_string(),
+                },
+            ],
+            Tone::Normal,
+        );
+    }
+    if let Some(balanceador) = ask(
+        conn,
+        report,
+        "balancerStatus",
+        "admin",
+        Doc::new().with("balancerStatus", 1),
+    )? {
+        report.field(
+            "balanceador",
+            match balanceador.flag("mode") || balanceador.text("mode") == "full" {
+                true => "ligado".to_string(),
+                false => format!("modo {}", balanceador.text("mode")),
+            },
+        );
+        if balanceador.text("mode") == "off" {
+            report.aviso(
+                "o balanceador está desligado",
+                "sem ele os pedaços param onde estiverem, e um shard cresce enquanto os outros ficam vazios. Desligado por uma janela é normal; desligado e esquecido é o começo de um shard cheio",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Índices demais numa coleção.
+fn index_shape(report: &mut Report, collections: &[Collection]) {
+    for collection in collections {
+        // Cada índice é escrito em todo insert e em todo update que toca a chave dele. O
+        // limite rígido do MongoDB é 64, e muito antes disso a escrita já está pagando
+        // caro por índices que ninguém pediu.
+        if collection.indexes >= 8.0 {
+            report.aviso(
+                format!(
+                    "{} tem {} índices",
+                    collection.name,
+                    count(collection.indexes)
+                ),
+                "todo insert e todo update escrevem em cada um deles. A coluna de usos na tabela acima costuma explicar metade",
+            );
+        }
+    }
 }

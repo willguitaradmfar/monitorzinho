@@ -41,7 +41,7 @@ mod mongo;
 mod mongo_checks;
 mod pg;
 mod pg_checks;
-mod scram;
+pub(crate) mod scram;
 mod url;
 
 const ENGINES: &[&str] = &["PostgreSQL", "MongoDB"];
@@ -905,16 +905,29 @@ impl<'a> Report<'a> {
                 (format!("  {verdict}"), Tone::Destaque),
                 (String::new(), Tone::Normal),
                 (
-                    "  Cada cartão deste painel é uma seção da investigação, e se reescreve"
+                    "  Cada cartão deste painel é uma seção da investigação, e a tecla de cada"
                         .to_string(),
                     Tone::Normal,
                 ),
                 (
-                    "  sozinho enquanto esta tela estiver aberta. A tecla de cada um abre o que"
+                    "  um abre o que ele encontrou por inteiro. Ctrl+T põe tudo em texto corrido,"
                         .to_string(),
                     Tone::Normal,
                 ),
-                ("  ele encontrou por inteiro.".to_string(), Tone::Normal),
+                (
+                    "  e lá o `c` copia o relatório inteiro.".to_string(),
+                    Tone::Normal,
+                ),
+                (String::new(), Tone::Normal),
+                (
+                    "  Isto é um retrato, não um monitor: nada é perguntado ao banco entre uma"
+                        .to_string(),
+                    Tone::Normal,
+                ),
+                (
+                    "  investigação e a próxima. Ctrl+R faz outra.".to_string(),
+                    Tone::Normal,
+                ),
                 (String::new(), Tone::Normal),
                 (
                     "  Nada aqui altera o banco: nenhum índice é criado, nenhum profiler é"
@@ -1008,7 +1021,8 @@ fn detail(
     let (Pane::Table { rows, headers, .. }, Pane::Text { lines, .. }) = (&tabela, &texto) else {
         unreachable!("acabaram de ser construídos")
     };
-    match (headers.is_empty(), lines.is_empty()) {
+    // Uma tabela sem linha nenhuma é um cabeçalho sozinho: pior que não ter tabela.
+    match (headers.is_empty() || rows.is_empty(), lines.is_empty()) {
         (true, _) => Layout::one(texto),
         (false, true) => Layout::one(tabela),
         (false, false) => {

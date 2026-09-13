@@ -131,6 +131,7 @@ impl Session {
         self.now(report)?;
         self.movement(report, window)?;
         connections(&mut self.conn, report, &self.settings)?;
+        who(&mut self.conn, report)?;
         locks(&mut self.conn, report)?;
         self.reset = activity(&mut self.conn, report, &self.settings)?;
         if report.stopping() {
@@ -139,6 +140,7 @@ impl Session {
         settings_card(report, &self.settings, self.depth);
         self.indexed = indexed_columns(&mut self.conn, report)?;
         indexes(&mut self.conn, report, self.depth, &self.reset)?;
+        table_cache(&mut self.conn, report)?;
         if self.depth >= Depth::Medio {
             self.statements = statements(
                 &mut self.conn,
@@ -149,19 +151,24 @@ impl Session {
             )?;
             let (reset, statements) = (&self.reset, &self.statements);
             scans(&mut self.conn, report, reset, statements, &self.indexed)?;
-            vacuum(&mut self.conn, report)?;
+            vacuum(&mut self.conn, report, &self.reset)?;
+            stale_stats(&mut self.conn, report)?;
+            horizon(&mut self.conn, report)?;
             wraparound(&mut self.conn, report, self.depth)?;
             replication(&mut self.conn, report, self.version)?;
             checkpoints(&mut self.conn, report, self.version)?;
+            write_activity(&mut self.conn, report, self.version)?;
         }
         if self.depth >= Depth::Profundo {
             if report.stopping() {
                 return Ok(());
             }
             sizes(&mut self.conn, report)?;
+            bloat(&mut self.conn, report)?;
             foreign_keys(&mut self.conn, report)?;
             sequences(&mut self.conn, report)?;
             no_primary_key(&mut self.conn, report)?;
+            security(&mut self.conn, report)?;
             extensions(&mut self.conn, report)?;
         }
         Ok(())
@@ -352,6 +359,9 @@ impl Session {
         if running == 0 {
             report.ok("nenhuma query em execução neste instante");
         }
+        // O servidor também trabalha por conta própria, e o que ele está fazendo explica
+        // I/O que nenhuma query justifica.
+        progress(&mut self.conn, report, self.version)?;
         // What disappeared between two looks has finished, and how long it had been
         // running is the only measurement of it anybody will ever get.
         let done: Vec<String> = self
@@ -894,36 +904,8 @@ fn connections(
         }
     }
 
-    let sql = "SELECT pid, COALESCE(usename,'') AS usuario, COALESCE(application_name,'') AS app, \
-               EXTRACT(epoch FROM now() - query_start) AS duracao, \
-               COALESCE(wait_event_type,'') AS espera_tipo, COALESCE(wait_event,'') AS espera, \
-               left(query, 300) AS query \
-               FROM pg_stat_activity \
-               WHERE state = 'active' AND query_start IS NOT NULL AND pid <> pg_backend_pid() \
-               ORDER BY query_start LIMIT 8";
-    if let Some(table) = ask(conn, report, "queries em andamento", sql)?
-        && !table.is_empty()
-    {
-        report.line("rodando agora:");
-        for row in table.iter() {
-            let seconds = row.num("duracao");
-            let waiting = match row.get("espera") {
-                "" => String::new(),
-                event => format!("  esperando {}/{}", row.get("espera_tipo"), event),
-            };
-            let line = format!(
-                "pid {} há {}{waiting}: {}",
-                row.get("pid"),
-                duration(seconds),
-                one_line(row.get("query"), 100)
-            );
-            if seconds > 60.0 {
-                report.aviso(line, "uma query de mais de um minuto no meio do dia costuma ser plano ruim, não volume");
-            } else {
-                report.row(line);
-            }
-        }
-    }
+    // O que está rodando agora é assunto do cartão «Agora», e repetir aqui seria a mesma
+    // query aparecendo duas vezes na mesma tela com palavras diferentes.
     Ok(())
 }
 
@@ -1362,7 +1344,6 @@ fn statements(
         ),
     );
 
-    report.line("as que mais consomem tempo do servidor:");
     report.table(&["% do tempo", "somado", "execuções", "média", "query"]);
     for stmt in statements.iter().take(15) {
         let share = if grand_total > 0.0 {
@@ -1771,15 +1752,30 @@ fn index_hint(query: &str) -> String {
     )
 }
 
-fn vacuum(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
+fn vacuum(conn: &mut pg::Conn, report: &mut Report, reset: &Reset) -> Result<(), String> {
     report.section("Vacuum e estatísticas");
-    let sql = "SELECT schemaname || '.' || relname AS tabela, n_live_tup, n_dead_tup, \
-               CASE WHEN n_live_tup > 0 THEN 100.0 * n_dead_tup / n_live_tup ELSE 0 END AS pct, \
-               EXTRACT(epoch FROM now() - GREATEST(last_vacuum, last_autovacuum)) AS desde_vacuum, \
-               EXTRACT(epoch FROM now() - GREATEST(last_analyze, last_autoanalyze)) AS desde_analyze, \
-               (last_analyze IS NULL AND last_autoanalyze IS NULL) AS nunca_analisada, \
-               pg_total_relation_size(relid) AS bytes \
-               FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 20";
+    // Linha morta é contada, não medida: um reinício sujo zera o contador sem limpar uma
+    // linha sequer. Dizer «nenhuma linha morta» com o contador de dois minutos atrás seria
+    // dar um atestado de saúde a partir de um caderno em branco.
+    if !reset.trustworthy() {
+        report.line(format!(
+            "contadores {} — linhas mortas de antes disso não aparecem aqui",
+            reset.describe()
+        ));
+    }
+    let sql = "SELECT t.schemaname || '.' || t.relname AS tabela, \
+               GREATEST(t.n_live_tup, c.reltuples::bigint - t.n_dead_tup, 0) AS n_live_tup, \
+               t.n_dead_tup, \
+               CASE WHEN GREATEST(t.n_live_tup, c.reltuples::bigint - t.n_dead_tup, 0) > 0 \
+                    THEN 100.0 * t.n_dead_tup \
+                         / GREATEST(t.n_live_tup, c.reltuples::bigint - t.n_dead_tup, 0) \
+                    ELSE -1 END AS pct, \
+               EXTRACT(epoch FROM now() - GREATEST(t.last_vacuum, t.last_autovacuum)) AS desde_vacuum, \
+               EXTRACT(epoch FROM now() - GREATEST(t.last_analyze, t.last_autoanalyze)) AS desde_analyze, \
+               (t.last_analyze IS NULL AND t.last_autoanalyze IS NULL) AS nunca_analisada, \
+               pg_total_relation_size(t.relid) AS bytes \
+               FROM pg_stat_user_tables t JOIN pg_class c ON c.oid = t.relid \
+               ORDER BY t.n_dead_tup DESC LIMIT 20";
     let Some(table) = ask(conn, report, "estatísticas de vacuum", sql)? else {
         return Ok(());
     };
@@ -1799,8 +1795,18 @@ fn vacuum(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
             vec![
                 row.get("tabela").to_string(),
                 count(dead),
-                format!("{pct:.0}%"),
-                duration(row.num("desde_vacuum")),
+                // Sem linhas vivas contadas não existe proporção, e inventar uma seria
+                // dizer 0% justamente na tabela em que ninguém sabe.
+                match pct {
+                    desconhecida if desconhecida < 0.0 => "?".to_string(),
+                    conhecida => format!("{conhecida:.0}%"),
+                },
+                // Coluna vazia é vacuum que nunca aconteceu, e «agora» seria a leitura
+                // exatamente oposta da verdade.
+                match row.get("desde_vacuum") {
+                    "" => "nunca".to_string(),
+                    _ => duration(row.num("desde_vacuum")),
+                },
             ],
             match pct {
                 muito if muito >= 50.0 => Tone::Ruim,
@@ -1810,14 +1816,21 @@ fn vacuum(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
         );
         // Dead rows are not just space: every scan of the table walks over them, and the
         // index entries pointing at them are walked too.
-        if pct >= 50.0 && dead > 50_000.0 {
+        if !(0.0..50.0).contains(&pct) && dead > 50_000.0 {
             flagged = true;
             report.grave(
-                format!(
-                    "{} tem {} linhas mortas, {pct:.0}% do tamanho vivo — a tabela e seus índices estão inchados",
-                    row.get("tabela"),
-                    count(dead)
-                ),
+                match pct < 0.0 {
+                    true => format!(
+                        "{} tem {} linhas mortas e nenhuma linha viva contada — a tabela está acumulando lixo sem ninguém medindo",
+                        row.get("tabela"),
+                        count(dead)
+                    ),
+                    false => format!(
+                        "{} tem {} linhas mortas, {pct:.0}% do tamanho vivo — a tabela e seus índices estão inchados",
+                        row.get("tabela"),
+                        count(dead)
+                    ),
+                },
                 "o autovacuum não está dando conta dela. Ajuste autovacuum_vacuum_scale_factor só para esta tabela (ALTER TABLE ... SET) em vez de mexer no servidor inteiro",
             );
         } else if pct >= 20.0 && dead > 10_000.0 {
@@ -2454,4 +2467,579 @@ fn missing_columns(query: &str, indexed: &HashMap<String, HashSet<String>>) -> O
         "filtra por {} e nenhuma dessas colunas começa um índice: candidata a CREATE INDEX CONCURRENTLY",
         wanted.join(", ")
     ))
+}
+
+/// Quem está segurando o horizonte do vacuum.
+///
+/// É a pergunta mais valiosa que se faz a um Postgres doente, e a que quase ninguém sabe
+/// fazer. O vacuum só pode remover uma linha morta mais velha que a transação mais antiga
+/// ainda viva em **qualquer lugar** do cluster — e «qualquer lugar» inclui quatro coisas
+/// que nada têm a ver umas com as outras: uma transação aberta, um slot de replicação
+/// parado, uma réplica com `hot_standby_feedback` atrasada, e uma transação preparada que
+/// alguém esqueceu num commit de duas fases.
+///
+/// Enquanto um desses não sair da frente, a tabela incha, os índices incham, e o
+/// congelamento não avança — e tratar o sintoma (rodar VACUUM de novo) não muda nada. Esta
+/// é a seção que diz o nome do culpado.
+fn horizon(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
+    report.section("Horizonte do vacuum");
+    let sql = "SELECT 'sessão' AS tipo, pid::text AS quem, \
+               COALESCE(age(backend_xmin), 0) AS idade, \
+               COALESCE(EXTRACT(epoch FROM now() - xact_start), 0) AS segundos, \
+               COALESCE(state, '') || ' · ' || left(COALESCE(query, ''), 90) AS detalhe \
+               FROM pg_stat_activity WHERE backend_xmin IS NOT NULL AND pid <> pg_backend_pid() \
+               UNION ALL \
+               SELECT 'slot de replicação', slot_name, COALESCE(age(xmin), 0), 0, \
+               CASE WHEN active THEN 'ativo' ELSE 'INATIVO' END \
+               FROM pg_replication_slots WHERE xmin IS NOT NULL \
+               UNION ALL \
+               SELECT 'slot (catálogo)', slot_name, COALESCE(age(catalog_xmin), 0), 0, \
+               CASE WHEN active THEN 'ativo' ELSE 'INATIVO' END \
+               FROM pg_replication_slots WHERE catalog_xmin IS NOT NULL \
+               UNION ALL \
+               SELECT 'transação preparada', gid, COALESCE(age(transaction), 0), \
+               COALESCE(EXTRACT(epoch FROM now() - prepared), 0), owner \
+               FROM pg_prepared_xacts \
+               ORDER BY 3 DESC LIMIT 10";
+    let Some(table) = ask(conn, report, "horizonte do vacuum", sql)? else {
+        return Ok(());
+    };
+    if table.is_empty() {
+        report.ok("ninguém segurando o horizonte: o vacuum pode limpar tudo que está morto");
+        return Ok(());
+    }
+    report.table(&["quem", "tipo", "transações atrás", "há", "detalhe"]);
+    for row in table.iter() {
+        let idade = row.num("idade");
+        report.cells(
+            vec![
+                row.get("quem").to_string(),
+                row.get("tipo").to_string(),
+                count(idade),
+                match row.num("segundos") {
+                    0.0 => String::new(),
+                    segundos => duration(segundos),
+                },
+                one_line(row.get("detalhe"), 90),
+            ],
+            match idade {
+                muito if muito > 50_000_000.0 => Tone::Ruim,
+                algum if algum > 5_000_000.0 => Tone::Aviso,
+                _ => Tone::Normal,
+            },
+        );
+    }
+    // Uma transação preparada esquecida é sempre grave, por mais nova que seja e esteja
+    // ela em que posição estiver na lista: ela não vai embora sozinha, ninguém a está
+    // vigiando, e o horizonte dela nunca avança.
+    for row in table
+        .iter()
+        .filter(|row| row.get("tipo") == "transação preparada")
+    {
+        report.grave(
+            format!(
+                "a transação preparada «{}» está aberta há {} e segurando o horizonte",
+                row.get("quem"),
+                duration(row.num("segundos"))
+            ),
+            "transação de duas fases órfã: nada no banco vai encerrá-la, e o vacuum não passa dela. Quem cuida do cluster decide entre COMMIT PREPARED e ROLLBACK PREPARED — e enquanto isso o congelamento também não avança",
+        );
+    }
+    let Some(primeiro) = table.first() else {
+        return Ok(());
+    };
+    let idade = primeiro.num("idade");
+    let quem = format!("{} {}", primeiro.get("tipo"), primeiro.get("quem"));
+    if idade > 50_000_000.0 {
+        report.grave(
+            format!("{quem} segura o horizonte há {} transações", count(idade)),
+            "nenhuma linha morta mais nova que isso pode ser removida em base nenhuma do cluster. É a causa por trás de inchaço que não some e de congelamento que não avança",
+        );
+    } else if idade > 5_000_000.0 {
+        report.aviso(
+            format!("{quem} segura o horizonte há {} transações", count(idade)),
+            "ainda não é urgente, mas é o mesmo mecanismo: se não sair da frente, vira inchaço",
+        );
+    } else if !table
+        .iter()
+        .any(|row| row.get("tipo") == "transação preparada")
+    {
+        report.ok(format!(
+            "o horizonte mais antigo está {} transações atrás — normal",
+            count(idade)
+        ));
+    }
+    Ok(())
+}
+
+/// Escrita: quanto WAL este banco gera, e quem está escrevendo as páginas sujas.
+///
+/// A pergunta por trás é sempre a mesma — por que o disco está ocupado — e ela tem três
+/// respostas possíveis que se parecem de fora: checkpoint demais, WAL demais, ou o
+/// processo que atende a consulta tendo que escrever página por conta própria porque
+/// ninguém escreveu por ele.
+fn write_activity(conn: &mut pg::Conn, report: &mut Report, version: i64) -> Result<(), String> {
+    report.section("Escrita e WAL");
+
+    if version >= 140_000 {
+        let sql = "SELECT wal_records, wal_fpi, wal_bytes::float8 AS wal_bytes, \
+                   wal_buffers_full, wal_write, wal_sync, \
+                   EXTRACT(epoch FROM now() - stats_reset) AS desde FROM pg_stat_wal";
+        if let Some(table) = ask(conn, report, "pg_stat_wal", sql)?
+            && let Some(row) = table.first()
+        {
+            let desde = row.num("desde").max(1.0);
+            report.field(
+                "WAL gerado",
+                format!(
+                    "{} em {} ({} por hora)",
+                    bytes(row.num("wal_bytes")),
+                    duration(desde),
+                    bytes(row.num("wal_bytes") / desde * 3600.0)
+                ),
+            );
+            report.field(
+                "registros",
+                format!(
+                    "{} ({} páginas inteiras)",
+                    count(row.num("wal_records")),
+                    count(row.num("wal_fpi"))
+                ),
+            );
+            // Uma página inteira vai para o WAL na primeira vez que é tocada depois de um
+            // checkpoint. Muitas delas é checkpoint frequente demais, não escrita demais.
+            let fpi = row.num("wal_fpi");
+            let registros = row.num("wal_records").max(1.0);
+            if fpi / registros > 0.1 && registros > 100_000.0 {
+                report.aviso(
+                    format!(
+                        "{:.0}% dos registros de WAL são páginas inteiras",
+                        100.0 * fpi / registros
+                    ),
+                    "página inteira é escrita na primeira vez que ela muda depois de um checkpoint: tanta assim quase sempre é checkpoint frequente demais. max_wal_size maior espaça os checkpoints e encolhe o WAL",
+                );
+            }
+            if row.num("wal_buffers_full") > 0.0 {
+                report.aviso(
+                    format!(
+                        "o buffer de WAL encheu {} vez(es), obrigando quem escrevia a esperar",
+                        count(row.num("wal_buffers_full"))
+                    ),
+                    "wal_buffers maior (16MB costuma bastar) tira essa espera do caminho de quem faz COMMIT",
+                );
+            }
+        }
+    }
+
+    // O `pg_stat_bgwriter` foi partido em dois no 17: o que sobrou lá é o escritor de
+    // fundo, e os checkpoints mudaram de casa.
+    let sql = if version >= 170_000 {
+        "SELECT buffers_clean, maxwritten_clean, buffers_alloc FROM pg_stat_bgwriter"
+    } else {
+        "SELECT buffers_clean, maxwritten_clean, buffers_alloc, buffers_backend, \
+         buffers_backend_fsync, buffers_checkpoint FROM pg_stat_bgwriter"
+    };
+    if let Some(table) = ask(conn, report, "pg_stat_bgwriter", sql)?
+        && let Some(row) = table.first()
+    {
+        report.field(
+            "páginas alocadas",
+            format!(
+                "{} · escritas pelo bgwriter {}",
+                count(row.num("buffers_alloc")),
+                count(row.num("buffers_clean"))
+            ),
+        );
+        if version < 170_000 {
+            let backend = row.num("buffers_backend");
+            let checkpoint = row.num("buffers_checkpoint").max(1.0);
+            report.field("escritas pelo backend", count(backend));
+            // Quando quem escreve a página suja é o processo que está atendendo a query,
+            // a latência daquela query inclui um write. É o bgwriter não dando conta.
+            if backend > checkpoint {
+                report.aviso(
+                    "mais páginas escritas pelos processos de consulta do que pelos checkpoints",
+                    "o bgwriter não está dando conta: bgwriter_lru_maxpages e bgwriter_delay decidem o ritmo dele. Enquanto isso, cada escrita dessas entra no tempo de resposta de alguém",
+                );
+            }
+            if row.num("buffers_backend_fsync") > 0.0 {
+                report.grave(
+                    format!(
+                        "{} fsync(s) feitos pelo processo de consulta — a fila do checkpointer transbordou",
+                        count(row.num("buffers_backend_fsync"))
+                    ),
+                    "é o sintoma clássico de disco saturado somado a checkpoint mal espaçado",
+                );
+            }
+        }
+        if row.num("maxwritten_clean") > 0.0 {
+            report.aviso(
+                format!(
+                    "o bgwriter parou por bater o limite de páginas {} vez(es)",
+                    count(row.num("maxwritten_clean"))
+                ),
+                "bgwriter_lru_maxpages está pequeno para o ritmo de escrita deste banco",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// O que o próprio servidor está fazendo agora sem ninguém ter pedido: vacuum, analyze,
+/// criação de índice. Aparece no cartão «Agora», junto do que os clientes estão fazendo.
+fn progress(conn: &mut pg::Conn, report: &mut Report, version: i64) -> Result<(), String> {
+    let sql = "SELECT p.pid, a.relid::regclass::text AS tabela, p.phase, \
+               p.heap_blks_scanned::float8 AS feito, p.heap_blks_total::float8 AS total \
+               FROM pg_stat_progress_vacuum p \
+               JOIN pg_stat_progress_vacuum a ON a.pid = p.pid";
+    if let Some(table) = ask(conn, report, "vacuum em andamento", sql)? {
+        for row in table.iter() {
+            let total = row.num("total").max(1.0);
+            report.line(format!(
+                "vacuum rodando em {} — {:.0}% ({}), fase «{}»",
+                row.get("tabela"),
+                100.0 * row.num("feito") / total,
+                row.get("pid"),
+                row.get("phase")
+            ));
+        }
+    }
+    if version >= 120_000 {
+        let sql = "SELECT pid, relid::regclass::text AS tabela, phase, \
+                   blocks_done::float8 AS feito, blocks_total::float8 AS total \
+                   FROM pg_stat_progress_create_index";
+        if let Some(table) = ask(conn, report, "índices em construção", sql)? {
+            for row in table.iter() {
+                report.line(format!(
+                    "criando índice em {} — fase «{}», {:.0}%",
+                    row.get("tabela"),
+                    row.get("phase"),
+                    100.0 * row.num("feito") / row.num("total").max(1.0)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Contas por usuário e por aplicação, e o que está preso numa transação de duas fases.
+fn who(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
+    let sql = "SELECT COALESCE(usename,'(interno)') AS usuario, \
+               COALESCE(NULLIF(application_name,''),'(sem nome)') AS app, \
+               count(*) AS n, \
+               count(*) FILTER (WHERE state = 'active') AS ativas, \
+               MAX(EXTRACT(epoch FROM now() - backend_start)) AS mais_velha \
+               FROM pg_stat_activity GROUP BY 1, 2 ORDER BY n DESC LIMIT 12";
+    report.section("Quem está conectado");
+    let Some(table) = ask(conn, report, "conexões por origem", sql)? else {
+        return Ok(());
+    };
+    report.table(&["usuário e aplicação", "conexões", "ativas", "mais antiga"]);
+    for row in table.iter() {
+        report.cells_headline(
+            vec![
+                format!("{}@{}", row.get("usuario"), row.get("app")),
+                row.get("n").to_string(),
+                row.get("ativas").to_string(),
+                duration(row.num("mais_velha")),
+            ],
+            Tone::Normal,
+        );
+    }
+    // Uma aplicação que abre conexão sem se identificar é a que ninguém acha quando ela é
+    // a que está segurando o banco.
+    let anonimas: f64 = table
+        .iter()
+        .filter(|row| row.get("app") == "(sem nome)" && row.get("usuario") != "(interno)")
+        .map(|row| row.num("n"))
+        .sum();
+    if anonimas > 4.0 {
+        report.aviso(
+            format!("{} conexões sem application_name", count(anonimas)),
+            "com `application_name` na string de conexão de cada serviço, esta lista passa a dizer quem está fazendo o quê — é uma linha de configuração e resolve metade das investigações futuras",
+        );
+    }
+    Ok(())
+}
+
+/// Estatísticas velhas: o planejador escolhe plano com o que o ANALYZE deixou, e o que o
+/// ANALYZE deixou pode ser de antes da tabela dobrar de tamanho.
+fn stale_stats(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
+    let sql = "SELECT schemaname || '.' || relname AS tabela, n_live_tup, n_mod_since_analyze, \
+               CASE WHEN n_live_tup > 0 THEN 100.0 * n_mod_since_analyze / n_live_tup ELSE 0 END AS pct, \
+               EXTRACT(epoch FROM now() - GREATEST(last_analyze, last_autoanalyze)) AS desde, \
+               CASE WHEN n_tup_upd > 0 THEN 100.0 * n_tup_hot_upd / n_tup_upd ELSE 100 END AS hot, \
+               n_tup_upd \
+               FROM pg_stat_user_tables \
+               WHERE n_live_tup > 10000 ORDER BY pct DESC LIMIT 15";
+    let Some(table) = ask(conn, report, "idade das estatísticas", sql)? else {
+        return Ok(());
+    };
+    for row in table.iter() {
+        let pct = row.num("pct");
+        if pct >= 20.0 {
+            report.aviso(
+                format!(
+                    "{} mudou {:.0}% das linhas desde o último ANALYZE ({} de {})",
+                    row.get("tabela"),
+                    pct,
+                    count(row.num("n_mod_since_analyze")),
+                    count(row.num("n_live_tup"))
+                ),
+                "o planejador está escolhendo plano com um retrato velho da tabela. Se o autovacuum não alcança, autovacuum_analyze_scale_factor só desta tabela resolve (ALTER TABLE ... SET)",
+            );
+        }
+        // Um UPDATE HOT não toca os índices. Quando quase nenhum é HOT numa tabela muito
+        // atualizada, ou falta espaço na página (fillfactor) ou se está atualizando
+        // justamente uma coluna indexada.
+        let hot = row.num("hot");
+        if row.num("n_tup_upd") > 100_000.0 && hot < 50.0 {
+            report.aviso(
+                format!(
+                    "só {hot:.0}% dos UPDATEs de {} são HOT ({} atualizações)",
+                    row.get("tabela"),
+                    count(row.num("n_tup_upd"))
+                ),
+                "todo UPDATE não-HOT reescreve também as entradas de índice da linha. Ou a página não tem folga (fillfactor 90 ou 80 nessa tabela), ou existe índice numa coluna que muda o tempo todo",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Quanto de cada tabela está sendo lido do disco, e quanto do cache.
+fn table_cache(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
+    let sql = "SELECT schemaname || '.' || relname AS tabela, \
+               heap_blks_read::float8 AS lidas, heap_blks_hit::float8 AS cache, \
+               COALESCE(idx_blks_read,0)::float8 AS idx_lidas, \
+               COALESCE(idx_blks_hit,0)::float8 AS idx_cache \
+               FROM pg_statio_user_tables \
+               WHERE heap_blks_read + heap_blks_hit > 10000 \
+               ORDER BY heap_blks_read DESC LIMIT 10";
+    report.section("Cache por tabela");
+    let Some(table) = ask(conn, report, "pg_statio_user_tables", sql)? else {
+        return Ok(());
+    };
+    if table.is_empty() {
+        report.ok("nenhuma tabela com leitura suficiente para comparar");
+        return Ok(());
+    }
+    report.line("quanto de cada tabela sai do cache, e quanto vem do disco:");
+    report.table(&["tabela", "em cache", "lido do disco", "índices em cache"]);
+    for row in table.iter() {
+        let lidas = row.num("lidas");
+        let total = (lidas + row.num("cache")).max(1.0);
+        let acerto = 100.0 * row.num("cache") / total;
+        report.cells_headline(
+            vec![
+                row.get("tabela").to_string(),
+                format!("{acerto:.1}%"),
+                bytes(lidas * 8192.0),
+                format!(
+                    "{:.1}%",
+                    100.0 * row.num("idx_cache")
+                        / (row.num("idx_cache") + row.num("idx_lidas")).max(1.0)
+                ),
+            ],
+            match acerto {
+                frio if frio < 90.0 => Tone::Aviso,
+                _ => Tone::Normal,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Quem lê esta base, e com que poder.
+///
+/// Não é uma auditoria de segurança — é a parte dela que se responde com `SELECT` e que um
+/// DBA olha de qualquer jeito ao receber um servidor que não conhece: quantos superusuários
+/// existem, se alguém entra sem senha, e se a conexão pode ser em claro.
+fn security(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
+    report.section("Segurança");
+    let sql = "SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls, \
+               (rolpassword IS NULL) AS sem_senha, rolvaliduntil::text AS ate \
+               FROM pg_authid WHERE rolcanlogin ORDER BY rolsuper DESC, rolname LIMIT 40";
+    let Some(table) = ask(conn, report, "papéis (pg_authid pede superusuário)", sql)? else {
+        // Sem poder ler pg_authid, o que dá para saber ainda vale ser dito.
+        let sql = "SELECT rolname, rolsuper, rolcreaterole, rolcreatedb, rolreplication, \
+                   false AS rolbypassrls, false AS sem_senha, rolvaliduntil::text AS ate \
+                   FROM pg_roles WHERE rolcanlogin ORDER BY rolsuper DESC, rolname LIMIT 40";
+        if let Some(table) = ask(conn, report, "papéis", sql)? {
+            report.field("papéis que entram", count(table.len() as f64));
+            let supers: Vec<String> = table
+                .iter()
+                .filter(|row| row.flag("rolsuper"))
+                .map(|row| row.get("rolname").to_string())
+                .collect();
+            report.field("superusuários", supers.join(", "));
+        }
+        return Ok(());
+    };
+    report.table(&["papel", "poderes", "senha", "validade"]);
+    let mut supers = 0;
+    let mut sem_senha: Vec<String> = Vec::new();
+    for row in table.iter() {
+        let mut poderes: Vec<&str> = Vec::new();
+        if row.flag("rolsuper") {
+            poderes.push("SUPERUSER");
+            supers += 1;
+        }
+        if row.flag("rolcreaterole") {
+            poderes.push("CREATEROLE");
+        }
+        if row.flag("rolcreatedb") {
+            poderes.push("CREATEDB");
+        }
+        if row.flag("rolreplication") {
+            poderes.push("REPLICATION");
+        }
+        if row.flag("rolbypassrls") {
+            poderes.push("BYPASSRLS");
+        }
+        if row.flag("sem_senha") {
+            sem_senha.push(row.get("rolname").to_string());
+        }
+        report.cells(
+            vec![
+                row.get("rolname").to_string(),
+                poderes.join(" "),
+                match row.flag("sem_senha") {
+                    true => "sem senha".to_string(),
+                    false => "definida".to_string(),
+                },
+                row.get("ate").to_string(),
+            ],
+            match (row.flag("rolsuper"), row.flag("sem_senha")) {
+                (_, true) => Tone::Ruim,
+                (true, _) => Tone::Aviso,
+                _ => Tone::Normal,
+            },
+        );
+    }
+    if !sem_senha.is_empty() {
+        report.grave(
+            format!(
+                "{} papel(éis) entram sem senha: {}",
+                sem_senha.len(),
+                sem_senha.join(", ")
+            ),
+            "quem alcançar a porta entra como eles. Se for confiança por pg_hba (peer, trust), confira se vale também para quem vem de fora da máquina",
+        );
+    }
+    if supers > 3 {
+        report.aviso(
+            format!("{supers} superusuários nesta instância"),
+            "superusuário ignora toda permissão e todo RLS. A aplicação raramente precisa de um",
+        );
+    }
+    Ok(())
+}
+
+/// Uma estimativa de quanto de cada tabela é espaço desperdiçado.
+///
+/// **Estimativa, e dita como tal.** O número exato custa ler a tabela inteira
+/// (`pgstattuple`), e ler a tabela inteira é exatamente o que esta ferramenta não faz num
+/// servidor de produção. A conta aqui compara o tamanho real com o que as colunas
+/// deveriam ocupar segundo o último ANALYZE: erra para os lados, acerta a ordem de
+/// grandeza, e é o suficiente para separar «a tabela é grande» de «a tabela está inchada».
+fn bloat(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
+    let sql = "SELECT n.nspname || '.' || c.relname AS tabela, \
+               pg_relation_size(c.oid)::float8 AS real_bytes, \
+               c.reltuples::float8 AS linhas, \
+               COALESCE(t.n_dead_tup, 0)::float8 AS mortas, \
+               COALESCE(t.n_live_tup, 0)::float8 AS vivas, \
+               (SELECT sum(s.avg_width + 1)::float8 FROM pg_stats s \
+                 WHERE s.schemaname = n.nspname AND s.tablename = c.relname) AS largura \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+               LEFT JOIN pg_stat_user_tables t ON t.relid = c.oid \
+               WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema') \
+               AND c.reltuples > 1000 AND pg_relation_size(c.oid) > 8388608 \
+               ORDER BY pg_relation_size(c.oid) DESC LIMIT 25";
+    let Some(table) = ask(conn, report, "estimativa de inchaço", sql)? else {
+        return Ok(());
+    };
+    let mut inchadas: Vec<(String, f64, f64, f64)> = Vec::new();
+    for row in table.iter() {
+        let largura = row.num("largura");
+        let linhas = row.num("linhas");
+        let real = row.num("real_bytes");
+        if real <= 0.0 {
+            continue;
+        }
+        let excesso = if largura > 0.0 && linhas > 0.0 {
+            // 24 bytes de cabeçalho por linha, 4 do ponteiro no início da página, e 8 KB
+            // por página menos os 24 do cabeçalho dela.
+            let por_pagina = ((8192.0 - 24.0) / (largura + 28.0)).floor().max(1.0);
+            real - (linhas / por_pagina).ceil() * 8192.0
+        } else {
+            // Sem ANALYZE não há largura de coluna, e é justamente na tabela que ninguém
+            // analisa que o inchaço mora. O que sobra são as linhas mortas, que dizem
+            // quanto do arquivo é lixo com uma conta bem mais simples — e que também são
+            // a resposta quando a tabela foi analisada há pouco e inchou depois.
+            let mortas = row.num("mortas");
+            // `n_live_tup` zera num reinício sujo; o `reltuples` do catálogo é velho mas
+            // sobrevive, e velho é melhor que zero — com zero, toda tabela pareceria 100%
+            // desperdício.
+            let vivas = row.num("vivas").max(row.num("linhas") - mortas).max(0.0);
+            match vivas + mortas > 0.0 {
+                true => real * mortas / (vivas + mortas),
+                false => 0.0,
+            }
+        };
+        if excesso <= 0.0 {
+            continue;
+        }
+        let pct = 100.0 * excesso / real;
+        if pct >= 30.0 && excesso > 16.0 * 1024.0 * 1024.0 {
+            inchadas.push((row.get("tabela").to_string(), real, excesso, pct));
+        }
+    }
+    // Um «tudo certo» falso é pior que um «não sei»: quando a tabela nunca foi analisada
+    // e os contadores estão zerados, o catálogo não tem como saber, e dizer que está tudo
+    // bem seria inventar.
+    // Sem ANALYZE não existe largura de coluna, e sem ela a única conta que sobra é a das
+    // linhas mortas — que mede o lixo recente, não o que a tabela acumulou antes de
+    // ninguém estar contando. Dizer «não inchada» aí é dar um atestado que o catálogo não
+    // assinou.
+    let cegas: Vec<String> = table
+        .iter()
+        .filter(|row| row.num("largura") <= 0.0)
+        .map(|row| row.get("tabela").to_string())
+        .collect();
+    if inchadas.is_empty() {
+        if cegas.is_empty() {
+            report.ok("nenhuma tabela grande parece inchada muito além do esperado");
+        } else {
+            report.aviso(
+                format!(
+                    "não dá para estimar o inchaço de {}: sem ANALYZE e sem contadores",
+                    cegas.join(", ")
+                ),
+                "a estimativa sai da largura das colunas (que vem do ANALYZE) ou das linhas mortas (que vêm dos contadores, e zeram num reinício sujo). Sem os dois, o tamanho do arquivo não diz nada sobre desperdício",
+            );
+        }
+        return Ok(());
+    }
+    inchadas.sort_by(|a, b| b.2.total_cmp(&a.2));
+    report.aviso(
+        format!(
+            "{} tabela(s) com espaço desperdiçado estimado em {}",
+            inchadas.len(),
+            bytes(inchadas.iter().map(|entrada| entrada.2).sum())
+        ),
+        "estimativa a partir do último ANALYZE, não medição. O número exato sai de pgstattuple (que lê a tabela inteira, então é para janela de manutenção); a correção é VACUUM FULL ou pg_repack, e os dois pedem janela",
+    );
+    for (tabela, real, excesso, pct) in inchadas.iter().take(10) {
+        report.cells(
+            vec![
+                tabela.clone(),
+                bytes(*real),
+                format!("~{} desperdiçados", bytes(*excesso)),
+                format!("~{pct:.0}%"),
+            ],
+            Tone::Aviso,
+        );
+    }
+    Ok(())
 }

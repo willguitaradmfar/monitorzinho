@@ -1472,6 +1472,129 @@ pub struct TextView {
     pub max_scroll: Cell<u16>,
     /// Para onde o Esc volta.
     pub parent: TextParent,
+    /// O que aconteceu na última vez que se pediu para copiar. Fica no rodapé: copiar é
+    /// um gesto sem retorno visível nenhum, e um gesto assim precisa dizer que funcionou.
+    pub copiado: Option<String>,
+}
+
+/// Leva um texto para fora do terminal: área de transferência do **seu** terminal, e
+/// arquivo.
+///
+/// Três caminhos, porque o certo depende de onde o programa está rodando — e ele
+/// frequentemente não está rodando onde você está:
+///
+/// * **OSC 52**, a sequência que pede ao terminal para pôr um texto na área de
+///   transferência. É a única que funciona quando o monitorzinho está numa máquina e você
+///   está em outra, porque quem executa é o seu terminal, do seu lado da conexão SSH.
+///   Dentro do tmux ela precisa de um envelope para atravessar, e o tmux ainda precisa
+///   estar com `set-clipboard on` — por isso o retorno nunca afirma que deu certo.
+/// * **O programa do ambiente gráfico** (`wl-copy`, `xclip`, `xsel`, `pbcopy`), que
+///   resolve quando o programa roda na mesma máquina em que você está sentado.
+/// * **O arquivo**, que sempre funciona e que é o único caminho honesto quando o terminal
+///   recusa a sequência: fica no servidor, onde um `cat` ou um `scp` alcançam.
+///
+/// Selecionar com o mouse resolveria se o texto coubesse na tela. Um relatório de vinte e
+/// três seções não cabe, e selecionar rolando é onde essa ideia acaba.
+fn copiar(titulo: &str, texto: &str) -> String {
+    use std::io::Write;
+
+    let arquivo = crate::db::dados_dir().join("relatorios").join(format!(
+        "{}.txt",
+        titulo
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_lowercase()
+    ));
+    let salvo = std::fs::create_dir_all(arquivo.parent().unwrap_or(&arquivo))
+        .and_then(|_| std::fs::write(&arquivo, texto))
+        .is_ok();
+
+    let terminal = osc52(texto);
+
+    // Só faz sentido na mesma máquina, e não há como saber daqui se é o caso: numa sessão
+    // remota isto copia para a área de transferência do servidor, que não é a de ninguém.
+    // Fica porque não custa nada e resolve o caso local sem depender do terminal.
+    let mut local = false;
+    for (programa, argumentos) in [
+        ("wl-copy", &[][..]),
+        ("xclip", &["-selection", "clipboard"][..]),
+        ("xsel", &["--clipboard", "--input"][..]),
+        ("pbcopy", &[][..]),
+    ] {
+        let filho = std::process::Command::new(programa)
+            .args(argumentos)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut filho) = filho else { continue };
+        let escreveu = filho
+            .stdin
+            .as_mut()
+            .map(|entrada| entrada.write_all(texto.as_bytes()).is_ok())
+            .unwrap_or(false);
+        // Sem fechar a entrada, o wl-copy espera o fim dela para sempre.
+        drop(filho.stdin.take());
+        if escreveu && filho.wait().map(|saida| saida.success()).unwrap_or(false) {
+            local = true;
+            break;
+        }
+    }
+
+    let linhas = texto.lines().count();
+    let tamanho = crate::format::human_bytes(texto.len() as f64);
+    let onde = match salvo {
+        true => format!(" · salvo em {}", arquivo.display()),
+        false => String::new(),
+    };
+    match (terminal, local) {
+        (true, _) => format!(
+            "{linhas} linhas ({tamanho}) mandadas para a área de transferência do seu terminal{onde}"
+        ),
+        (false, true) => format!("{linhas} linhas ({tamanho}) na área de transferência{onde}"),
+        (false, false) => match salvo {
+            true => format!(
+                "{linhas} linhas ({tamanho}) salvas em {}",
+                arquivo.display()
+            ),
+            false => "não consegui copiar nem salvar o relatório".to_string(),
+        },
+    }
+}
+
+/// Pede ao terminal — o seu, do outro lado da conexão — para pôr o texto na área de
+/// transferência.
+///
+/// Devolve se a sequência **foi escrita**, não se funcionou: não existe resposta. Um
+/// terminal que não conhece OSC 52 a descarta em silêncio, e é por isso que o arquivo
+/// existe.
+///
+/// O texto muito grande é recusado por quase todo terminal (e pelo tmux) sem avisar, então
+/// nem vale tentar: acima do limite, o arquivo é a resposta.
+fn osc52(texto: &str) -> bool {
+    use std::io::Write;
+
+    /// O maior payload que os terminais costumam aceitar, já em base64.
+    const LIMITE: usize = 74_000;
+
+    let codificado = crate::tools::db::scram::b64_encode(texto.as_bytes());
+    if codificado.len() > LIMITE {
+        return false;
+    }
+    let sequencia = format!("\x1b]52;c;{codificado}\x07");
+    // Dentro do tmux ou do screen, a sequência precisa de um envelope para chegar ao
+    // terminal de verdade — e o ESC de dentro precisa ser dobrado.
+    let dentro_de_tmux = std::env::var_os("TMUX").is_some()
+        || std::env::var("TERM")
+            .is_ok_and(|term| term.starts_with("screen") || term.starts_with("tmux"));
+    let saida = match dentro_de_tmux {
+        true => format!("\x1bPtmux;{}\x1b\\", sequencia.replace('\x1b', "\x1b\x1b")),
+        false => sequencia,
+    };
+    let mut stdout = std::io::stdout();
+    stdout.write_all(saida.as_bytes()).is_ok() && stdout.flush().is_ok()
 }
 
 /// A tela que estava aberta quando o texto entrou na frente dela.
@@ -1481,6 +1604,8 @@ pub struct TextView {
 pub enum TextParent {
     Menu(Box<ActionMenu>),
     Table(Box<TableFocus>),
+    /// O painel de uma investigação de banco, de onde sai o relatório corrido.
+    Board(Box<BoardFocus>),
 }
 
 /// One chart on the Overview tab: what it measures, and everything the panel knows
@@ -2578,6 +2703,7 @@ impl App {
             scroll: 0,
             max_scroll: Cell::new(0),
             parent: TextParent::Table(Box::new(table)),
+            copiado: None,
         }));
     }
 
@@ -2924,6 +3050,7 @@ impl App {
             scroll: 0,
             max_scroll: Cell::new(0),
             parent: TextParent::Menu(parent),
+            copiado: None,
         }));
     }
 
@@ -2956,6 +3083,7 @@ impl App {
                     scroll: 0,
                     max_scroll: Cell::new(0),
                     parent: TextParent::Menu(parent),
+                    copiado: None,
                 }));
                 return;
             }
@@ -3003,6 +3131,10 @@ impl App {
             KeyCode::PageDown => scroll(view, PAGE_ROWS),
             KeyCode::Home => view.scroll = 0,
             KeyCode::End => view.scroll = view.max_scroll.get(),
+            KeyCode::Char('c') => {
+                let texto = view.lines.join("\n");
+                view.copiado = Some(copiar(&view.title, &texto));
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
                 let Focus::Text(view) = std::mem::replace(&mut self.focus, Focus::None) else {
                     return;
@@ -3010,6 +3142,7 @@ impl App {
                 self.focus = match view.parent {
                     TextParent::Menu(menu) => Focus::Actions(menu),
                     TextParent::Table(table) => Focus::Table(*table),
+                    TextParent::Board(board) => Focus::Board(board),
                 };
             }
             _ => {}
@@ -4864,6 +4997,63 @@ impl App {
             anchor_seq: Cell::new(0),
             anchor_offset: Cell::new(0),
         });
+    }
+
+    /// O quadro inteiro como texto corrido, para copiar (Ctrl+T).
+    ///
+    /// Ver `copiar`: dentro dele, `c` leva o relatório inteiro para fora do terminal.
+    ///
+    /// A grade é boa para achar; um chamado, um e-mail para o time que cuida do banco ou
+    /// uma anotação de janela de manutenção precisam do texto. Mesma investigação, sem
+    /// moldura, sem cor e sem corte — e com o cabeçalho dizendo qual servidor e de quando,
+    /// porque um relatório colado sem isso é um relatório sobre banco nenhum.
+    pub fn board_report(&mut self) {
+        let Focus::Board(board) = &self.focus else {
+            return;
+        };
+        let Some(execution) = self.tools.by_id(board.execution_id) else {
+            return;
+        };
+        let Some(quadro) = execution.board().cloned() else {
+            return;
+        };
+        let titulo = format!("{} — {}", execution.tool, execution.summary);
+        let mut linhas = vec![
+            titulo.clone(),
+            "=".repeat(titulo.chars().count()),
+            format!(
+                "{}  ·  investigado há {}",
+                crate::invest::tempo::dia_e_hora(crate::invest::store::agora(), 0),
+                tools::lock_board(&quadro)
+                    .updated
+                    .map(|quando| format::human_duration(quando.elapsed().as_secs()))
+                    .unwrap_or_else(|| "—".to_string())
+            ),
+            "Somente leitura: nada foi criado, alterado nem removido neste banco.".to_string(),
+        ];
+        for card in &tools::lock_board(&quadro).cards {
+            linhas.push(String::new());
+            linhas.push(format!("── {} ──", card.title));
+            linhas.extend(
+                card.detail
+                    .como_texto()
+                    .into_iter()
+                    // O título do painel já foi escrito como cabeçalho da seção; repeti-lo
+                    // em cada pedaço do arranjo seria escrever o nome três vezes.
+                    .filter(|linha| linha.trim() != card.title.trim()),
+            );
+        }
+        let Focus::Board(board) = std::mem::replace(&mut self.focus, Focus::None) else {
+            return;
+        };
+        self.focus = Focus::Text(Box::new(TextView {
+            title: format!("{titulo} — relatório"),
+            lines: linhas,
+            scroll: 0,
+            max_scroll: Cell::new(0),
+            parent: TextParent::Board(board),
+            copiado: None,
+        }));
     }
 
     /// Ctrl+R: pede uma passada completa agora, em vez de esperar a próxima.

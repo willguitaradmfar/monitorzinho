@@ -264,9 +264,12 @@ fn render_text_view(frame: &mut Frame, area: Rect, view: &TextView) {
         .title(format!(" {} ", view.title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::CYAN))
-        .title_bottom(hint_line(
-            "↑/↓ rolar · PgUp/PgDn rolar rápido · Home/End extremos · Esc voltar",
-        ));
+        // O retorno de uma cópia vai no lugar da dica, e não ao lado dela: é o que se
+        // quer ler no instante seguinte à tecla, e é a única coisa naquela linha que muda.
+        .title_bottom(hint_line(match &view.copiado {
+            Some(resultado) => resultado,
+            None => "c copiar tudo · ↑/↓ rolar · PgUp/PgDn rolar rápido · Home/End extremos · Esc voltar",
+        }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -3356,7 +3359,7 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
     // onde isso é dito: um cartão que existe, tem achado e não aparece em lugar nenhum é
     // um achado perdido.
     let rodape = match focus.card {
-        Some(_) => " ↑/↓ e PgUp/PgDn rolar · Esc volta para a grade · Tab log · Ctrl+R investigar de novo"
+        Some(_) => " ↑/↓ e PgUp/PgDn rolar · Esc volta para a grade · Ctrl+T relatório · Tab log · Ctrl+R investigar de novo"
             .to_string(),
         None if desenhados < quadro.cards.len() => {
             let resto: Vec<String> = quadro.cards[desenhados..]
@@ -3369,7 +3372,8 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
                 .collect();
             format!(" não coube na tela: {}", resto.join(" · "))
         }
-        None => " a tecla de cada cartão abre o que ele achou · Tab log · Ctrl+R investigar de novo · Esc voltar".to_string(),
+        None => " a tecla de cada cartão abre o que ele achou · Ctrl+T relatório para copiar · Tab log · Ctrl+R investigar de novo · Esc voltar"
+            .to_string(),
     };
     frame.render_widget(
         Paragraph::new(Line::styled(rodape, Style::default().fg(palette::DIM))),
