@@ -887,7 +887,10 @@ worth acting on carries a mark in the card's title, so which card to open is
 visible without opening any.
 
 Inside a card, **every** table is navigable — in all three engines: `↑`/`↓` walk
-the rows and everything known about the row under the cursor appears underneath — no key to open it and
+the rows and everything known about the row under the cursor appears underneath,
+spread across as many columns as the width allows so that it costs height rather
+than hiding, with each part taking the room it needs and the leftover left blank
+at the bottom rather than stretched into one pane — no key to open it and
 none to close it, because the arrow is the whole gesture. An index row opens onto
 its definition, its size, how many rows it has served and how many of those were
 fetched from the table; a table row onto its columns with their types, how many

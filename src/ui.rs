@@ -3255,6 +3255,164 @@ fn grade_do_quadro(area: Rect, necessarias: &[u16]) -> (usize, Vec<u16>) {
     (colunas, alturas)
 }
 
+/// Desenha o corpo de um cartão: a tabela e, embaixo, o que ela quer dizer.
+///
+/// Não usa `render_layout` porque lá os pesos são proporções — o que é certo num módulo da
+/// Invest, em que dois painéis dividem a tela pela importância, e errado aqui: uma tabela
+/// de duas linhas ficaria com três quintos da altura vazios enquanto a prosa embaixo
+/// espremeria oito linhas em quatro. Aqui cada parte pede o que precisa, a prosa tem teto,
+/// e o que sobra fica com a tabela, que é quem cresce.
+fn render_corpo(frame: &mut Frame, area: Rect, no: &crate::painel::Layout, pintor: &Pintor) {
+    use crate::painel::{Layout as ML, Pane};
+    let ML::Rows(partes) = no else {
+        render_layout(frame, area, no, pintor, &mut None);
+        return;
+    };
+    let [(_, primeiro), (_, segundo)] = &partes[..] else {
+        render_layout(frame, area, no, pintor, &mut None);
+        return;
+    };
+    let (ML::Leaf(tabela), ML::Leaf(prosa)) = (primeiro, segundo) else {
+        render_layout(frame, area, no, pintor, &mut None);
+        return;
+    };
+    let linhas_da_prosa = match &**prosa {
+        Pane::Text { lines, .. } => lines.len() as u16 + 2,
+        _ => 6,
+    };
+    let altura_da_prosa = linhas_da_prosa.min(area.height / 3).max(3);
+    let metades = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(altura_da_prosa)])
+        .split(area);
+    render_pane(frame, metades[0], tabela, pintor, None);
+    render_pane(frame, metades[1], prosa, pintor, None);
+}
+
+/// Desenha o detalhe da linha sob o cursor aproveitando a largura da tela.
+///
+/// A tabela em cima é larga porque tem colunas; o detalhe embaixo é uma lista de pares, e
+/// uma lista de pares empilhada desperdiça tudo o que houver à direita dela — vinte fatos
+/// viram vinte linhas de altura e a tabela fica sem espaço para mostrar em que linha o
+/// cursor está. Aqui os fatos se espalham em duas, três ou quatro colunas conforme o que
+/// couber, e a altura cai na mesma proporção.
+fn render_detalhe(frame: &mut Frame, area: Rect, no: &crate::painel::Layout, pintor: &Pintor) {
+    use crate::painel::{Layout as ML, Pane};
+    match no {
+        ML::Leaf(pane) => match &**pane {
+            Pane::Facts { title, rows } if !rows.is_empty() => {
+                let bloco = moldura(title);
+                let dentro = bloco.inner(area);
+                frame.render_widget(bloco, area);
+                let colunas = colunas_de_fatos(rows, dentro.width);
+                let por_coluna = rows.len().div_ceil(colunas);
+                let areas = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(vec![Constraint::Ratio(1, colunas as u32); colunas])
+                    .split(dentro);
+                for (fatia, &area) in rows.chunks(por_coluna).zip(areas.iter()) {
+                    frame.render_widget(Paragraph::new(fatos_em_linhas(fatia, pintor)), area);
+                }
+            }
+            _ => render_pane(frame, area, pane, pintor, None),
+        },
+        ML::Rows(partes) => {
+            // Cada parte fica com exatamente o que pediu. A sobra não mora aqui: quem a
+            // recebe é a tabela lá em cima, que é onde o cursor está.
+            let alturas: Vec<Constraint> = partes
+                .iter()
+                .map(|(_, filho)| Constraint::Length(altura_do_detalhe(filho, area.width)))
+                .collect();
+            let areas = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(alturas)
+                .split(area);
+            for ((_, filho), &area) in partes.iter().zip(areas.iter()) {
+                render_detalhe(frame, area, filho, pintor);
+            }
+        }
+        ML::Cols(partes) => {
+            let pesos: Vec<Constraint> = partes
+                .iter()
+                .map(|(peso, _)| Constraint::Fill((*peso).max(1)))
+                .collect();
+            let areas = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(pesos)
+                .split(area);
+            for ((_, filho), &area) in partes.iter().zip(areas.iter()) {
+                render_detalhe(frame, area, filho, pintor);
+            }
+        }
+    }
+}
+
+/// Em quantas colunas os fatos cabem nesta largura.
+///
+/// Pela largura do fato mais largo, e não pela média: uma coluna dimensionada pela média
+/// corta justamente o fato que alguém foi ler. Com poucos fatos fica em uma coluna de
+/// propósito — três fatos em três colunas é uma linha de texto espalhada pela tela.
+fn colunas_de_fatos(rows: &[(String, String, crate::invest::module::Tone)], largura: u16) -> usize {
+    const MIN_COLUNA: usize = 34;
+    let mais_largo = rows
+        .iter()
+        .map(|(rotulo, valor, _)| {
+            rotulo.chars().count().min(MAX_LABEL_WIDTH) + 2 + valor.chars().count()
+        })
+        .max()
+        .unwrap_or(MIN_COLUNA)
+        .max(MIN_COLUNA);
+    let cabem = (largura as usize / mais_largo).max(1);
+    // Nunca mais colunas que o necessário para deixar a lista com quatro linhas: além
+    // disso o olho passa a varrer horizontalmente por nada.
+    cabem.min(rows.len().div_ceil(4)).clamp(1, 4)
+}
+
+/// Quanta altura a tabela do cartão e a prosa embaixo dela pedem para caber inteiras.
+fn altura_do_corpo(no: &crate::painel::Layout) -> u16 {
+    use crate::painel::{Layout as ML, Pane};
+    match no {
+        ML::Leaf(pane) => match &**pane {
+            // As linhas, o cabeçalho e as duas bordas.
+            Pane::Table { rows, .. } => rows.len() as u16 + 4,
+            Pane::Text { lines, .. } => lines.len() as u16 + 2,
+            Pane::Facts { rows, .. } => rows.len() as u16 + 2,
+            _ => 5,
+        },
+        ML::Rows(partes) => partes.iter().map(|(_, filho)| altura_do_corpo(filho)).sum(),
+        ML::Cols(partes) => partes
+            .iter()
+            .map(|(_, filho)| altura_do_corpo(filho))
+            .max()
+            .unwrap_or(6),
+    }
+}
+
+/// Quanta altura o detalhe pede nesta largura, para a tabela ficar com o resto.
+fn altura_do_detalhe(no: &crate::painel::Layout, largura: u16) -> u16 {
+    use crate::painel::{Layout as ML, Pane};
+    match no {
+        ML::Leaf(pane) => match &**pane {
+            Pane::Facts { rows, .. } => {
+                let colunas = colunas_de_fatos(rows, largura.saturating_sub(2));
+                (rows.len().div_ceil(colunas) as u16) + 2
+            }
+            Pane::Text { lines, .. } => (lines.len() as u16 + 2).min(14),
+            Pane::Empty { .. } => 3,
+            _ => 8,
+        },
+        ML::Rows(partes) => partes
+            .iter()
+            .map(|(_, filho)| altura_do_detalhe(filho, largura))
+            .sum(),
+        ML::Cols(partes) => partes
+            .iter()
+            .map(|(_, filho)| altura_do_detalhe(filho, largura))
+            .max()
+            .unwrap_or(6),
+    }
+}
+
 /// O painel de uma execução que publica um quadro: a grade de cartões, ou um cartão em
 /// tela cheia.
 ///
@@ -3320,14 +3478,26 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
         // fechar — a seta é a navegação inteira.
         Some(card) => match card.row_detail() {
             Some(detalhe) => {
+                // Cada metade leva o que precisa para caber inteira, e o que sobrar fica
+                // em branco no fim. É melhor que dar a sobra a uma das duas: uma tabela de
+                // duas linhas esticada em quarenta afasta o detalhe do cursor que ele
+                // descreve, e um detalhe esticado é uma moldura com trinta linhas vazias.
+                // A tabela rola sozinha para manter o cursor à vista quando não couber.
+                let corpo = altura_do_corpo(&card.detail).min(partes[1].height * 3 / 5);
+                let sobra = partes[1].height.saturating_sub(corpo);
+                let detalhe_h = altura_do_detalhe(detalhe, partes[1].width).min(sobra);
                 let metades = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Fill(3), Constraint::Fill(2)])
+                    .constraints([
+                        Constraint::Length(corpo.max(6)),
+                        Constraint::Length(detalhe_h.max(4)),
+                        Constraint::Min(0),
+                    ])
                     .split(partes[1]);
-                render_layout(frame, metades[0], &card.detail, &pintor, &mut None);
-                render_layout(frame, metades[1], detalhe, &pintor, &mut None);
+                render_corpo(frame, metades[0], &card.detail, &pintor);
+                render_detalhe(frame, metades[1], detalhe, &pintor);
             }
-            None => render_layout(frame, partes[1], &card.detail, &pintor, &mut None),
+            None => render_corpo(frame, partes[1], &card.detail, &pintor),
         },
         None => {
             let desejadas: Vec<u16> = quadro.cards.iter().map(|card| card.height + 2).collect();
@@ -4401,14 +4571,25 @@ fn render_pane_facts(
     let dentro = bloco.inner(area);
     frame.render_widget(bloco, area);
 
+    frame.render_widget(Paragraph::new(fatos_em_linhas(rows, pintor)), dentro);
+}
+
+/// Os pares rótulo/valor como linhas prontas, sem moldura.
+///
+/// Fora de `render_pane_facts` porque o detalhe de uma linha desenha os mesmos fatos em
+/// duas ou três colunas dentro de **uma** moldura, e três molduras com o mesmo título uma
+/// ao lado da outra leriam como três painéis diferentes.
+fn fatos_em_linhas(
+    rows: &[(String, String, crate::invest::module::Tone)],
+    pintor: &Pintor,
+) -> Vec<Line<'static>> {
     let largura = rows
         .iter()
         .map(|(r, _, _)| r.chars().count())
         .max()
         .unwrap_or(0)
         .min(MAX_LABEL_WIDTH);
-    let linhas: Vec<Line> = rows
-        .iter()
+    rows.iter()
         .map(|(rotulo, valor, tone)| {
             // Seguido, o fato inteiro é da cor da marca — rótulo e valor. Num painel de
             // fatos não há coluna de estrela onde pôr uma, e meia linha colorida leria
@@ -4435,8 +4616,7 @@ fn render_pane_facts(
             );
             Line::from(spans)
         })
-        .collect();
-    frame.render_widget(Paragraph::new(linhas), dentro);
+        .collect()
 }
 
 fn render_pane_bars(
