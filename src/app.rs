@@ -4952,8 +4952,12 @@ impl App {
 
     /// ↑/↓ e PgUp/PgDn dentro de um cartão ampliado.
     ///
+    /// Num cartão cujas linhas têm o que dizer, a seta **anda pela tabela** e o detalhe
+    /// embaixo acompanha — é o que faz a investigação virar algo em que se navega em vez
+    /// de algo que se lê. Nos outros, ela rola o texto, que é tudo o que há ali.
+    ///
     /// A posição fica gravada no próprio cartão, e não aqui: a ferramenta reescreve o
-    /// cartão a cada volta, e um cartão que voltasse para a primeira linha toda vez seria
+    /// cartão a cada Ctrl+R, e um cartão que voltasse para a primeira linha toda vez seria
     /// ilegível justamente enquanto estivesse sendo lido.
     pub fn board_scroll(&mut self, delta: i32) {
         let Focus::Board(board) = &self.focus else {
@@ -4970,6 +4974,11 @@ impl App {
         let Some(card) = quadro.cards.get_mut(index) else {
             return;
         };
+        if card.rows() > 0 {
+            let onde = (card.row as i32 + delta).clamp(0, card.rows() as i32 - 1) as usize;
+            card.select(onde);
+            return;
+        }
         let altura = card.lines() as i32;
         card.scroll = (card.scroll as i32 + delta).clamp(0, altura.saturating_sub(1)) as u16;
         let scroll = card.scroll;
@@ -5162,10 +5171,25 @@ impl App {
     }
 
     /// Esc in the monitor: drop the search first, leave only once there's none.
+    ///
+    /// «Sair» quer dizer voltar de onde se veio, e para uma execução que tem painel o log
+    /// está atrás dele: entrou pelo Tab do painel, sai para o painel. Sair direto para a
+    /// lista faria a pessoa refazer dois passos para continuar lendo o que estava lendo.
     pub fn tool_monitor_escape(&mut self) {
         if let Focus::ToolMonitor(monitor) = &mut self.focus {
             if monitor.query.is_empty() {
-                self.focus = Focus::None;
+                let id = monitor.execution_id;
+                let tem_painel = self
+                    .tools
+                    .by_id(id)
+                    .is_some_and(|execution| execution.board().is_some());
+                self.focus = match tem_painel {
+                    true => Focus::Board(Box::new(BoardFocus {
+                        execution_id: id,
+                        card: None,
+                    })),
+                    false => Focus::None,
+                };
             } else {
                 monitor.query.clear();
                 monitor.only_matches = false;

@@ -3315,7 +3315,20 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
     let pintor = Pintor::novo(&app.marks, None);
     let mut desenhados = quadro.cards.len();
     match focus.card.and_then(|index| quadro.cards.get(index)) {
-        Some(card) => render_layout(frame, partes[1], &card.detail, &pintor, &mut None),
+        // Um cartão navegável mostra os dois: a tabela com o cursor em cima, e o que a
+        // linha sob o cursor tem a dizer embaixo. Sem tecla para abrir e sem tecla para
+        // fechar — a seta é a navegação inteira.
+        Some(card) => match card.row_detail() {
+            Some(detalhe) => {
+                let metades = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Fill(3), Constraint::Fill(2)])
+                    .split(partes[1]);
+                render_layout(frame, metades[0], &card.detail, &pintor, &mut None);
+                render_layout(frame, metades[1], detalhe, &pintor, &mut None);
+            }
+            None => render_layout(frame, partes[1], &card.detail, &pintor, &mut None),
+        },
         None => {
             let desejadas: Vec<u16> = quadro.cards.iter().map(|card| card.height + 2).collect();
             let (colunas, alturas) = grade_do_quadro(partes[1], &desejadas);
@@ -3359,8 +3372,15 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
     // onde isso é dito: um cartão que existe, tem achado e não aparece em lugar nenhum é
     // um achado perdido.
     let rodape = match focus.card {
-        Some(_) => " ↑/↓ e PgUp/PgDn rolar · Esc volta para a grade · Ctrl+T relatório · Tab log · Ctrl+R investigar de novo"
-            .to_string(),
+        Some(index) => match quadro.cards.get(index).map(|card| card.rows() > 0) {
+            Some(true) => format!(
+                " ↑/↓ andar pelas linhas ({} de {}) · Esc volta para a grade · Ctrl+T relatório · Ctrl+R investigar de novo",
+                quadro.cards[index].row + 1,
+                quadro.cards[index].rows()
+            ),
+            _ => " ↑/↓ e PgUp/PgDn rolar · Esc volta para a grade · Ctrl+T relatório · Tab log · Ctrl+R investigar de novo"
+                .to_string(),
+        },
         None if desenhados < quadro.cards.len() => {
             let resto: Vec<String> = quadro.cards[desenhados..]
                 .iter()

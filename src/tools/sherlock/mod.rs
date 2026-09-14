@@ -604,6 +604,10 @@ pub struct Report<'a> {
     logged: HashSet<String>,
 }
 
+/// O que uma linha da listagem tem por trás: os pares rótulo/valor, e um texto longo
+/// quando existe um (o SQL inteiro, a definição inteira de um índice).
+type Detalhe = (Vec<(String, String, Tone)>, Vec<String>);
+
 /// A card being filled in.
 struct Building {
     key: String,
@@ -613,6 +617,9 @@ struct Building {
     /// A listagem da seção, em colunas. Vazia numa seção que não tem o que tabular.
     headers: Vec<String>,
     rows: Vec<Row>,
+    /// O que cada linha tem por trás: pares rótulo/valor e, quando há, um texto longo
+    /// (o SQL inteiro de uma query, a definição inteira de um índice).
+    detalhes: Vec<Detalhe>,
     /// A prosa: o que a listagem quer dizer, e o que fazer a respeito.
     lines: Vec<(String, Tone)>,
     tone: Tone,
@@ -668,6 +675,7 @@ impl<'a> Report<'a> {
             facts: Vec::new(),
             headers: Vec::new(),
             rows: Vec::new(),
+            detalhes: Vec::new(),
             lines: Vec::new(),
             tone: Tone::Normal,
         });
@@ -722,19 +730,62 @@ impl<'a> Report<'a> {
         self.log(format!("      {texto}"));
     }
 
-    /// Uma linha da listagem que também merece aparecer no cartão da grade.
-    pub fn cells_headline(&mut self, cells: Vec<String>, tone: Tone) {
-        if let Some(open) = &mut self.open
-            && open.facts.len() < 8
-        {
-            let (primeira, resto) = cells.split_at(1.min(cells.len()));
-            open.facts.push((
-                primeira.first().cloned().unwrap_or_default(),
-                resto.join("  "),
-                tone,
+    /// Uma linha da listagem que carrega, por trás, tudo o que se sabe sobre ela.
+    ///
+    /// É o que faz a tabela virar algo em que se navega: a seta move o cursor e estes
+    /// pares aparecem embaixo, sem nenhuma ida nova ao servidor. Tudo já foi lido na
+    /// investigação — o custo de saber mais sobre uma linha é zero depois que a leitura
+    /// aconteceu, e é por isso que vale ler mais de uma vez só.
+    pub fn cells_deep(
+        &mut self,
+        cells: Vec<String>,
+        tone: Tone,
+        fatos: Vec<(&str, String)>,
+        texto: Vec<String>,
+    ) {
+        if let Some(open) = &mut self.open {
+            // As linhas e os detalhes andam juntos pelo índice, então uma linha sem
+            // detalhe ainda ocupa um lugar na lista.
+            while open.detalhes.len() < open.rows.len() {
+                open.detalhes.push((Vec::new(), Vec::new()));
+            }
+            open.detalhes.push((
+                fatos
+                    .into_iter()
+                    .filter(|(_, valor)| !valor.trim().is_empty())
+                    .map(|(rotulo, valor)| (rotulo.to_string(), valor, Tone::Normal))
+                    .collect(),
+                texto,
             ));
         }
         self.cells(cells, tone);
+    }
+
+    /// Uma linha da listagem que também merece aparecer no cartão da grade.
+    pub fn cells_headline(&mut self, cells: Vec<String>, tone: Tone) {
+        self.cells(cells, tone);
+        self.destacar();
+    }
+
+    /// Promove a última linha da listagem ao cartão da grade.
+    ///
+    /// Separado de `cells` porque uma linha pode ter sido escrita por `cells_deep`, que já
+    /// carrega o detalhe junto: chamar os dois seria escrever a mesma linha duas vezes na
+    /// tabela, que é exatamente o que acontecia antes disto existir.
+    pub fn destacar(&mut self) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        let (Some(linha), true) = (open.rows.last(), open.facts.len() < 8) else {
+            return;
+        };
+        let (primeira, resto) = linha.cells.split_at(1.min(linha.cells.len()));
+        let fato = (
+            primeira.first().cloned().unwrap_or_default(),
+            resto.join("  "),
+            linha.tone,
+        );
+        open.facts.push(fato);
     }
 
     /// A row of a listing, indented under whatever introduced it.
@@ -892,7 +943,20 @@ impl<'a> Report<'a> {
             title: marked,
             rows: open.facts,
         };
-        card.detail = detail(open.title, open.headers, open.rows, open.lines);
+        let linhas_da_tabela = open.rows.len();
+        card.detail = detail(open.title.clone(), open.headers, open.rows, open.lines);
+        // Uma linha sem detalhe declarado ainda precisa de um lugar na lista, senão o
+        // cursor da décima linha leria o detalhe da terceira.
+        if !open.detalhes.is_empty() {
+            open.detalhes
+                .resize_with(linhas_da_tabela, || (Vec::new(), Vec::new()));
+            card.rows_detail = open
+                .detalhes
+                .into_iter()
+                .map(|(fatos, texto)| row_detail(&open.title, fatos, texto))
+                .collect();
+            card.select(0);
+        }
         lock_board(&self.board).put(card);
     }
 
@@ -1091,6 +1155,42 @@ impl<'a> Report<'a> {
 
     fn tally(&self) -> String {
         format!("{} graves · {} avisos", self.graves, self.avisos)
+    }
+}
+
+/// Monta o painel de uma linha: os fatos dela, e o texto longo quando há um.
+fn row_detail(titulo: &str, fatos: Vec<(String, String, Tone)>, texto: Vec<String>) -> Layout {
+    if fatos.is_empty() && texto.is_empty() {
+        return Layout::one(Pane::Empty {
+            title: titulo.to_string(),
+            note: "esta linha não tem mais nada por trás".to_string(),
+        });
+    }
+    let fatos_pane = Pane::Facts {
+        title: titulo.to_string(),
+        rows: fatos,
+    };
+    if texto.is_empty() {
+        return Layout::one(fatos_pane);
+    }
+    let altura_fatos = match &fatos_pane {
+        Pane::Facts { rows, .. } => rows.len() as u16 + 2,
+        _ => 4,
+    };
+    let texto_pane = Pane::Text {
+        title: titulo.to_string(),
+        lines: texto
+            .into_iter()
+            .map(|linha| (linha, Tone::Normal))
+            .collect(),
+        scroll: 0,
+    };
+    match altura_fatos {
+        0..=2 => Layout::one(texto_pane),
+        altura => Layout::rows(vec![
+            (altura, Layout::one(fatos_pane)),
+            (6, Layout::one(texto_pane)),
+        ]),
     }
 }
 

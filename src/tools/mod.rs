@@ -850,6 +850,12 @@ impl Board {
                     .scroll
                     .min(card.lines().saturating_sub(1) as u16),
             );
+            // O cursor também sobrevive à reescrita: quem estava lendo a décima linha
+            // continua nela depois de um Ctrl+R, e não volta para o topo.
+            let onde = self.cards[old].row;
+            if card.rows() > 0 {
+                card.select(onde.min(card.rows() - 1));
+            }
             self.cards[old] = card;
             return;
         }
@@ -869,6 +875,15 @@ pub struct Card {
     /// it means — and a table is the right shape for the first and the wrong one for the
     /// second.
     pub detail: crate::painel::Layout,
+    /// O que cada linha da tabela tem a dizer por conta própria, na ordem das linhas.
+    ///
+    /// É o que transforma a tabela em algo navegável: a seta move o cursor e isto aparece
+    /// embaixo, sem tecla nenhuma e sem outra ida ao servidor — tudo já foi lido na
+    /// investigação. Vazio numa seção cujas linhas não têm mais nada por trás.
+    pub rows_detail: Vec<crate::painel::Layout>,
+    /// Em que linha o cursor está. Guardado no cartão, como a rolagem, para sobreviver a
+    /// sair e voltar.
+    pub row: usize,
     /// How many rows the card asks for in the grid, content only — the frame is added
     /// by whoever draws it.
     pub height: u16,
@@ -896,8 +911,41 @@ impl Card {
             title,
             height: 5,
             scroll: 0,
+            rows_detail: Vec::new(),
+            row: 0,
             tone: crate::painel::Tone::Normal,
         }
+    }
+
+    /// Quantas linhas dá para navegar.
+    pub fn rows(&self) -> usize {
+        self.rows_detail.len()
+    }
+
+    /// Move o cursor e diz à tabela qual linha pintar.
+    pub fn select(&mut self, at: usize) {
+        fn marcar(no: &mut crate::painel::Layout, at: usize) {
+            match no {
+                crate::painel::Layout::Leaf(pane) => {
+                    if let crate::painel::Pane::Table { selected, .. } = &mut **pane {
+                        *selected = Some(at);
+                    }
+                }
+                crate::painel::Layout::Rows(partes) | crate::painel::Layout::Cols(partes) => {
+                    for (_, filho) in partes {
+                        marcar(filho, at);
+                    }
+                }
+            }
+        }
+        self.row = at.min(self.rows().saturating_sub(1));
+        let row = self.row;
+        marcar(&mut self.detail, row);
+    }
+
+    /// O detalhe da linha em que o cursor está.
+    pub fn row_detail(&self) -> Option<&crate::painel::Layout> {
+        self.rows_detail.get(self.row)
     }
 
     /// How many lines the detail's prose has — what the scroll is clamped against. A

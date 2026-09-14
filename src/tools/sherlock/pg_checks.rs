@@ -21,7 +21,6 @@ use super::{
 use crate::painel::Tone;
 
 /// How many rows of any one listing are worth reading in a terminal.
-const TOP: usize = 12;
 /// Below this, a query is not worth a line of its own: the card would drown in the
 /// application's ordinary traffic and hide the one statement that matters.
 const SLOW_MS: f64 = 100.0;
@@ -163,7 +162,7 @@ impl Session {
             if report.stopping() {
                 return Ok(());
             }
-            sizes(&mut self.conn, report)?;
+            tables(&mut self.conn, report)?;
             bloat(&mut self.conn, report)?;
             foreign_keys(&mut self.conn, report)?;
             sequences(&mut self.conn, report)?;
@@ -288,7 +287,12 @@ impl Session {
                    COALESCE(wait_event_type,'') AS espera_tipo, COALESCE(wait_event,'') AS espera, \
                    COALESCE(usename,'') AS usuario, COALESCE(application_name,'') AS app, \
                    array_to_string(pg_blocking_pids(pid), ',') AS bloqueadores, \
-                   left(query, 400) AS query \
+                   COALESCE(client_addr::text, 'local') AS origem, \
+                   COALESCE(backend_type, '') AS tipo, \
+                   EXTRACT(epoch FROM now() - backend_start) AS conectado_ha, \
+                   EXTRACT(epoch FROM now() - xact_start) AS transacao_ha, \
+                   COALESCE(backend_xid::text, '') AS xid, \
+                   left(query, 2000) AS query \
                    FROM pg_stat_activity \
                    WHERE state = 'active' AND query_start IS NOT NULL AND pid <> pg_backend_pid() \
                    ORDER BY query_start";
@@ -341,7 +345,7 @@ impl Session {
                 );
                 continue;
             }
-            report.cells_headline(
+            report.cells_deep(
                 vec![
                     duration(age),
                     row.get("pid").to_string(),
@@ -354,6 +358,46 @@ impl Session {
                 } else {
                     Tone::Normal
                 },
+                vec![
+                    ("pid", row.get("pid").to_string()),
+                    ("usuário", row.get("usuario").to_string()),
+                    ("aplicação", row.get("app").to_string()),
+                    ("origem", row.get("origem").to_string()),
+                    ("tipo de processo", row.get("tipo").to_string()),
+                    ("rodando há", duration(age)),
+                    (
+                        "transação aberta há",
+                        match row.get("transacao_ha") {
+                            "" => String::new(),
+                            _ => duration(row.num("transacao_ha")),
+                        },
+                    ),
+                    ("conectado há", duration(row.num("conectado_ha"))),
+                    (
+                        "esperando",
+                        match row.get("espera") {
+                            "" => "nada — está usando CPU".to_string(),
+                            evento => format!("{}/{evento}", row.get("espera_tipo")),
+                        },
+                    ),
+                    (
+                        "travado por",
+                        match row.get("bloqueadores") {
+                            "" => String::new(),
+                            pids => format!("pid(s) {pids}"),
+                        },
+                    ),
+                    (
+                        "id da transação",
+                        match row.get("xid") {
+                            "" => "nenhuma escrita ainda".to_string(),
+                            xid => xid.to_string(),
+                        },
+                    ),
+                    ("tabelas que lê", tables_in(row.get("query")).join(", ")),
+                    ("colunas filtradas", hints(row.get("query")).join(", ")),
+                ],
+                quebrar(row.get("query"), 150),
             );
         }
         if running == 0 {
@@ -490,11 +534,10 @@ impl Session {
                     lento if lento >= SLOW_MS => Tone::Aviso,
                     _ => Tone::Normal,
                 };
+                report.cells_deep(celulas, tom, recente.fatos(), quebrar(&recente.query, 150));
                 // As primeiras também no cartão da grade; o resto só na tabela cheia.
                 if posicao < 6 {
-                    report.cells_headline(celulas, tom);
-                } else {
-                    report.cells(celulas, tom);
+                    report.destacar();
                 }
             }
         }
@@ -1066,19 +1109,32 @@ fn activity(
     Ok(reset)
 }
 
-/// Um índice como o catálogo o descreve, para a comparação de redundância.
+/// Um índice como o catálogo o descreve.
 struct Indice {
     nome: String,
+    tabela: String,
     /// As colunas como `indkey` as guarda: números separados por espaço, o que faz de
     /// «é prefixo de» uma comparação de texto.
     colunas: String,
+    definicao: String,
     /// O método de acesso — dois índices de tipos diferentes não se substituem.
     tipo: String,
     unico: bool,
+    primaria: bool,
     parcial: bool,
+    valido: bool,
     bytes: f64,
+    usos: f64,
+    lidas: f64,
+    buscadas: f64,
 }
 
+/// Todo índice da base numa tabela só: tamanho, uso, e o que ele é.
+///
+/// Uma linha por índice, com o que se sabe dele por trás — a definição inteira, quantas
+/// linhas ele já entregou, quanto ele custa em disco. É a seção em que mais se navega, e
+/// por isso é a que mais carrega detalhe: a pergunta «este índice vale o que custa?» se
+/// responde olhando cinco números que não cabem numa linha de tabela.
 fn indexes(
     conn: &mut pg::Conn,
     report: &mut Report,
@@ -1087,157 +1143,230 @@ fn indexes(
 ) -> Result<(), String> {
     report.section("Índices");
 
-    let sql = "SELECT n.nspname || '.' || c.relname AS indice, t.relname AS tabela \
-               FROM pg_index i \
-               JOIN pg_class c ON c.oid = i.indexrelid \
-               JOIN pg_class t ON t.oid = i.indrelid \
-               JOIN pg_namespace n ON n.oid = c.relnamespace \
-               WHERE NOT i.indisvalid";
-    if let Some(table) = ask(conn, report, "índices inválidos", sql)? {
-        for row in table.iter() {
-            report.grave(
-                format!(
-                    "índice {} (tabela {}) está inválido: ninguém o usa e toda escrita na tabela continua pagando por ele",
-                    row.get("indice"),
-                    row.get("tabela")
-                ),
-                "sobra de um CREATE INDEX CONCURRENTLY que falhou. Confira e recrie — o REINDEX/DROP é decisão sua",
-            );
-        }
-    }
-
-    let sql = "SELECT s.schemaname || '.' || s.relname AS tabela, s.indexrelname AS indice, \
-               s.idx_scan, pg_relation_size(s.indexrelid) AS bytes \
-               FROM pg_stat_user_indexes s \
-               JOIN pg_index i ON i.indexrelid = s.indexrelid \
-               WHERE s.idx_scan = 0 AND NOT i.indisunique AND NOT i.indisprimary \
-               AND pg_relation_size(s.indexrelid) > 1048576 \
-               ORDER BY pg_relation_size(s.indexrelid) DESC LIMIT 20";
-    if let Some(table) = ask(conn, report, "índices sem uso", sql)? {
-        if table.is_empty() {
-            report.ok("todo índice não-único desta base já foi usado ao menos uma vez");
-        } else {
-            let total: f64 = table.iter().map(|row| row.num("bytes")).sum();
-            let headline = format!(
-                "{} índice(s) nunca usados ocupando {} ({})",
-                table.len(),
-                bytes(total),
-                reset.describe()
-            );
-            if reset.trustworthy() {
-                report.aviso(
-                    headline,
-                    "cada um deles é espaço, e mais lentidão em todo INSERT e UPDATE da tabela. Confira se não servem a um relatório mensal antes de largar",
-                );
-            } else {
-                report.line(format!(
-                    "{headline} — contadores novos demais para concluir alguma coisa"
-                ));
-            }
-            report.table(&["tamanho", "índice", "tabela", "situação"]);
-            for row in table.iter() {
-                report.cells(
-                    vec![
-                        bytes(row.num("bytes")),
-                        row.get("indice").to_string(),
-                        row.get("tabela").to_string(),
-                        "nunca usado".to_string(),
-                    ],
-                    Tone::Aviso,
-                );
-            }
-        }
-    }
-
-    // Redundancy is a catalogue fact, not a statistic: an index on (a) next to an index
-    // on (a, b) is dead weight whatever the counters say, because anything the first can
-    // answer the second answers too.
     let sql = "SELECT n.nspname || '.' || t.relname AS tabela, c.relname AS indice, \
                i.indkey::text AS colunas, am.amname AS tipo, \
-               i.indisunique AS unico, i.indisprimary AS primaria, \
+               i.indisunique AS unico, i.indisprimary AS primaria, i.indisvalid AS valido, \
                (i.indpred IS NOT NULL) AS parcial, \
                pg_relation_size(i.indexrelid) AS bytes, \
-               pg_get_indexdef(i.indexrelid) AS definicao \
+               pg_get_indexdef(i.indexrelid) AS definicao, \
+               COALESCE(s.idx_scan, 0) AS usos, \
+               COALESCE(s.idx_tup_read, 0) AS lidas, \
+               COALESCE(s.idx_tup_fetch, 0) AS buscadas \
                FROM pg_index i \
                JOIN pg_class c ON c.oid = i.indexrelid \
                JOIN pg_class t ON t.oid = i.indrelid \
                JOIN pg_namespace n ON n.oid = t.relnamespace \
                JOIN pg_am am ON am.oid = c.relam \
-               WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND i.indisvalid \
-               ORDER BY 1, 2";
-    if let Some(table) = ask(conn, report, "definição dos índices", sql)? {
-        let mut by_table: HashMap<String, Vec<Indice>> = HashMap::new();
-        for row in table.iter() {
-            by_table
-                .entry(row.get("tabela").to_string())
-                .or_default()
-                .push(Indice {
-                    nome: row.get("indice").to_string(),
-                    colunas: row.get("colunas").to_string(),
-                    tipo: row.get("tipo").to_string(),
-                    unico: row.flag("unico") || row.flag("primaria"),
-                    parcial: row.flag("parcial"),
-                    bytes: row.num("bytes"),
-                });
-        }
-        let mut redundant: Vec<(String, String, f64)> = Vec::new();
-        for (table_name, list) in &by_table {
-            for indice in list {
-                // A unique index earns its place by the constraint it enforces, and an
-                // expression index (column 0 in indkey) can't be compared this way.
-                if indice.unico
-                    || indice.parcial
-                    || indice.colunas.split(' ').any(|column| column == "0")
-                {
-                    continue;
-                }
-                let prefixo = format!("{} ", indice.colunas);
-                if let Some(maior) = list.iter().find(|outro| {
-                    outro.nome != indice.nome
-                        && outro.tipo == indice.tipo
-                        && !outro.parcial
-                        && outro.colunas.starts_with(&prefixo)
-                }) {
-                    redundant.push((
-                        format!("{table_name}.{}", indice.nome),
-                        maior.nome.clone(),
-                        indice.bytes,
-                    ));
-                }
-            }
-        }
-        redundant.sort_by(|a, b| b.2.total_cmp(&a.2));
-        if redundant.is_empty() {
-            report.ok("nenhum índice é prefixo de outro — não há duplicação óbvia");
-        } else {
-            let total: f64 = redundant.iter().map(|entry| entry.2).sum();
-            report.aviso(
-                format!(
-                    "{} índice(s) redundantes, {} no total: as colunas de cada um já são o começo de outro índice",
-                    redundant.len(),
-                    bytes(total)
-                ),
-                "o índice maior atende às mesmas buscas. O menor só custa escrita e espaço",
-            );
-            report.table(&["tamanho", "índice", "tabela", "situação"]);
-            for (name, covering, size) in redundant.iter().take(TOP) {
-                let (tabela, indice) = name.rsplit_once('.').unwrap_or(("", name.as_str()));
-                report.cells(
-                    vec![
-                        bytes(*size),
-                        indice.to_string(),
-                        tabela.to_string(),
-                        format!("redundante — coberto por {covering}"),
-                    ],
-                    Tone::Aviso,
-                );
-            }
-        }
+               LEFT JOIN pg_stat_user_indexes s ON s.indexrelid = i.indexrelid \
+               WHERE n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
+               ORDER BY pg_relation_size(i.indexrelid) DESC";
+    let Some(table) = ask(conn, report, "índices", sql)? else {
+        return Ok(());
+    };
+    let indices: Vec<Indice> = table
+        .iter()
+        .map(|row| Indice {
+            nome: row.get("indice").to_string(),
+            tabela: row.get("tabela").to_string(),
+            colunas: row.get("colunas").to_string(),
+            definicao: row.get("definicao").to_string(),
+            tipo: row.get("tipo").to_string(),
+            unico: row.flag("unico"),
+            primaria: row.flag("primaria"),
+            parcial: row.flag("parcial"),
+            valido: row.flag("valido"),
+            bytes: row.num("bytes"),
+            usos: row.num("usos"),
+            lidas: row.num("lidas"),
+            buscadas: row.num("buscadas"),
+        })
+        .collect();
+    if indices.is_empty() {
+        report.line("nenhum índice fora dos esquemas do sistema");
+        return Ok(());
+    }
 
-        if depth >= Depth::Profundo {
-            let total: f64 = table.iter().map(|row| row.num("bytes")).sum();
-            report.field("espaço total em índices", bytes(total));
+    // Redundância é fato de catálogo, não estatística: um índice em (a) ao lado de um em
+    // (a, b) é peso morto diga o contador o que disser, porque tudo que o primeiro responde
+    // o segundo responde também.
+    let mut coberto: HashMap<String, String> = HashMap::new();
+    for indice in &indices {
+        if indice.unico
+            || indice.primaria
+            || indice.parcial
+            || indice.colunas.split(' ').any(|c| c == "0")
+        {
+            continue;
         }
+        let prefixo = format!("{} ", indice.colunas);
+        if let Some(maior) = indices.iter().find(|outro| {
+            outro.nome != indice.nome
+                && outro.tabela == indice.tabela
+                && outro.tipo == indice.tipo
+                && !outro.parcial
+                && outro.colunas.starts_with(&prefixo)
+        }) {
+            coberto.insert(indice.nome.clone(), maior.nome.clone());
+        }
+    }
+
+    let total: f64 = indices.iter().map(|indice| indice.bytes).sum();
+    report.field(
+        "ao todo",
+        format!(
+            "{} índices ocupando {} · contadores {}",
+            indices.len(),
+            bytes(total),
+            reset.describe()
+        ),
+    );
+    report.table(&["tamanho", "índice", "tabela", "usos", "situação"]);
+    let (mut sem_uso, mut sem_uso_bytes) = (0usize, 0.0);
+    for indice in &indices {
+        let mut situacao: Vec<String> = Vec::new();
+        if indice.primaria {
+            situacao.push("chave primária".to_string());
+        } else if indice.unico {
+            situacao.push("único".to_string());
+        }
+        if indice.parcial {
+            situacao.push("parcial".to_string());
+        }
+        if !indice.valido {
+            situacao.push("INVÁLIDO".to_string());
+        }
+        if let Some(maior) = coberto.get(&indice.nome) {
+            situacao.push(format!("coberto por {maior}"));
+        }
+        if indice.usos == 0.0 && !indice.primaria && !indice.unico {
+            situacao.push("nunca usado".to_string());
+            sem_uso += 1;
+            sem_uso_bytes += indice.bytes;
+        }
+        let tom = match (
+            indice.valido,
+            indice.usos == 0.0 && !indice.primaria && !indice.unico,
+        ) {
+            (false, _) => Tone::Ruim,
+            (_, true) => Tone::Aviso,
+            _ => match coberto.contains_key(&indice.nome) {
+                true => Tone::Aviso,
+                false => Tone::Normal,
+            },
+        };
+        report.cells_deep(
+            vec![
+                bytes(indice.bytes),
+                indice.nome.clone(),
+                indice.tabela.clone(),
+                count(indice.usos),
+                situacao.join(" · "),
+            ],
+            tom,
+            vec![
+                ("tabela", indice.tabela.clone()),
+                ("método", indice.tipo.clone()),
+                ("tamanho", bytes(indice.bytes)),
+                ("varreduras", count(indice.usos)),
+                ("linhas entregues", count(indice.lidas)),
+                (
+                    "linhas buscadas na tabela",
+                    format!(
+                        "{} ({})",
+                        count(indice.buscadas),
+                        match indice.lidas {
+                            0.0 => "—".to_string(),
+                            lidas => format!("{:.0}% do que leu", 100.0 * indice.buscadas / lidas),
+                        }
+                    ),
+                ),
+                (
+                    "por varredura",
+                    match indice.usos {
+                        0.0 => String::new(),
+                        usos => format!("{} linhas", count(indice.lidas / usos)),
+                    },
+                ),
+                (
+                    "único",
+                    (if indice.unico { "sim" } else { "não" }).to_string(),
+                ),
+                (
+                    "chave primária",
+                    (if indice.primaria { "sim" } else { "não" }).to_string(),
+                ),
+                (
+                    "parcial",
+                    (if indice.parcial { "sim" } else { "não" }).to_string(),
+                ),
+                (
+                    "válido",
+                    (if indice.valido { "sim" } else { "NÃO" }).to_string(),
+                ),
+                (
+                    "coberto por",
+                    coberto.get(&indice.nome).cloned().unwrap_or_default(),
+                ),
+            ],
+            vec![format!("{};", indice.definicao)],
+        );
+    }
+
+    for indice in indices.iter().filter(|indice| !indice.valido) {
+        report.grave(
+            format!(
+                "índice {} (tabela {}) está inválido: ninguém o usa e toda escrita na tabela continua pagando por ele",
+                indice.nome, indice.tabela
+            ),
+            "sobra de um CREATE INDEX CONCURRENTLY que falhou. Confira e recrie — o REINDEX/DROP é decisão sua",
+        );
+    }
+    if sem_uso == 0 {
+        report.ok("todo índice não-único desta base já foi usado ao menos uma vez");
+    } else {
+        let frase = format!(
+            "{sem_uso} índice(s) nunca usados ocupando {} ({})",
+            bytes(sem_uso_bytes),
+            reset.describe()
+        );
+        if reset.trustworthy() {
+            report.aviso(
+                frase,
+                "cada um deles é espaço, e mais lentidão em todo INSERT e UPDATE da tabela. Confira se não servem a um relatório mensal antes de largar",
+            );
+        } else {
+            report.line(format!(
+                "{frase} — contadores novos demais para concluir alguma coisa"
+            ));
+        }
+    }
+    if coberto.is_empty() {
+        report.ok("nenhum índice é prefixo de outro — não há duplicação óbvia");
+    } else {
+        let desperdicio: f64 = indices
+            .iter()
+            .filter(|indice| coberto.contains_key(&indice.nome))
+            .map(|indice| indice.bytes)
+            .sum();
+        report.aviso(
+            format!(
+                "{} índice(s) redundantes, {} no total: as colunas de cada um já são o começo de outro índice",
+                coberto.len(),
+                bytes(desperdicio)
+            ),
+            "o índice maior atende às mesmas buscas. O menor só custa escrita e espaço",
+        );
+    }
+    if depth >= Depth::Profundo {
+        let escrita: f64 = indices
+            .iter()
+            .filter(|i| !i.primaria)
+            .map(|i| i.bytes)
+            .sum();
+        report.field(
+            "peso da escrita",
+            format!("{} fora a chave primária", bytes(escrita)),
+        );
     }
     Ok(())
 }
@@ -1252,6 +1381,16 @@ struct Stmt {
     miss: f64,
     temp: f64,
     query: String,
+    /// O resto do que o `pg_stat_statements` guarda, e que não cabe numa linha de tabela:
+    /// o pior caso, o desvio, as páginas sujas, o WAL. É o que aparece quando o cursor
+    /// para em cima da linha.
+    min: f64,
+    max: f64,
+    stddev: f64,
+    sujas: f64,
+    escritas: f64,
+    wal: f64,
+    id: String,
 }
 
 /// O que falta para haver `pg_stat_statements`, e o que fazer a respeito.
@@ -1272,6 +1411,91 @@ fn instalar_statements(settings: &HashMap<String, Setting>) -> String {
         return "a biblioteca já está carregada neste servidor: falta só `CREATE EXTENSION pg_stat_statements;` nesta base — um comando, sem reinício e sem janela de manutenção".to_string();
     }
     "dois passos: `shared_preload_libraries = 'pg_stat_statements'` no servidor (no RDS/Aurora é o parameter group, no Cloud SQL é uma flag, no Azure é um server parameter — nos três exige reinício), e depois `CREATE EXTENSION pg_stat_statements;` em cada base que você quiser enxergar".to_string()
+}
+
+impl Stmt {
+    /// Tudo que se sabe desta forma de query, para quando o cursor parar em cima dela.
+    fn fatos(&self, share: f64) -> Vec<(&'static str, String)> {
+        let por_execucao = |valor: f64| match self.calls {
+            0.0 => String::new(),
+            calls => count(valor / calls),
+        };
+        vec![
+            ("identificador", self.id.clone()),
+            ("execuções", count(self.calls)),
+            (
+                "tempo somado",
+                format!("{} ({share:.1}% do banco)", millis(self.total)),
+            ),
+            ("média por execução", millis(self.mean)),
+            (
+                "melhor e pior caso",
+                match self.max {
+                    0.0 => String::new(),
+                    _ => format!("{} … {}", millis(self.min), millis(self.max)),
+                },
+            ),
+            (
+                "desvio",
+                match self.stddev {
+                    0.0 => String::new(),
+                    desvio => format!(
+                        "{} — {}",
+                        millis(desvio),
+                        match desvio > self.mean {
+                            true =>
+                                "o tempo varia mais que a própria média: o plano muda conforme o parâmetro",
+                            false => "tempo estável entre execuções",
+                        }
+                    ),
+                },
+            ),
+            ("linhas devolvidas", count(self.rows)),
+            ("linhas por execução", por_execucao(self.rows)),
+            (
+                "páginas do cache",
+                format!(
+                    "{} acertos, {} do disco ({:.1}% em cache)",
+                    count(self.hit),
+                    count(self.miss),
+                    100.0 * self.hit / (self.hit + self.miss).max(1.0)
+                ),
+            ),
+            ("lido do disco", bytes(self.miss * 8192.0)),
+            (
+                "páginas sujadas",
+                match self.sujas {
+                    0.0 => String::new(),
+                    sujas => format!(
+                        "{} ({} escritas pela própria query)",
+                        count(sujas),
+                        count(self.escritas)
+                    ),
+                },
+            ),
+            (
+                "derramado em disco",
+                match self.temp {
+                    0.0 => String::new(),
+                    temp => bytes(temp * 8192.0),
+                },
+            ),
+            (
+                "WAL gerado",
+                match self.wal {
+                    0.0 => String::new(),
+                    wal => bytes(wal),
+                },
+            ),
+            ("tabelas que lê", tables_in(&self.query).join(", ")),
+            ("colunas filtradas", hints(&self.query).join(", ")),
+        ]
+    }
+
+    /// O texto da query, quebrado para caber na tela sem perder nada.
+    fn texto(&self) -> Vec<String> {
+        quebrar(&self.query, 150)
+    }
 }
 
 /// Whether the timing columns are the 13+ names. The rename split `total_time` into
@@ -1302,10 +1526,22 @@ fn statements(
     }
 
     let (total_column, mean_column) = statement_columns(version);
+    // Os nomes das colunas de pior caso e desvio mudaram no 13 junto com os de tempo
+    // total, e o WAL por statement só existe de lá para cá.
+    let (min_col, max_col, stddev_col) = match version >= 130_000 {
+        true => ("min_exec_time", "max_exec_time", "stddev_exec_time"),
+        false => ("min_time", "max_time", "stddev_time"),
+    };
+    let wal_col = match version >= 130_000 {
+        true => "wal_bytes::float8",
+        false => "0",
+    };
     let sql = format!(
         "SELECT COALESCE(queryid::text,'') AS id, calls, rows, \
          {total_column} AS total, {mean_column} AS media, \
+         {min_col} AS minimo, {max_col} AS maximo, {stddev_col} AS desvio, \
          shared_blks_hit AS hit, shared_blks_read AS miss, temp_blks_written AS temp, \
+         shared_blks_dirtied AS sujas, shared_blks_written AS escritas, {wal_col} AS wal, \
          query FROM pg_stat_statements \
          WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
          AND calls > 0 ORDER BY {total_column} DESC LIMIT 200"
@@ -1325,6 +1561,13 @@ fn statements(
             miss: row.num("miss"),
             temp: row.num("temp"),
             query: row.get("query").to_string(),
+            min: row.num("minimo"),
+            max: row.num("maximo"),
+            stddev: row.num("desvio"),
+            sujas: row.num("sujas"),
+            escritas: row.num("escritas"),
+            wal: row.num("wal"),
+            id: row.get("id").to_string(),
         })
         .collect();
     if statements.is_empty() {
@@ -1344,19 +1587,27 @@ fn statements(
         ),
     );
 
-    report.table(&["% do tempo", "somado", "execuções", "média", "query"]);
-    for stmt in statements.iter().take(15) {
+    report.table(&[
+        "% do tempo",
+        "somado",
+        "execuções",
+        "média",
+        "pior",
+        "query",
+    ]);
+    for stmt in statements.iter() {
         let share = if grand_total > 0.0 {
             100.0 * stmt.total / grand_total
         } else {
             0.0
         };
-        report.cells(
+        report.cells_deep(
             vec![
                 format!("{share:.1}%"),
                 millis(stmt.total),
                 count(stmt.calls),
                 millis(stmt.mean),
+                millis(stmt.max),
                 one_line(&stmt.query, 160),
             ],
             match stmt.mean {
@@ -1364,6 +1615,8 @@ fn statements(
                 lento if lento >= SLOW_MS => Tone::Aviso,
                 _ => Tone::Normal,
             },
+            stmt.fatos(share),
+            stmt.texto(),
         );
         // One statement owning a third of the server is not automatically wrong — it may
         // be the whole application — but it is always the right place to look first.
@@ -1601,7 +1854,7 @@ fn indexed_columns(
                JOIN pg_class t ON t.oid = i.indrelid \
                JOIN pg_namespace n ON n.oid = t.relnamespace \
                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] \
-               WHERE i.indisvalid AND n.nspname NOT IN ('pg_catalog','information_schema')";
+               WHERE i.indisvalid AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')";
     let mut map: HashMap<String, HashSet<String>> = HashMap::new();
     if let Some(table) = ask(conn, report, "colunas indexadas", sql)? {
         for row in table.iter() {
@@ -1710,6 +1963,28 @@ fn tables_in(query: &str) -> Vec<String> {
         .filter(|capture| capture.get(2).is_none())
         .map(|capture| capture[1].to_ascii_lowercase())
         .collect()
+}
+
+/// Quebra um texto longo em linhas que cabem na tela, sem perder nada dele.
+///
+/// Diferente de `one_line`, que corta: aqui nada é jogado fora, porque o lugar em que isto
+/// é usado é justamente o detalhe — onde alguém foi ver a query inteira.
+fn quebrar(texto: &str, largura: usize) -> Vec<String> {
+    let mut linhas = Vec::new();
+    let mut atual = String::new();
+    for palavra in texto.split_whitespace() {
+        if atual.chars().count() + palavra.chars().count() + 1 > largura && !atual.is_empty() {
+            linhas.push(std::mem::take(&mut atual));
+        }
+        if !atual.is_empty() {
+            atual.push(' ');
+        }
+        atual.push_str(palavra);
+    }
+    if !atual.is_empty() {
+        linhas.push(atual);
+    }
+    linhas
 }
 
 /// An index suggestion for one table, taken from the statements that actually read it.
@@ -2045,54 +2320,261 @@ fn checkpoints(conn: &mut pg::Conn, report: &mut Report, version: i64) -> Result
     Ok(())
 }
 
-fn sizes(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
-    report.section("Volumes");
+/// Cada tabela da base, com tudo o que se sabe dela.
+///
+/// É a seção mais navegável da investigação: a linha traz o tamanho e o movimento, e o
+/// detalhe traz a anatomia — colunas com tipo, quantos valores distintos cada uma tem,
+/// quanto dela é nulo, quanto ocupa, mais o histórico de vacuum e a proporção entre ler
+/// por índice e ler tudo. É o que um DBA pede quando alguém diz «esta tabela está
+/// estranha».
+fn tables(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
+    report.section("Tabelas");
     let sql = "SELECT n.nspname || '.' || c.relname AS tabela, \
                pg_total_relation_size(c.oid) AS total, \
                pg_relation_size(c.oid) AS dados, \
                pg_indexes_size(c.oid) AS indices, \
                COALESCE(pg_total_relation_size(c.reltoastrelid), 0) AS toast, \
-               c.reltuples AS linhas \
+               c.reltuples AS linhas, c.relpages AS paginas, \
+               COALESCE(t.n_live_tup, 0) AS vivas, COALESCE(t.n_dead_tup, 0) AS mortas, \
+               COALESCE(t.seq_scan, 0) AS varreduras, COALESCE(t.seq_tup_read, 0) AS lidas_varrendo, \
+               COALESCE(t.idx_scan, 0) AS por_indice, COALESCE(t.idx_tup_fetch, 0) AS lidas_indice, \
+               COALESCE(t.n_tup_ins, 0) AS inseridas, COALESCE(t.n_tup_upd, 0) AS atualizadas, \
+               COALESCE(t.n_tup_del, 0) AS apagadas, COALESCE(t.n_tup_hot_upd, 0) AS hot, \
+               EXTRACT(epoch FROM now() - GREATEST(t.last_vacuum, t.last_autovacuum)) AS desde_vacuum, \
+               EXTRACT(epoch FROM now() - GREATEST(t.last_analyze, t.last_autoanalyze)) AS desde_analyze, \
+               (SELECT count(*) FROM pg_index i WHERE i.indrelid = c.oid) AS qtd_indices, \
+               (SELECT count(*) FROM pg_attribute a \
+                 WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped) AS qtd_colunas, \
+               (SELECT count(*) FROM pg_trigger g WHERE g.tgrelid = c.oid AND NOT g.tgisinternal) AS gatilhos, \
+               c.relpersistence AS persistencia, \
+               COALESCE(c.reloptions::text, '') AS opcoes \
                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+               LEFT JOIN pg_stat_user_tables t ON t.relid = c.oid \
                WHERE c.relkind IN ('r','p','m') \
                AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
-               ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 20";
+               ORDER BY pg_total_relation_size(c.oid) DESC";
     let Some(table) = ask(conn, report, "tamanho das tabelas", sql)? else {
         return Ok(());
     };
-    report.table(&["total", "tabela", "dados", "índices", "toast", "linhas"]);
+    if table.is_empty() {
+        report.line("nenhuma tabela fora dos esquemas do sistema");
+        return Ok(());
+    }
+    let colunas = columns_by_table(conn, report)?;
+
+    let total: f64 = table.iter().map(|row| row.num("total")).sum();
+    report.field(
+        "ao todo",
+        format!("{} tabelas ocupando {}", table.len(), bytes(total)),
+    );
+    report.table(&["total", "tabela", "linhas", "dados", "índices", "movimento"]);
     for row in table.iter() {
-        report.cells_headline(
+        let dados = row.num("dados");
+        let indices = row.num("indices");
+        let vivas = row.num("vivas").max(row.num("linhas"));
+        let varreduras = row.num("varreduras");
+        let por_indice = row.num("por_indice");
+        let leituras = varreduras + por_indice;
+        let escritas = row.num("inseridas") + row.num("atualizadas") + row.num("apagadas");
+        report.cells_deep(
             vec![
                 bytes(row.num("total")),
                 row.get("tabela").to_string(),
-                bytes(row.num("dados")),
-                bytes(row.num("indices")),
-                match row.num("toast") {
-                    toast if toast > 0.0 => bytes(toast),
-                    _ => String::new(),
-                },
-                count(row.num("linhas")),
+                count(vivas),
+                bytes(dados),
+                format!("{} ({})", bytes(indices), row.get("qtd_indices")),
+                format!(
+                    "{} leituras · {} escritas",
+                    count(leituras),
+                    count(escritas)
+                ),
             ],
-            Tone::Normal,
+            match (
+                indices > dados && dados > 50.0 * 1024.0 * 1024.0,
+                row.num("mortas") > vivas * 0.2,
+            ) {
+                (true, _) | (_, true) => Tone::Aviso,
+                _ => Tone::Normal,
+            },
+            vec![
+                ("tamanho total", bytes(row.num("total"))),
+                ("dados", bytes(dados)),
+                (
+                    "índices",
+                    format!("{} em {} índices", bytes(indices), row.get("qtd_indices")),
+                ),
+                (
+                    "toast (valores grandes)",
+                    match row.num("toast") {
+                        0.0 => String::new(),
+                        toast => bytes(toast),
+                    },
+                ),
+                ("colunas", row.get("qtd_colunas").to_string()),
+                (
+                    "gatilhos",
+                    match row.get("gatilhos") {
+                        "0" => String::new(),
+                        n => n.to_string(),
+                    },
+                ),
+                (
+                    "linhas",
+                    format!(
+                        "{} vivas, {} mortas",
+                        count(vivas),
+                        count(row.num("mortas"))
+                    ),
+                ),
+                (
+                    "como é lida",
+                    match leituras {
+                        0.0 => "ninguém leu desde o último reset dos contadores".to_string(),
+                        _ => format!(
+                            "{:.0}% por índice, {:.0}% varrendo tudo",
+                            100.0 * por_indice / leituras,
+                            100.0 * varreduras / leituras
+                        ),
+                    },
+                ),
+                (
+                    "linhas por varredura",
+                    match varreduras {
+                        0.0 => String::new(),
+                        v => count(row.num("lidas_varrendo") / v),
+                    },
+                ),
+                (
+                    "escritas",
+                    format!(
+                        "{} inseridas · {} atualizadas · {} apagadas",
+                        count(row.num("inseridas")),
+                        count(row.num("atualizadas")),
+                        count(row.num("apagadas"))
+                    ),
+                ),
+                (
+                    "atualizações HOT",
+                    match row.num("atualizadas") {
+                        0.0 => String::new(),
+                        upd => format!(
+                            "{:.0}% (as que não tocam índice)",
+                            100.0 * row.num("hot") / upd
+                        ),
+                    },
+                ),
+                (
+                    "último vacuum",
+                    match row.get("desde_vacuum") {
+                        "" => "nunca".to_string(),
+                        _ => format!("há {}", duration(row.num("desde_vacuum"))),
+                    },
+                ),
+                (
+                    "último analyze",
+                    match row.get("desde_analyze") {
+                        "" => "nunca — o planejador não sabe nada desta tabela".to_string(),
+                        _ => format!("há {}", duration(row.num("desde_analyze"))),
+                    },
+                ),
+                (
+                    "persistência",
+                    match row.get("persistencia") {
+                        "u" => "UNLOGGED — não sobrevive a uma queda".to_string(),
+                        "t" => "temporária".to_string(),
+                        _ => String::new(),
+                    },
+                ),
+                (
+                    "opções",
+                    row.get("opcoes")
+                        .trim_matches(|c| c == '{' || c == '}')
+                        .to_string(),
+                ),
+            ],
+            colunas.get(row.get("tabela")).cloned().unwrap_or_default(),
         );
     }
+
     for row in table.iter() {
-        let data = row.num("dados");
-        let indexes = row.num("indices");
-        if indexes > data && data > 50.0 * 1024.0 * 1024.0 {
+        let dados = row.num("dados");
+        let indices = row.num("indices");
+        if indices > dados && dados > 50.0 * 1024.0 * 1024.0 {
             report.aviso(
                 format!(
                     "{} tem mais índice ({}) do que dado ({})",
                     row.get("tabela"),
-                    bytes(indexes),
-                    bytes(data)
+                    bytes(indices),
+                    bytes(dados)
                 ),
-                "quase sempre é índice a mais, não dado a menos: confira a lista de índices sem uso e de redundantes acima",
+                "quase sempre é índice a mais, não dado a menos: confira a coluna de usos no cartão de Índices",
+            );
+        }
+        if row.get("persistencia") == "u" {
+            report.aviso(
+                format!("{} é UNLOGGED", row.get("tabela")),
+                "não vai para o WAL, não é replicada, e é esvaziada depois de uma queda. Ótimo para cache, péssimo para dado que importa",
             );
         }
     }
     Ok(())
+}
+
+/// As colunas de cada tabela, já formatadas para o detalhe: tipo, quantos valores
+/// distintos, quanto é nulo, quanto ocupa.
+///
+/// Uma consulta só para a base inteira, agrupada aqui — é o `pg_stats`, que é o que o
+/// planejador usa para decidir plano, e ler isso é ver o banco com os olhos dele.
+fn columns_by_table(
+    conn: &mut pg::Conn,
+    report: &mut Report,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let sql = "SELECT n.nspname || '.' || c.relname AS tabela, a.attname AS coluna, \
+               format_type(a.atttypid, a.atttypmod) AS tipo, \
+               a.attnotnull AS obrigatoria, \
+               COALESCE(s.n_distinct, 0) AS distintos, \
+               COALESCE(s.null_frac, 0) AS nulos, \
+               COALESCE(s.avg_width, 0) AS largura \
+               FROM pg_attribute a \
+               JOIN pg_class c ON c.oid = a.attrelid \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               LEFT JOIN pg_stats s ON s.schemaname = n.nspname \
+                 AND s.tablename = c.relname AND s.attname = a.attname \
+               WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r','p','m') \
+               AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
+               ORDER BY c.relname, a.attnum";
+    let mut por_tabela: HashMap<String, Vec<String>> = HashMap::new();
+    let Some(table) = ask(conn, report, "colunas", sql)? else {
+        return Ok(por_tabela);
+    };
+    for row in table.iter() {
+        let distintos = row.num("distintos");
+        let linhas = por_tabela.entry(row.get("tabela").to_string()).or_default();
+        if linhas.is_empty() {
+            linhas.push(format!(
+                "{:<28} {:<22} {:>12} {:>8} {:>8}",
+                "coluna", "tipo", "distintos", "nulos", "bytes"
+            ));
+        }
+        linhas.push(format!(
+            "{:<28} {:<22} {:>12} {:>8} {:>8}{}",
+            one_line(row.get("coluna"), 28),
+            one_line(row.get("tipo"), 22),
+            // Negativo no pg_stats é proporção: -1 quer dizer «tudo distinto», que é o
+            // que uma chave natural parece.
+            match distintos {
+                d if d < 0.0 => format!("{:.0}% da tabela", -100.0 * d),
+                d => count(d),
+            },
+            format!("{:.0}%", 100.0 * row.num("nulos")),
+            count(row.num("largura")),
+            match row.flag("obrigatoria") {
+                true => "  NOT NULL",
+                false => "",
+            }
+        ));
+    }
+    Ok(por_tabela)
 }
 
 fn foreign_keys(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
@@ -2105,7 +2587,7 @@ fn foreign_keys(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> 
                FROM pg_constraint c \
                JOIN pg_class t ON t.oid = c.conrelid \
                JOIN pg_namespace n ON n.oid = t.relnamespace \
-               WHERE c.contype = 'f' AND n.nspname NOT IN ('pg_catalog','information_schema') \
+               WHERE c.contype = 'f' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
                AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.conrelid \
                                AND i.indisvalid AND i.indkey[0] = c.conkey[1]) \
                ORDER BY pg_total_relation_size(c.conrelid) DESC LIMIT 20";
@@ -2185,7 +2667,7 @@ fn sequences(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
                JOIN pg_class c ON c.oid = a.attrelid \
                JOIN pg_namespace n ON n.oid = c.relnamespace \
                WHERE a.atttypid = 'int4'::regtype AND a.attnum > 0 AND NOT a.attisdropped \
-               AND c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema') \
+               AND c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
                AND pg_get_serial_sequence(n.nspname || '.' || c.relname, a.attname) IS NOT NULL";
     if let Some(table) = ask(conn, report, "colunas serial de 32 bits", sql)? {
         for row in table.iter() {
@@ -2215,7 +2697,7 @@ fn no_primary_key(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String
     report.section("Modelagem");
     let sql = "SELECT n.nspname || '.' || c.relname AS tabela, c.reltuples::bigint AS linhas \
                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-               WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema') \
+               WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
                AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary) \
                AND c.reltuples > 1000 ORDER BY c.reltuples DESC LIMIT 10";
     let Some(table) = ask(conn, report, "tabelas sem chave primária", sql)? else {
@@ -2250,6 +2732,30 @@ fn extensions(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
 }
 
 /// Uma forma de query que já se viu rodar, e o que ela custou da última vez.
+impl Recente {
+    /// O que se sabe desta forma de query no intervalo entre duas investigações.
+    fn fatos(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("execuções no intervalo", count(self.calls)),
+            ("tempo somado", millis(self.total)),
+            ("média por execução", millis(self.mean)),
+            (
+                "derramado em disco",
+                match self.temp {
+                    0.0 => String::new(),
+                    temp => bytes(temp * 8192.0),
+                },
+            ),
+            (
+                "visto pela última vez",
+                format!("há {}", duration(self.visto.elapsed().as_secs_f64())),
+            ),
+            ("tabelas que lê", tables_in(&self.query).join(", ")),
+            ("colunas filtradas", hints(&self.query).join(", ")),
+        ]
+    }
+}
+
 struct Recente {
     visto: std::time::Instant,
     /// Quantas execuções desde que esta ferramenta começou a olhar.
@@ -2277,7 +2783,9 @@ fn statement_counters(conn: &mut pg::Conn, total_column: &str) -> HashMap<String
     let sql = format!(
         "SELECT COALESCE(queryid::text, md5(query)) AS id, calls, rows, \
          {total_column} AS total, 0 AS media, shared_blks_hit AS hit, \
-         shared_blks_read AS miss, temp_blks_written AS temp, query \
+         shared_blks_read AS miss, temp_blks_written AS temp, \
+         shared_blks_dirtied AS sujas, shared_blks_written AS escritas, \
+         0 AS minimo, 0 AS maximo, 0 AS desvio, 0 AS wal, query \
          FROM pg_stat_statements \
          WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())"
     );
@@ -2298,6 +2806,13 @@ fn statement_counters(conn: &mut pg::Conn, total_column: &str) -> HashMap<String
                     miss: row.num("miss"),
                     temp: row.num("temp"),
                     query: row.get("query").to_string(),
+                    min: 0.0,
+                    max: 0.0,
+                    stddev: 0.0,
+                    sujas: 0.0,
+                    escritas: 0.0,
+                    wal: 0.0,
+                    id: row.get("id").to_string(),
                 },
             );
         }
@@ -2324,6 +2839,13 @@ fn delta_of(before: &HashMap<String, Stmt>, after: &HashMap<String, Stmt>) -> Ve
             miss: (now.miss - was.map(|stmt| stmt.miss).unwrap_or(0.0)).max(0.0),
             temp: (now.temp - was.map(|stmt| stmt.temp).unwrap_or(0.0)).max(0.0),
             query: now.query.clone(),
+            min: now.min,
+            max: now.max,
+            stddev: now.stddev,
+            sujas: (now.sujas - was.map(|stmt| stmt.sujas).unwrap_or(0.0)).max(0.0),
+            escritas: (now.escritas - was.map(|stmt| stmt.escritas).unwrap_or(0.0)).max(0.0),
+            wal: (now.wal - was.map(|stmt| stmt.wal).unwrap_or(0.0)).max(0.0),
+            id: id.clone(),
         });
     }
     recent.sort_by(|a, b| b.total.total_cmp(&a.total));
@@ -2953,7 +3475,7 @@ fn bloat(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
                  WHERE s.schemaname = n.nspname AND s.tablename = c.relname) AS largura \
                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                LEFT JOIN pg_stat_user_tables t ON t.relid = c.oid \
-               WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema') \
+               WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') \
                AND c.reltuples > 1000 AND pg_relation_size(c.oid) > 8388608 \
                ORDER BY pg_relation_size(c.oid) DESC LIMIT 25";
     let Some(table) = ask(conn, report, "estimativa de inchaço", sql)? else {

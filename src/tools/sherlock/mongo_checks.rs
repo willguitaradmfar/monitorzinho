@@ -1080,9 +1080,53 @@ fn databases(conn: &mut mongo::Conn, report: &mut Report, depth: Depth) -> Resul
         .map(|doc| (doc.text("name"), doc.num("sizeOnDisk")))
         .collect();
     rows.sort_by(|a, b| b.1.total_cmp(&a.1));
-    report.table(&["tamanho", "base"]);
+    report.table(&["em disco", "base", "coleções", "objetos", "índices"]);
     for (name, size) in rows.iter().take(if depth >= Depth::Medio { 20 } else { 8 }) {
-        report.cells(vec![bytes(*size), name.clone()], Tone::Normal);
+        // Uma consulta por base, e só a partir do nível médio: num cluster com cinquenta
+        // bases isso são cinquenta idas, e no nível raso o que se quer é o tamanho.
+        let stats = match depth >= Depth::Medio {
+            true => conn
+                .run(
+                    name,
+                    Doc::new().with("dbStats", 1).with("maxTimeMS", 10_000),
+                )
+                .unwrap_or_default(),
+            false => Doc::new(),
+        };
+        report.cells_deep(
+            vec![
+                bytes(*size),
+                name.clone(),
+                stats.text("collections"),
+                count(stats.num("objects")),
+                bytes(stats.num("indexSize")),
+            ],
+            Tone::Normal,
+            vec![
+                ("em disco", bytes(*size)),
+                ("coleções", stats.text("collections")),
+                ("visões", stats.text("views")),
+                ("documentos", count(stats.num("objects"))),
+                ("dados", bytes(stats.num("dataSize"))),
+                ("documento médio", bytes(stats.num("avgObjSize"))),
+                (
+                    "índices",
+                    format!(
+                        "{} ocupando {}",
+                        stats.text("indexes"),
+                        bytes(stats.num("indexSize"))
+                    ),
+                ),
+                (
+                    "espaço livre dentro dos arquivos",
+                    match stats.num("freeStorageSize") {
+                        0.0 => String::new(),
+                        livre => bytes(livre),
+                    },
+                ),
+            ],
+            Vec::new(),
+        );
     }
     report.field("total em disco", bytes(list.num("totalSize")));
     Ok(())
@@ -1099,6 +1143,14 @@ struct Collection {
     indexes: f64,
     index_bytes: f64,
     average: f64,
+    /// O tamanho de cada índice, que é o que diz qual deles está custando o espaço.
+    index_sizes: Vec<(String, f64)>,
+    capped: bool,
+    /// Regra de validação declarada na coleção — ou nada, que é o caso quase sempre.
+    validador: bool,
+    /// Quantas linhas cabem no cache: `$collStats` conta as páginas que o WiredTiger tem
+    /// desta coleção em memória.
+    em_cache: f64,
 }
 
 fn collections(
@@ -1125,6 +1177,14 @@ fn collections(
         .map(|doc| doc.text("name"))
         .filter(|name| !name.starts_with("system."))
         .collect();
+    // Quem declarou regra de validação de esquema. É a única coisa que o MongoDB tem de
+    // parecido com um `NOT NULL`, e saber que não existe nenhuma é metade de um
+    // diagnóstico de modelagem.
+    let com_regra: std::collections::HashSet<String> = listing
+        .iter()
+        .filter(|doc| doc.doc("options.validator").is_some())
+        .map(|doc| doc.text("name"))
+        .collect();
     report.field(
         "na base",
         format!("{} coleção(ões) em {}", names.len(), target.database),
@@ -1149,6 +1209,10 @@ fn collections(
                 indexes: 0.0,
                 index_bytes: 0.0,
                 average: 0.0,
+                index_sizes: Vec::new(),
+                capped: false,
+                validador: false,
+                em_cache: 0.0,
             })
             .collect());
     }
@@ -1158,6 +1222,7 @@ fn collections(
         if report.stopping() {
             break;
         }
+        let name_para_regra = name.clone();
         let stats = conn.cursor(
             &target.database,
             Doc::new()
@@ -1184,11 +1249,23 @@ fn collections(
             indexes: storage.num("nindexes"),
             index_bytes: storage.num("totalIndexSize"),
             average: storage.num("avgObjSize"),
+            index_sizes: storage
+                .doc("indexSizes")
+                .map(|doc| {
+                    doc.0
+                        .iter()
+                        .map(|(nome, valor)| (nome.clone(), valor.as_num().unwrap_or(0.0)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            capped: storage.flag("capped"),
+            validador: com_regra.contains(&name_para_regra),
+            em_cache: storage.num("wiredTiger.cache.bytes currently in the cache"),
         });
     }
     out.sort_by(|a, b| (b.storage + b.index_bytes).total_cmp(&(a.storage + a.index_bytes)));
     report.table(&[
-        "total",
+        "em disco",
         "coleção",
         "documentos",
         "dados",
@@ -1197,18 +1274,80 @@ fn collections(
         "doc. médio",
     ]);
     for collection in out.iter() {
-        report.cells_headline(
-            vec![
-                bytes(collection.storage + collection.index_bytes),
-                collection.name.clone(),
-                count(collection.documents),
-                bytes(collection.size),
-                count(collection.indexes),
-                bytes(collection.index_bytes),
-                bytes(collection.average),
-            ],
+        let celulas = vec![
+            bytes(collection.storage + collection.index_bytes),
+            collection.name.clone(),
+            count(collection.documents),
+            bytes(collection.size),
+            count(collection.indexes),
+            bytes(collection.index_bytes),
+            bytes(collection.average),
+        ];
+        report.cells_deep(
+            celulas,
             Tone::Normal,
+            vec![
+                ("documentos", count(collection.documents)),
+                ("dados (descomprimidos)", bytes(collection.size)),
+                (
+                    "em disco",
+                    format!(
+                        "{} ({})",
+                        bytes(collection.storage),
+                        match collection.size {
+                            0.0 => "—".to_string(),
+                            tamanho => format!(
+                                "compressão de {:.1}×",
+                                tamanho / collection.storage.max(1.0)
+                            ),
+                        }
+                    ),
+                ),
+                ("documento médio", bytes(collection.average)),
+                (
+                    "índices",
+                    format!("{} ocupando {}", collection.indexes, bytes(collection.index_bytes)),
+                ),
+                (
+                    "espaço livre dentro do arquivo",
+                    match collection.reusable {
+                        0.0 => String::new(),
+                        livre => format!(
+                            "{} ({:.0}% do arquivo) — volta a ser usado pela coleção, mas não pelo disco",
+                            bytes(livre),
+                            100.0 * livre / collection.storage.max(1.0)
+                        ),
+                    },
+                ),
+                (
+                    "no cache agora",
+                    match collection.em_cache {
+                        0.0 => String::new(),
+                        cache => bytes(cache),
+                    },
+                ),
+                (
+                    "regra de validação",
+                    match collection.validador {
+                        true => "declarada".to_string(),
+                        false => "nenhuma — qualquer documento entra".to_string(),
+                    },
+                ),
+                (
+                    "limitada (capped)",
+                    match collection.capped {
+                        true => "sim — escreve em círculo e descarta o mais antigo".to_string(),
+                        false => String::new(),
+                    },
+                ),
+            ],
+            collection
+                .index_sizes
+                .iter()
+                .map(|(nome, tamanho)| format!("{:<40} {}", nome, bytes(*tamanho)))
+                .collect(),
         );
+        report.destacar();
     }
     Ok(out)
 }
@@ -1298,10 +1437,16 @@ fn indexes(
                 situacao.push("nunca usado".to_string());
                 sem_uso += 1;
             }
-            report.cells(
+            let tamanho = collection
+                .index_sizes
+                .iter()
+                .find(|(chave, _)| *chave == nome)
+                .map(|(_, tamanho)| *tamanho)
+                .unwrap_or(0.0);
+            report.cells_deep(
                 vec![
                     collection.name.clone(),
-                    nome,
+                    nome.clone(),
                     format!("{{ {} }}", chaves.join(", ")),
                     match ops {
                         desconhecido if desconhecido < 0.0 => "—".to_string(),
@@ -1313,6 +1458,57 @@ fn indexes(
                     true => Tone::Aviso,
                     false => Tone::Normal,
                 },
+                vec![
+                    ("coleção", collection.name.clone()),
+                    ("chaves", format!("{{ {} }}", chaves.join(", "))),
+                    (
+                        "tamanho",
+                        match tamanho {
+                            0.0 => String::new(),
+                            t => format!(
+                                "{} ({:.0}% dos índices da coleção)",
+                                bytes(t),
+                                100.0 * t / collection.index_bytes.max(1.0)
+                            ),
+                        },
+                    ),
+                    (
+                        "usos desde que o servidor subiu",
+                        match ops {
+                            desconhecido if desconhecido < 0.0 => {
+                                "não deu para ver ($indexStats recusado)".to_string()
+                            }
+                            usado => count(usado),
+                        },
+                    ),
+                    (
+                        "único",
+                        (if index.flag("unique") { "sim" } else { "não" }).to_string(),
+                    ),
+                    (
+                        "esparso",
+                        (if index.flag("sparse") { "sim" } else { "" }).to_string(),
+                    ),
+                    (
+                        "TTL",
+                        match index.path("expireAfterSeconds") {
+                            Some(_) => format!(
+                                "apaga depois de {}",
+                                duration(index.num("expireAfterSeconds"))
+                            ),
+                            None => String::new(),
+                        },
+                    ),
+                    (
+                        "parcial",
+                        match index.doc("partialFilterExpression") {
+                            Some(filtro) => filtro.render_forma(),
+                            None => String::new(),
+                        },
+                    ),
+                    ("versão", index.text("v")),
+                ],
+                Vec::new(),
             );
         }
     }
