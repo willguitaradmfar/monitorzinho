@@ -99,7 +99,16 @@ impl Value {
         match self {
             Value::Text(_) => "\"…\"".to_string(),
             Value::Doc(doc) => doc.render_forma(),
-            Value::List(list) => format!("[…{}]", list.len()),
+            // A lista abre: dentro de um `$expr` ou de um `$and` é ela que carrega a
+            // pergunta, e `[…2]` escondia justamente a parte que se foi ver. Os valores
+            // continuam trocados por marca — o que aparece é a forma, não o dado.
+            Value::List(list) => {
+                let dentro: Vec<String> = list.iter().take(4).map(Value::forma).collect();
+                match list.len() > 4 {
+                    true => format!("[{}, …+{}]", dentro.join(", "), list.len() - 4),
+                    false => format!("[{}]", dentro.join(", ")),
+                }
+            }
             Value::ObjectId(_) => "ObjectId(…)".to_string(),
             Value::Time(_) => "data".to_string(),
             Value::Binary(..) => "bin".to_string(),

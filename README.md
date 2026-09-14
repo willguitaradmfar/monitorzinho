@@ -886,15 +886,19 @@ its own shortcut key, each opening onto the full table of what it found. What is
 worth acting on carries a mark in the card's title, so which card to open is
 visible without opening any.
 
-Inside a card, the tables are **navigable**: `↑`/`↓` walk the rows and everything
-known about the row under the cursor appears underneath — no key to open it and
+Inside a card, **every** table is navigable — in all three engines: `↑`/`↓` walk
+the rows and everything known about the row under the cursor appears underneath — no key to open it and
 none to close it, because the arrow is the whole gesture. An index row opens onto
 its definition, its size, how many rows it has served and how many of those were
 fetched from the table; a table row onto its columns with their types, how many
 distinct values each holds, what fraction is null and how many bytes it costs; a
 query row onto its full text, its best and worst case, its standard deviation —
 which is how a plan that changes with the parameter announces itself — and the
-pages it read, dirtied and spilled. Nothing of this costs a second round trip: it
+pages it read, dirtied and spilled; a MongoDB operation onto the whole shape of the
+query, arrays and expressions included, which is the part that a table column always
+cuts off exactly where it started to matter; a process on a machine onto its state
+spelled out, a filesystem onto its inode use and mount options, a listening port
+onto what usually answers there. Nothing of this costs a second round trip: it
 was all read during the investigation, and reading more about a row is free once
 the reading has happened. A letter jumps straight to another card, `Esc` steps
 back one level at a time, and `Ctrl+T` and the log both return to wherever they

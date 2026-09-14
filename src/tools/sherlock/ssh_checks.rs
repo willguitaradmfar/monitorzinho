@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use super::{Depth, Plan, Report, bytes, count, duration, one_line, plural, ssh};
+use super::{Depth, Plan, Report, bytes, count, duration, one_line, plural, quebrar, ssh};
 use crate::painel::Tone;
 
 /// Uma investigação de uma máquina.
@@ -232,6 +232,49 @@ fn aspas(texto: &str) -> String {
     texto.trim_matches('"').to_string()
 }
 
+/// O que costuma atender numa porta conhecida. Não é uma identificação — é o palpite que
+/// todo mundo faz ao ver o número, dito em voz alta para não precisar ser lembrado.
+fn servico_da_porta(porta: &str) -> String {
+    match porta {
+        "22" => "SSH",
+        "25" | "587" | "465" => "SMTP",
+        "53" => "DNS",
+        "80" | "8080" | "8000" => "HTTP",
+        "443" | "8443" => "HTTPS",
+        "3306" => "MySQL",
+        "5432" => "PostgreSQL",
+        "6379" => "Redis",
+        "27017" | "27018" => "MongoDB",
+        "5672" | "15672" => "RabbitMQ",
+        "9092" => "Kafka",
+        "9200" | "9300" => "Elasticsearch",
+        "11211" => "Memcached",
+        "2375" | "2376" => "Docker — e a API do Docker aberta é root na máquina",
+        "3389" => "RDP",
+        "111" => "rpcbind",
+        _ => "",
+    }
+    .to_string()
+}
+
+/// A letra de estado do `ps`, por extenso.
+fn estado_do_processo(estado: &str) -> String {
+    let letra = estado.chars().next().unwrap_or(' ');
+    let base = match letra {
+        'R' => "rodando ou pronto para rodar",
+        'S' => "dormindo, esperando algo",
+        'D' => "espera ininterrupta — I/O que nem sinal interrompe",
+        'Z' => "zumbi: morreu e o pai não recolheu",
+        'T' => "parado",
+        'I' => "ocioso (thread de kernel)",
+        _ => "desconhecido",
+    };
+    match estado.contains('+') {
+        true => format!("{base} · em primeiro plano"),
+        false => base.to_string(),
+    }
+}
+
 /// Os tempos de CPU de `/proc/stat`, em jiffies desde o boot.
 #[derive(Clone, Copy)]
 struct Cpu {
@@ -397,7 +440,11 @@ fn disk(report: &mut Report, s: &Secoes) {
             .trim_end_matches('%')
             .parse::<f64>()
             .unwrap_or(0.0);
-        report.cells_headline(
+        let inodes_aqui = inodes
+            .iter()
+            .find(|(onde, _)| onde == ponto)
+            .map(|(_, pct)| *pct);
+        report.cells_deep(
             vec![
                 dispositivo.to_string(),
                 ponto.to_string(),
@@ -410,7 +457,47 @@ fn disk(report: &mut Report, s: &Secoes) {
                 apertado if apertado >= 80.0 => Tone::Aviso,
                 _ => Tone::Normal,
             },
+            vec![
+                ("dispositivo", dispositivo.to_string()),
+                ("montado em", ponto.to_string()),
+                ("tamanho", bytes(tamanho)),
+                ("usado", format!("{} ({pct:.0}%)", bytes(usado))),
+                ("livre", bytes(livre)),
+                (
+                    "inodes",
+                    match inodes_aqui {
+                        Some(uso) => format!("{uso:.0}% usados"),
+                        None => String::new(),
+                    },
+                ),
+                (
+                    "opções de montagem",
+                    campo(s, "montagens")
+                        .lines()
+                        .find(|linha| {
+                            let c: Vec<&str> = linha.split_whitespace().collect();
+                            c.len() >= 4 && c[1] == ponto
+                        })
+                        .and_then(|linha| linha.split_whitespace().nth(3))
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                (
+                    "sistema de arquivos",
+                    campo(s, "montagens")
+                        .lines()
+                        .find(|linha| {
+                            let c: Vec<&str> = linha.split_whitespace().collect();
+                            c.len() >= 3 && c[1] == ponto
+                        })
+                        .and_then(|linha| linha.split_whitespace().nth(2))
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+            ],
+            Vec::new(),
         );
+        report.destacar();
         if pct >= 90.0 {
             apertados.push((ponto.to_string(), pct));
         }
@@ -555,7 +642,11 @@ fn network(report: &mut Report, s: &Secoes) {
         for (local, endereco, processo) in &abertas {
             let mundo =
                 endereco.contains("0.0.0.0") || endereco == "*" || endereco.contains("[::]");
-            report.cells(
+            let porta = local
+                .rsplit_once(':')
+                .map(|(_, p)| p.to_string())
+                .unwrap_or_default();
+            report.cells_deep(
                 vec![
                     local.clone(),
                     match mundo {
@@ -568,6 +659,22 @@ fn network(report: &mut Report, s: &Secoes) {
                     true => Tone::Aviso,
                     false => Tone::Normal,
                 },
+                vec![
+                    ("endereço", local.clone()),
+                    ("porta", porta.clone()),
+                    ("processo", processo.clone()),
+                    (
+                        "quem alcança",
+                        match mundo {
+                            true => {
+                                "qualquer endereço que a rede permitir chegar até aqui".to_string()
+                            }
+                            false => "só quem já está dentro desta máquina".to_string(),
+                        },
+                    ),
+                    ("serviço conhecido nessa porta", servico_da_porta(&porta)),
+                ],
+                Vec::new(),
             );
         }
         let mundo = abertas
@@ -646,21 +753,35 @@ fn processes(report: &mut Report, s: &Secoes) {
                 c[7..].join(" ")
             ));
         }
-        report.cells_headline(
+        report.cells_deep(
             vec![
                 c[0].to_string(),
                 c[1].to_string(),
                 format!("{pcpu:.1}%"),
                 format!("{}%", c[3]),
                 bytes(c[4].parse::<f64>().unwrap_or(0.0) * 1024.0),
-                duration(c[5].parse().unwrap_or(0.0)),
+                duration(segundos),
                 c[7..].join(" "),
             ],
             match pcpu {
                 muito if muito >= 90.0 => Tone::Aviso,
                 _ => Tone::Normal,
             },
+            vec![
+                ("pid", c[0].to_string()),
+                ("usuário", c[1].to_string()),
+                ("CPU", format!("{pcpu:.1}% de um núcleo")),
+                ("memória", format!("{}% da máquina", c[3])),
+                (
+                    "residente",
+                    bytes(c[4].parse::<f64>().unwrap_or(0.0) * 1024.0),
+                ),
+                ("rodando há", duration(segundos)),
+                ("estado", estado_do_processo(c[6])),
+            ],
+            quebrar(&c[7..].join(" "), 140),
         );
+        report.destacar();
     }
     for quente in &quentes {
         report.aviso(
@@ -741,7 +862,20 @@ fn services(report: &mut Report, s: &Secoes) {
             continue;
         }
         quantos += 1;
-        report.cells_headline(vec![c[0].to_string(), c[1..].join(" ")], Tone::Ruim);
+        report.cells_deep(
+            vec![c[0].to_string(), c[1..].join(" ")],
+            Tone::Ruim,
+            vec![
+                ("unidade", c[0].to_string()),
+                ("estado", c[1..].join(" ")),
+                (
+                    "onde olhar",
+                    format!("systemctl status {} · journalctl -u {} -n 50", c[0], c[0]),
+                ),
+            ],
+            Vec::new(),
+        );
+        report.destacar();
     }
     if quantos > 0 {
         report.grave(
@@ -778,9 +912,11 @@ fn errors(report: &mut Report, s: &Secoes) {
     report.table(&["quando", "o quê"]);
     for linha in linhas.iter().take(15) {
         let (quando, resto) = linha.split_at(linha.len().min(15));
-        report.cells(
+        report.cells_deep(
             vec![quando.trim().to_string(), one_line(resto, 140)],
             Tone::Aviso,
+            vec![("quando", quando.trim().to_string())],
+            quebrar(resto, 140),
         );
     }
     if linhas.len() >= 10 {
@@ -967,13 +1103,19 @@ fn inventory(report: &mut Report, s: &Secoes) {
         report.table(&["container", "estado", "imagem"]);
         for linha in linhas.iter().take(12) {
             let partes: Vec<&str> = linha.split('\t').collect();
-            report.cells(
+            report.cells_deep(
                 vec![
                     partes.first().unwrap_or(&"").to_string(),
                     partes.get(1).unwrap_or(&"").to_string(),
                     partes.get(2).unwrap_or(&"").to_string(),
                 ],
                 Tone::Normal,
+                vec![
+                    ("container", partes.first().unwrap_or(&"").to_string()),
+                    ("estado", partes.get(1).unwrap_or(&"").to_string()),
+                    ("imagem", partes.get(2).unwrap_or(&"").to_string()),
+                ],
+                Vec::new(),
             );
         }
     }

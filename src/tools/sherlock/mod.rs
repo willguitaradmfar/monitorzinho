@@ -761,17 +761,12 @@ impl<'a> Report<'a> {
         self.cells(cells, tone);
     }
 
-    /// Uma linha da listagem que também merece aparecer no cartão da grade.
-    pub fn cells_headline(&mut self, cells: Vec<String>, tone: Tone) {
-        self.cells(cells, tone);
-        self.destacar();
-    }
-
     /// Promove a última linha da listagem ao cartão da grade.
     ///
-    /// Separado de `cells` porque uma linha pode ter sido escrita por `cells_deep`, que já
-    /// carrega o detalhe junto: chamar os dois seria escrever a mesma linha duas vezes na
-    /// tabela, que é exatamente o que acontecia antes disto existir.
+    /// Um gesto à parte, e não um parâmetro de `cells`, porque quem escreve a linha nem
+    /// sempre é quem decide se ela merece o cartão: as primeiras seis de uma lista longa
+    /// vão, o resto fica só na tabela cheia. Chamar duas funções que ambas escrevem a
+    /// linha seria escrevê-la duas vezes — foi o que aconteceu enquanto isto não existia.
     pub fn destacar(&mut self) {
         let Some(open) = &mut self.open else {
             return;
@@ -1262,6 +1257,28 @@ pub fn one_line(text: &str, limit: usize) -> String {
     }
     let kept: String = flat.chars().take(limit.saturating_sub(1)).collect();
     format!("{kept}…")
+}
+
+/// Quebra um texto longo em linhas que cabem na tela, sem perder nada dele.
+///
+/// Diferente de `one_line`, que corta: aqui nada é jogado fora, porque o lugar em que isto
+/// é usado é o detalhe de uma linha — onde alguém foi justamente ver o que não coube.
+pub fn quebrar(texto: &str, largura: usize) -> Vec<String> {
+    let mut linhas = Vec::new();
+    let mut atual = String::new();
+    for palavra in texto.split_whitespace() {
+        if atual.chars().count() + palavra.chars().count() + 1 > largura && !atual.is_empty() {
+            linhas.push(std::mem::take(&mut atual));
+        }
+        if !atual.is_empty() {
+            atual.push(' ');
+        }
+        atual.push_str(palavra);
+    }
+    if !atual.is_empty() {
+        linhas.push(atual);
+    }
+    linhas
 }
 
 /// Bytes as a person says them.

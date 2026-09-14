@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     Depth, Plan, Report, STATEMENT_TIMEOUT, bytes, count, duration, millis, one_line, pg, plural,
+    quebrar,
 };
 use crate::painel::Tone;
 
@@ -230,13 +231,32 @@ impl Session {
                     count(delta.apagadas)
                 ),
             };
-            report.cells_headline(
-                vec![count(delta.leituras()), nome.clone(), como, escrita],
+            report.cells_deep(
+                vec![
+                    count(delta.leituras()),
+                    nome.clone(),
+                    como.clone(),
+                    escrita.clone(),
+                ],
                 match delta.seq_scan > 0.0 && delta.vivas > 1000.0 {
                     true => Tone::Aviso,
                     false => Tone::Normal,
                 },
+                vec![
+                    ("tabela", nome.clone()),
+                    ("leituras no intervalo", count(delta.leituras())),
+                    ("por índice", count(delta.idx_scan)),
+                    ("varrendo a tabela inteira", count(delta.seq_scan)),
+                    ("linhas lidas varrendo", count(delta.seq_tup)),
+                    ("linhas lidas por índice", count(delta.idx_tup)),
+                    ("inseridas", count(delta.inseridas)),
+                    ("atualizadas", count(delta.atualizadas)),
+                    ("apagadas", count(delta.apagadas)),
+                    ("linhas vivas", count(delta.vivas)),
+                ],
+                Vec::new(),
             );
+            report.destacar();
         }
         for (name, scans, rows, per_scan) in scanned.into_iter().take(4) {
             report.alerta(
@@ -891,13 +911,38 @@ fn connections(
             "" => String::new(),
             _ => duration(row.num("mais_antiga")),
         };
-        report.cells(
+        report.cells_deep(
             vec![
                 row.get("estado").to_string(),
                 row.get("n").to_string(),
-                oldest,
+                oldest.clone(),
             ],
             Tone::Normal,
+            vec![
+                ("estado", row.get("estado").to_string()),
+                ("quantas conexões", row.get("n").to_string()),
+                (
+                    "a mais antiga neste estado",
+                    match oldest.is_empty() {
+                        true => String::new(),
+                        false => format!("há {oldest}"),
+                    },
+                ),
+                (
+                    "o que quer dizer",
+                    match row.get("estado") {
+                        "active" => "está executando uma query agora".to_string(),
+                        "idle" => "conectada e sem fazer nada — normal num pool".to_string(),
+                        e if e.starts_with("idle in transaction (aborted)") =>
+                            "transação aberta que já deu erro e ninguém fechou: segura lock e horizonte do mesmo jeito".to_string(),
+                        e if e.starts_with("idle in transaction") =>
+                            "transação aberta sem trabalho: segura locks e trava o vacuum enquanto durar".to_string(),
+                        "fastpath function call" => "executando uma função pelo caminho curto".to_string(),
+                        _ => "processo interno do servidor, não é conexão de cliente".to_string(),
+                    },
+                ),
+            ],
+            Vec::new(),
         );
     }
     if limit > 0.0 {
@@ -1799,7 +1844,7 @@ fn scans(
         let read = row.num("seq_tup_read");
         let live = row.num("n_live_tup");
         let per_scan = if scans > 0.0 { read / scans } else { 0.0 };
-        report.cells(
+        report.cells_deep(
             vec![
                 row.get("tabela").to_string(),
                 count(scans),
@@ -1811,6 +1856,33 @@ fn scans(
                 true => Tone::Aviso,
                 false => Tone::Normal,
             },
+            vec![
+                ("tabela", row.get("tabela").to_string()),
+                ("varreduras completas", count(scans)),
+                ("linhas lidas varrendo", count(read)),
+                ("linhas por varredura", count(per_scan)),
+                ("leituras por índice", count(row.num("idx_scan"))),
+                (
+                    "proporção",
+                    match scans + row.num("idx_scan") {
+                        0.0 => String::new(),
+                        total => format!(
+                            "{:.0}% das leituras são varredura completa",
+                            100.0 * scans / total
+                        ),
+                    },
+                ),
+                ("linhas vivas", count(live)),
+                ("tamanho", bytes(row.num("bytes"))),
+                (
+                    "veredito",
+                    match per_scan < 5000.0 {
+                        true => "tabela pequena: ler inteiro é o plano certo, e um índice aqui seria mais lento".to_string(),
+                        false => "cada varredura percorre muita linha — é onde um índice mudaria o jogo".to_string(),
+                    },
+                ),
+            ],
+            Vec::new(),
         );
         // A small table is *supposed* to be read whole: the planner is right and an index
         // there would be slower. The problem starts when each scan walks thousands of rows.
@@ -1965,28 +2037,6 @@ fn tables_in(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// Quebra um texto longo em linhas que cabem na tela, sem perder nada dele.
-///
-/// Diferente de `one_line`, que corta: aqui nada é jogado fora, porque o lugar em que isto
-/// é usado é justamente o detalhe — onde alguém foi ver a query inteira.
-fn quebrar(texto: &str, largura: usize) -> Vec<String> {
-    let mut linhas = Vec::new();
-    let mut atual = String::new();
-    for palavra in texto.split_whitespace() {
-        if atual.chars().count() + palavra.chars().count() + 1 > largura && !atual.is_empty() {
-            linhas.push(std::mem::take(&mut atual));
-        }
-        if !atual.is_empty() {
-            atual.push(' ');
-        }
-        atual.push_str(palavra);
-    }
-    if !atual.is_empty() {
-        linhas.push(atual);
-    }
-    linhas
-}
-
 /// An index suggestion for one table, taken from the statements that actually read it.
 fn columns_for(table: &str, statements: &[Stmt], already: &HashSet<String>) -> Option<String> {
     let table = table.to_ascii_lowercase();
@@ -2066,7 +2116,7 @@ fn vacuum(conn: &mut pg::Conn, report: &mut Report, reset: &Reset) -> Result<(),
         if dead < 1000.0 {
             continue;
         }
-        report.cells(
+        report.cells_deep(
             vec![
                 row.get("tabela").to_string(),
                 count(dead),
@@ -2088,6 +2138,38 @@ fn vacuum(conn: &mut pg::Conn, report: &mut Report, reset: &Reset) -> Result<(),
                 algum if algum >= 20.0 => Tone::Aviso,
                 _ => Tone::Normal,
             },
+            vec![
+                ("tabela", row.get("tabela").to_string()),
+                ("linhas mortas", count(dead)),
+                ("linhas vivas", count(row.num("n_live_tup"))),
+                (
+                    "proporção",
+                    match pct < 0.0 {
+                        true => "não dá para saber: contadores zerados e nenhum ANALYZE".to_string(),
+                        false => format!("{pct:.0}% do tamanho vivo"),
+                    },
+                ),
+                ("tamanho total", bytes(row.num("bytes"))),
+                (
+                    "último vacuum",
+                    match row.get("desde_vacuum") {
+                        "" => "nunca".to_string(),
+                        _ => format!("há {}", duration(row.num("desde_vacuum"))),
+                    },
+                ),
+                (
+                    "último analyze",
+                    match row.get("desde_analyze") {
+                        "" => "nunca — o planejador não sabe nada desta tabela".to_string(),
+                        _ => format!("há {}", duration(row.num("desde_analyze"))),
+                    },
+                ),
+                (
+                    "o que isso custa",
+                    "toda varredura da tabela percorre as linhas mortas também, e cada índice guarda uma entrada apontando para elas".to_string(),
+                ),
+            ],
+            Vec::new(),
         );
         // Dead rows are not just space: every scan of the table walks over them, and the
         // index entries pointing at them are walked too.
@@ -2157,7 +2239,7 @@ fn wraparound(conn: &mut pg::Conn, report: &mut Report, depth: Depth) -> Result<
     for row in table.iter() {
         let age = row.num("idade");
         let pct = 100.0 * age / 2_000_000_000.0;
-        report.cells(
+        report.cells_deep(
             vec![
                 row.get("datname").to_string(),
                 count(age),
@@ -2168,6 +2250,21 @@ fn wraparound(conn: &mut pg::Conn, report: &mut Report, depth: Depth) -> Result<
                 algum if algum >= 10.0 => Tone::Aviso,
                 _ => Tone::Normal,
             },
+            vec![
+                ("base", row.get("datname").to_string()),
+                ("transações desde o congelamento", count(age)),
+                ("quanto falta para o limite", count(2_000_000_000.0 - age)),
+                ("percentual do limite", format!("{pct:.2}%")),
+                (
+                    "limite do autovacuum",
+                    format!("{} (autovacuum_freeze_max_age)", count(limit)),
+                ),
+                (
+                    "o que acontece no limite",
+                    "aos 2 bilhões o servidor para de aceitar escrita em qualquer base até alguém congelar na mão, com o banco fora do ar".to_string(),
+                ),
+            ],
+            Vec::new(),
         );
         if age > 1_200_000_000.0 {
             report.grave(
@@ -2613,7 +2710,7 @@ fn foreign_keys(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> 
         "o índice que falta",
     ]);
     for row in table.iter() {
-        report.cells(
+        report.cells_deep(
             vec![
                 row.get("tabela").to_string(),
                 row.get("colunas").to_string(),
@@ -2626,6 +2723,22 @@ fn foreign_keys(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> 
                 ),
             ],
             Tone::Aviso,
+            vec![
+                ("restrição", row.get("chave").to_string()),
+                ("tabela que referencia", row.get("tabela").to_string()),
+                ("colunas", row.get("colunas").to_string()),
+                ("tabela referenciada", row.get("referencia").to_string()),
+                ("tamanho da tabela filha", bytes(row.num("bytes"))),
+                (
+                    "o que custa",
+                    "sem índice, todo DELETE ou UPDATE da chave na tabela pai varre a filha inteira — e faz isso segurando lock".to_string(),
+                ),
+            ],
+            vec![format!(
+                "CREATE INDEX CONCURRENTLY ON {} ({});",
+                row.get("tabela"),
+                row.get("colunas")
+            )],
         );
     }
     Ok(())
@@ -2713,9 +2826,22 @@ fn no_primary_key(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String
     );
     report.table(&["tabela", "linhas (estimadas)"]);
     for row in table.iter() {
-        report.cells(
+        report.cells_deep(
             vec![row.get("tabela").to_string(), count(row.num("linhas"))],
             Tone::Aviso,
+            vec![
+                ("tabela", row.get("tabela").to_string()),
+                ("linhas estimadas", count(row.num("linhas"))),
+                (
+                    "o que falta",
+                    "nenhum índice desta tabela é PRIMARY KEY".to_string(),
+                ),
+                (
+                    "o que isso impede",
+                    "apagar uma linha duplicada com segurança, e replicação lógica — que simplesmente não replica tabela sem identidade".to_string(),
+                ),
+            ],
+            Vec::new(),
         );
     }
     Ok(())
@@ -3033,7 +3159,7 @@ fn horizon(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
     report.table(&["quem", "tipo", "transações atrás", "há", "detalhe"]);
     for row in table.iter() {
         let idade = row.num("idade");
-        report.cells(
+        report.cells_deep(
             vec![
                 row.get("quem").to_string(),
                 row.get("tipo").to_string(),
@@ -3049,6 +3175,29 @@ fn horizon(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
                 algum if algum > 5_000_000.0 => Tone::Aviso,
                 _ => Tone::Normal,
             },
+            vec![
+                ("quem segura", row.get("quem").to_string()),
+                ("tipo", row.get("tipo").to_string()),
+                ("transações atrás", count(idade)),
+                (
+                    "há quanto tempo",
+                    match row.num("segundos") {
+                        0.0 => String::new(),
+                        segundos => duration(segundos),
+                    },
+                ),
+                (
+                    "como se resolve",
+                    match row.get("tipo") {
+                        "transação preparada" =>
+                            "COMMIT PREPARED ou ROLLBACK PREPARED, por quem cuida do cluster. Nada no banco vai encerrá-la sozinho".to_string(),
+                        t if t.starts_with("slot") =>
+                            "a réplica volta a consumir o slot, ou o slot é removido. Enquanto isso ele segura WAL e horizonte".to_string(),
+                        _ => "a transação termina — sozinha, ou porque alguém encerrou a sessão".to_string(),
+                    },
+                ),
+            ],
+            quebrar(row.get("detalhe"), 140),
         );
     }
     // Uma transação preparada esquecida é sempre grave, por mais nova que seja e esteja
@@ -3258,7 +3407,7 @@ fn who(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
     };
     report.table(&["usuário e aplicação", "conexões", "ativas", "mais antiga"]);
     for row in table.iter() {
-        report.cells_headline(
+        report.cells_deep(
             vec![
                 format!("{}@{}", row.get("usuario"), row.get("app")),
                 row.get("n").to_string(),
@@ -3266,7 +3415,20 @@ fn who(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
                 duration(row.num("mais_velha")),
             ],
             Tone::Normal,
+            vec![
+                ("usuário", row.get("usuario").to_string()),
+                ("aplicação", row.get("app").to_string()),
+                ("conexões", row.get("n").to_string()),
+                ("delas ativas agora", row.get("ativas").to_string()),
+                ("a mais antiga", format!("aberta há {}", duration(row.num("mais_velha")))),
+                (
+                    "o que isso diz",
+                    "conexão velha e ociosa é pool funcionando; conexão velha e sempre ativa é trabalho que não termina".to_string(),
+                ),
+            ],
+            Vec::new(),
         );
+        report.destacar();
     }
     // Uma aplicação que abre conexão sem se identificar é a que ninguém acha quando ela é
     // a que está segurando o banco.
@@ -3352,7 +3514,7 @@ fn table_cache(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
         let lidas = row.num("lidas");
         let total = (lidas + row.num("cache")).max(1.0);
         let acerto = 100.0 * row.num("cache") / total;
-        report.cells_headline(
+        report.cells_deep(
             vec![
                 row.get("tabela").to_string(),
                 format!("{acerto:.1}%"),
@@ -3367,7 +3529,28 @@ fn table_cache(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
                 frio if frio < 90.0 => Tone::Aviso,
                 _ => Tone::Normal,
             },
+            vec![
+                ("tabela", row.get("tabela").to_string()),
+                ("páginas servidas pelo cache", count(row.num("cache"))),
+                ("páginas lidas do disco", count(lidas)),
+                ("lido do disco", bytes(lidas * 8192.0)),
+                ("acerto de cache", format!("{acerto:.2}%")),
+                (
+                    "índices",
+                    format!(
+                        "{} do cache, {} do disco",
+                        count(row.num("idx_cache")),
+                        count(row.num("idx_lidas"))
+                    ),
+                ),
+                (
+                    "o que puxa para baixo",
+                    "ou o conjunto quente não cabe em shared_buffers, ou alguma varredura repetida passa o rodo no cache a cada volta".to_string(),
+                ),
+            ],
+            Vec::new(),
         );
+        report.destacar();
     }
     Ok(())
 }
@@ -3422,7 +3605,7 @@ fn security(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
         if row.flag("sem_senha") {
             sem_senha.push(row.get("rolname").to_string());
         }
-        report.cells(
+        report.cells_deep(
             vec![
                 row.get("rolname").to_string(),
                 poderes.join(" "),
@@ -3437,6 +3620,61 @@ fn security(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
                 (true, _) => Tone::Aviso,
                 _ => Tone::Normal,
             },
+            vec![
+                ("papel", row.get("rolname").to_string()),
+                (
+                    "superusuário",
+                    match row.flag("rolsuper") {
+                        true => "sim — ignora toda permissão e todo RLS".to_string(),
+                        false => "não".to_string(),
+                    },
+                ),
+                (
+                    "pode criar papéis",
+                    (if row.flag("rolcreaterole") {
+                        "sim"
+                    } else {
+                        "não"
+                    })
+                    .to_string(),
+                ),
+                (
+                    "pode criar bases",
+                    (if row.flag("rolcreatedb") {
+                        "sim"
+                    } else {
+                        "não"
+                    })
+                    .to_string(),
+                ),
+                (
+                    "pode replicar",
+                    (if row.flag("rolreplication") {
+                        "sim"
+                    } else {
+                        "não"
+                    })
+                    .to_string(),
+                ),
+                (
+                    "ignora RLS",
+                    (if row.flag("rolbypassrls") {
+                        "sim"
+                    } else {
+                        "não"
+                    })
+                    .to_string(),
+                ),
+                (
+                    "senha",
+                    match row.flag("sem_senha") {
+                        true => "nenhuma — entra por confiança do pg_hba".to_string(),
+                        false => "definida".to_string(),
+                    },
+                ),
+                ("validade", row.get("ate").to_string()),
+            ],
+            Vec::new(),
         );
     }
     if !sem_senha.is_empty() {
@@ -3553,7 +3791,7 @@ fn bloat(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
         "estimativa a partir do último ANALYZE, não medição. O número exato sai de pgstattuple (que lê a tabela inteira, então é para janela de manutenção); a correção é VACUUM FULL ou pg_repack, e os dois pedem janela",
     );
     for (tabela, real, excesso, pct) in inchadas.iter().take(10) {
-        report.cells(
+        report.cells_deep(
             vec![
                 tabela.clone(),
                 bytes(*real),
@@ -3561,6 +3799,25 @@ fn bloat(conn: &mut pg::Conn, report: &mut Report) -> Result<(), String> {
                 format!("~{pct:.0}%"),
             ],
             Tone::Aviso,
+            vec![
+                ("tabela", tabela.clone()),
+                ("tamanho no disco", bytes(*real)),
+                ("desperdício estimado", bytes(*excesso)),
+                ("proporção", format!("~{pct:.0}% do arquivo")),
+                (
+                    "como a conta é feita",
+                    "compara o tamanho real com o que as colunas deveriam ocupar segundo o último ANALYZE, ou com a proporção de linhas mortas quando não há ANALYZE".to_string(),
+                ),
+                (
+                    "o número exato",
+                    "sai de pgstattuple, que lê a tabela inteira — por isso não é feito daqui".to_string(),
+                ),
+                (
+                    "como se corrige",
+                    "VACUUM FULL ou pg_repack, e os dois pedem janela de manutenção".to_string(),
+                ),
+            ],
+            Vec::new(),
         );
     }
     Ok(())

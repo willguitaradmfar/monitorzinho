@@ -14,7 +14,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::bson::{Doc, Value};
-use super::{Depth, Plan, Report, bytes, count, duration, millis, mongo, one_line, plural};
+use super::{
+    Depth, Plan, Report, bytes, count, duration, millis, mongo, one_line, plural, quebrar,
+};
 use crate::painel::Tone;
 
 /// One live inspection of one MongoDB cluster.
@@ -242,7 +244,7 @@ impl Session {
                 );
                 continue;
             }
-            report.cells_headline(
+            report.cells_deep(
                 vec![
                     duration(seconds),
                     op.text("op"),
@@ -255,7 +257,32 @@ impl Session {
                 } else {
                     Tone::Normal
                 },
+                vec![
+                    ("operação", op.text("op")),
+                    ("coleção", op.text("ns")),
+                    ("rodando há", duration(seconds)),
+                    (
+                        "plano",
+                        match plan.is_empty() {
+                            true => "não registrado".to_string(),
+                            false => plan.clone(),
+                        },
+                    ),
+                    ("cliente", op.text("client")),
+                    ("descrição", op.text("desc")),
+                    ("opid", op.text("opid")),
+                    (
+                        "esperando lock",
+                        match op.flag("waitingForLock") {
+                            true => "sim".to_string(),
+                            false => String::new(),
+                        },
+                    ),
+                    ("cedeu a vez", count(op.num("numYields"))),
+                ],
+                quebrar(&op.text("command"), 150),
             );
+            report.destacar();
         }
         if running == 0 {
             report.ok("nenhuma operação em andamento neste instante");
@@ -367,10 +394,30 @@ impl Session {
                 lento if lento >= 1000.0 => Tone::Ruim,
                 _ => Tone::Aviso,
             };
+            report.cells_deep(
+                celulas,
+                tom,
+                vec![
+                    ("coleção", lenta.ns.clone()),
+                    ("duração", millis(lenta.millis)),
+                    (
+                        "plano",
+                        match lenta.plano.is_empty() {
+                            true => "não registrado".to_string(),
+                            false => lenta.plano.clone(),
+                        },
+                    ),
+                    ("documentos examinados", lenta.examinados.clone()),
+                    (
+                        "quando",
+                        format!("há {}", duration(lenta.visto.elapsed().as_secs_f64())),
+                    ),
+                    ("o que fazer", lenta.fix.clone()),
+                ],
+                quebrar(&lenta.forma, 140),
+            );
             if posicao < 6 {
-                report.cells_headline(celulas, tom);
-            } else {
-                report.cells(celulas, tom);
+                report.destacar();
             }
         }
         // O que é notável entre elas vira achado, com a sugestão de índice junto.
@@ -463,7 +510,7 @@ impl Session {
         report.table(&["tempo", "coleção", "operações", "média"]);
         for (ns, tempo, vezes) in linhas.iter().take(20) {
             // `top` mede em microssegundos.
-            report.cells_headline(
+            report.cells_deep(
                 vec![
                     millis(tempo / 1000.0),
                     ns.clone(),
@@ -471,7 +518,19 @@ impl Session {
                     millis(tempo / 1000.0 / vezes.max(1.0)),
                 ],
                 Tone::Normal,
+                vec![
+                    ("coleção", ns.clone()),
+                    ("tempo somado no intervalo", millis(tempo / 1000.0)),
+                    ("operações", count(*vezes)),
+                    ("média por operação", millis(tempo / 1000.0 / vezes.max(1.0))),
+                    (
+                        "de onde vem",
+                        "o comando `top`, que mede tempo dentro de lock por coleção. Não diz qual query foi — diz onde o tempo ficou".to_string(),
+                    ),
+                ],
+                Vec::new(),
             );
+            report.destacar();
         }
         Ok(())
     }
@@ -648,9 +707,15 @@ fn forma_json(command: Option<&serde_json::Value>) -> String {
                     .iter()
                     .filter_map(|estagio| estagio.as_object()?.keys().next().cloned())
                     .collect();
-                match estagios.len() == itens.len() && !estagios.is_empty() {
-                    true => format!("[{}]", estagios.join(", ")),
-                    false => format!("[…{}]", itens.len()),
+                if estagios.len() == itens.len() && !estagios.is_empty() {
+                    return format!("[{}]", estagios.join(", "));
+                }
+                // Qualquer outra lista abre do mesmo jeito que do lado BSON: dentro de um
+                // `$expr` é ela que carrega a pergunta.
+                let dentro: Vec<String> = itens.iter().take(4).map(forma).collect();
+                match itens.len() > 4 {
+                    true => format!("[{}, …+{}]", dentro.join(", "), itens.len() - 4),
+                    false => format!("[{}]", dentro.join(", ")),
                 }
             }
             serde_json::Value::Object(campos) => {
@@ -1650,7 +1715,7 @@ fn slow(conn: &mut mongo::Conn, report: &mut Report, target: &mongo::Target) -> 
     achadas.sort_by(|a, b| b.millis.total_cmp(&a.millis));
     report.table(&["duração", "coleção", "plano", "examinados", "operação"]);
     for lenta in &achadas {
-        report.cells(
+        report.cells_deep(
             vec![
                 millis(lenta.millis),
                 lenta.ns.clone(),
@@ -1662,6 +1727,20 @@ fn slow(conn: &mut mongo::Conn, report: &mut Report, target: &mongo::Target) -> 
                 true => Tone::Ruim,
                 false => Tone::Aviso,
             },
+            vec![
+                ("coleção", lenta.ns.clone()),
+                ("duração", millis(lenta.millis)),
+                (
+                    "plano",
+                    match lenta.plano.is_empty() {
+                        true => "não registrado".to_string(),
+                        false => lenta.plano.clone(),
+                    },
+                ),
+                ("documentos examinados", lenta.examinados.clone()),
+                ("o que fazer", lenta.fix.clone()),
+            ],
+            quebrar(&lenta.forma, 140),
         );
     }
     // A sugestão é o que ninguém copia de uma tabela: vai embaixo, e só para as que têm
@@ -2003,6 +2082,9 @@ fn classify_json(
 }
 
 fn replication(conn: &mut mongo::Conn, report: &mut Report) -> Result<(), String> {
+    // A seção abre **antes** da pergunta: uma recusa é resposta desta seção, e sem abrir
+    // ela primeiro a frase cairia dentro do cartão anterior, falando de outro assunto.
+    report.section("Replicação");
     let Some(status) = ask(
         conn,
         report,
@@ -2011,9 +2093,13 @@ fn replication(conn: &mut mongo::Conn, report: &mut Report) -> Result<(), String
         Doc::new().with("replSetGetStatus", 1),
     )?
     else {
+        report.line("este servidor não faz parte de um conjunto de réplicas");
+        report.aviso(
+            "sem réplica: este servidor é o único lugar onde estes dados existem",
+            "uma máquina só é um ponto único de falha, e restaurar backup leva o tempo que leva. Um conjunto de réplicas com três membros troca isso por uma eleição de dez segundos",
+        );
         return Ok(());
     };
-    report.section("Replicação");
     let members: Vec<&Doc> = status
         .list("members")
         .iter()
@@ -2027,7 +2113,7 @@ fn replication(conn: &mut mongo::Conn, report: &mut Report) -> Result<(), String
     report.table(&["membro", "estado", "saúde", "atraso"]);
     for member in &members {
         let lag = (primary - member.num("optimeDate")) / 1000.0;
-        report.cells(
+        report.cells_deep(
             vec![
                 member.text("name"),
                 member.text("stateStr"),
@@ -2046,6 +2132,24 @@ fn replication(conn: &mut mongo::Conn, report: &mut Report) -> Result<(), String
                 (_, atraso) if atraso > 60.0 => Tone::Aviso,
                 _ => Tone::Normal,
             },
+            vec![
+                ("membro", member.text("name")),
+                ("estado", member.text("stateStr")),
+                ("saúde", member.text("health")),
+                (
+                    "atraso para o primário",
+                    match member.text("stateStr").as_str() {
+                        "PRIMARY" => "é o primário".to_string(),
+                        _ => duration(lag),
+                    },
+                ),
+                ("último optime", member.text("optimeDate")),
+                ("último heartbeat", member.text("lastHeartbeatRecv")),
+                ("ping", format!("{} ms", member.text("pingMs"))),
+                ("no ar há", duration(member.num("uptime"))),
+                ("erro no heartbeat", member.text("lastHeartbeatMessage")),
+            ],
+            Vec::new(),
         );
         if member.num("health") == 0.0 {
             report.grave(
@@ -2443,7 +2547,7 @@ fn sharding(conn: &mut mongo::Conn, report: &mut Report) -> Result<(), String> {
     report.section("Sharding");
     report.table(&["shard", "endereço", "estado"]);
     for shard in shards.list("shards").iter().filter_map(Value::as_doc) {
-        report.cells(
+        report.cells_deep(
             vec![
                 shard.text("_id"),
                 one_line(&shard.text("host"), 90),
@@ -2453,6 +2557,12 @@ fn sharding(conn: &mut mongo::Conn, report: &mut Report) -> Result<(), String> {
                 },
             ],
             Tone::Normal,
+            vec![
+                ("shard", shard.text("_id")),
+                ("estado", shard.text("state")),
+                ("etiquetas", shard.text("tags")),
+            ],
+            quebrar(&shard.text("host"), 120),
         );
     }
     if let Some(balanceador) = ask(
