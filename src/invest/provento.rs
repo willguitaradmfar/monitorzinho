@@ -52,6 +52,8 @@ pub struct Cache {
     /// Por ativo, para não refazer a busca de quem já respondeu.
     por_ativo: Arc<Mutex<HashMap<AssetId, Vec<Anunciado>>>>,
     pedidos: Arc<Mutex<Vec<AssetId>>>,
+    /// Quando a última rodada de rebusca começou. Ver `abrir_rodada`.
+    rodada: Arc<Mutex<Option<u64>>>,
     pendentes: Arc<AtomicUsize>,
 }
 
@@ -81,10 +83,13 @@ impl Cache {
         // soube. Quem responde «quando» é o registro de buscas — e sem registro nenhum,
         // como acontece na primeira vez que esta versão roda, o que se sabe é velho por
         // definição.
+        let agora = crate::db::agora();
         let em_dia = em_dia(
-            crate::invest::store::buscas()
-                .idade(crate::invest::store::fonte::ANUNCIADO, crate::db::agora()),
+            crate::invest::store::buscas().idade(crate::invest::store::fonte::ANUNCIADO, agora),
         );
+        if !em_dia {
+            self.abrir_rodada(agora);
+        }
         for ativo in ativos {
             let ja = em_dia
                 && self
@@ -108,6 +113,31 @@ impl Cache {
             self.buscar(providers, ativo.clone());
         }
         self.ja_tem()
+    }
+
+    /// Esquece o que já foi pedido, para a lista vencida poder ser buscada de novo — no
+    /// máximo uma rodada por `VALIDADE`.
+    ///
+    /// **É o que faz uma sessão longa continuar recebendo anúncio novo.** `pedidos`
+    /// existe para que a lista vencida não vire uma busca por desenho de tela, e ele
+    /// cumpria isso bem demais: uma vez preenchido, ele nunca esvaziava. Quem deixa o
+    /// programa aberto por uma semana parava de ver provento anunciado no segundo dia, e
+    /// a única coisa que destravava era reiniciar — porque `pedidos` nasce vazio.
+    ///
+    /// A rodada é carimbada **aqui** e não quando a busca volta: se a fonte estiver fora
+    /// do ar, o carimbo de busca não anda, e sem este segundo relógio cada desenho de
+    /// tela abriria uma rodada nova contra um serviço que já disse que não.
+    fn abrir_rodada(&self, agora: u64) {
+        let Ok(mut rodada) = self.rodada.lock() else {
+            return;
+        };
+        if rodada.is_some_and(|em| agora.saturating_sub(em) < VALIDADE) {
+            return;
+        }
+        *rodada = Some(agora);
+        if let Ok(mut pedidos) = self.pedidos.lock() {
+            pedidos.clear();
+        }
     }
 
     pub fn pendentes(&self) -> usize {
@@ -166,6 +196,29 @@ mod tests {
     #[test]
     fn sem_registro_de_busca_a_lista_e_velha_por_definicao() {
         assert!(!em_dia(None));
+    }
+
+    /// A rodada de rebusca reabre, e é o que mantém uma sessão longa recebendo anúncio.
+    ///
+    /// Sem ela, `pedidos` enchia uma vez e nunca mais esvaziava: quem deixasse o programa
+    /// aberto parava de ver provento novo no segundo dia, e só reiniciar destravava.
+    #[test]
+    fn a_rodada_reabre_depois_da_validade_e_nao_antes() {
+        let cache = Cache::default();
+        let ativo = AssetId::parse("B3/PETR4").expect("lê o ticker");
+        let pediu = |cache: &Cache| {
+            cache.pedidos.lock().unwrap().push(ativo.clone());
+        };
+
+        cache.abrir_rodada(1_000);
+        pediu(&cache);
+        // Dentro da validade a rodada não reabre — senão cada desenho de tela viraria uma
+        // busca.
+        cache.abrir_rodada(1_000 + VALIDADE - 1);
+        assert_eq!(cache.pedidos.lock().unwrap().len(), 1);
+        // Passada a validade, o que já foi pedido é esquecido e pode ser buscado de novo.
+        cache.abrir_rodada(1_000 + VALIDADE);
+        assert!(cache.pedidos.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -19,6 +19,8 @@ use crate::invest::module::{
     Outcome, Pane, Row, Tone,
 };
 use crate::invest::modules::comum::{Formulario, Lista, hint};
+use crate::invest::modules::patrimonio;
+use crate::invest::tempo::{self, Data};
 
 pub struct Carteiras;
 
@@ -166,6 +168,116 @@ fn cartao(carteira: &Carteira, p: &crate::invest::carteiras::Plano, patrimonio: 
         selected: None,
         query: String::new(),
         note: Some((rodape, Tone::Destaque)),
+    }
+}
+
+/// A performance da carteira dia a dia, nos últimos trinta dias.
+fn grafico_diario(ctx: &Ctx, carteira: &Carteira, agora: f64) -> Pane {
+    let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
+    grafico(
+        ctx,
+        carteira,
+        "dia a dia · 30 dias",
+        patrimonio::ultimos_dias(&hoje, 30),
+        agora,
+    )
+}
+
+/// A mesma carteira mês a mês, nos últimos doze meses.
+fn grafico_mensal(ctx: &Ctx, carteira: &Carteira, agora: f64) -> Pane {
+    let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
+    grafico(
+        ctx,
+        carteira,
+        "mês a mês · 12 meses",
+        patrimonio::ultimos_meses(&hoje, 12),
+        agora,
+    )
+}
+
+/// Quanto valeram **as posições desta carteira** em cada uma das datas, pelo histórico de
+/// preço delas.
+///
+/// **A quantidade é a de hoje em todas as datas, e a nota diz isso.** É o que faz o
+/// gráfico responder «a carteira valorizou ou desvalorizou», que é a pergunta: um aporte
+/// feito no meio do período entraria como um degrau para cima e leria como valorização.
+/// A conta é a mesma do Patrimônio, com o mesmo cache de séries — ver
+/// `patrimonio::reconstruir_de`; só o recorte muda.
+fn grafico(
+    ctx: &Ctx,
+    carteira: &Carteira,
+    periodo: &str,
+    pontos: Vec<(String, Data)>,
+    agora: f64,
+) -> Pane {
+    let (rotulos, datas): (Vec<String>, Vec<Data>) = pontos.into_iter().unzip();
+    let nome = carteira.nome.clone();
+    // Sem nenhuma posição marcada como desta carteira não há o que reconstruir — e o
+    // motivo é outro: não é que falte histórico, é que falta o vínculo.
+    if !ctx
+        .portfolio
+        .posicoes
+        .iter()
+        .any(|p| p.carteira.as_deref() == Some(nome.as_str()))
+    {
+        return Pane::Empty {
+            title: periodo.into(),
+            note: format!(
+                "Nenhuma posição marcada como da carteira «{nome}».\n\n\
+                 Em Posições, Enter num ativo e preencha o campo «carteira» — o \n\
+                 vínculo é do papel, e vale em todas as corretoras."
+            ),
+        };
+    }
+
+    let r = match patrimonio::reconstruir_de(ctx, &datas, &|l| {
+        l.posicao.carteira.as_deref() == Some(nome.as_str())
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            return Pane::Empty {
+                title: periodo.into(),
+                // Sem ponto depois do `{e}`: a mensagem de «buscando…» já termina em
+                // reticências, e as duas coladas viram «buscando 3….».
+                note: format!(
+                    "{e}\n\n\
+                     A curva sai do histórico de preço das posições marcadas como \n\
+                     desta carteira."
+                ),
+            };
+        }
+    };
+    let nota = match r.ressalva() {
+        Some(ressalva) => format!("quantidades de hoje · {ressalva}"),
+        None => "só preço, com as quantidades de hoje".into(),
+    };
+    let mut valores = r.valores;
+
+    // A ponta direita é o valor de agora — a mesma regra do Patrimônio: o histórico
+    // termina no último pregão fechado, e deixá-lo ali faria «hoje» ser um número e o
+    // total no alto da tela ser outro. **Só o último ponto**; o passado é fato.
+    let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
+    if datas.last() == Some(&hoje)
+        && agora > 0.0
+        && let Some(ultimo) = valores.last_mut()
+    {
+        *ultimo = agora;
+    }
+
+    // A variação da ponta a ponta no título: a forma mostra o andamento, e o número diz
+    // de quanto ele foi.
+    let variacao = match (valores.first(), valores.last()) {
+        (Some(de), Some(ate)) if *de > 0.0 => format!(" · {}", calc::pct((ate / de - 1.0) * 100.0)),
+        _ => String::new(),
+    };
+
+    Pane::Chart {
+        title: format!("{periodo}{variacao}"),
+        series: valores,
+        format: |v| format!("R$ {}", calc::moeda(v)),
+        marks: Vec::new(),
+        x_labels: rotulos,
+        note: Some(nota),
     }
 }
 
@@ -490,12 +602,27 @@ impl ModuleView for Vista {
                 }),
             ),
             (
-                2,
-                Layout::one(Pane::Bars {
-                    title: format!("O que aportar · {}", unidade.label()),
-                    rows: barras,
-                    full: Some(100.0),
-                }),
+                3,
+                Layout::cols(vec![
+                    // Os dois gráficos, um embaixo do outro: o dia a dia responde «o que
+                    // aconteceu esta semana» e o mês a mês responde «para onde isto vem
+                    // indo», e são perguntas diferentes sobre a mesma carteira.
+                    (
+                        3,
+                        Layout::rows(vec![
+                            (1, Layout::one(grafico_diario(ctx, carteira, p.total))),
+                            (1, Layout::one(grafico_mensal(ctx, carteira, p.total))),
+                        ]),
+                    ),
+                    (
+                        2,
+                        Layout::one(Pane::Bars {
+                            title: format!("O que aportar · {}", unidade.label()),
+                            rows: barras,
+                            full: Some(100.0),
+                        }),
+                    ),
+                ]),
             ),
         ])
     }
@@ -715,5 +842,45 @@ impl Vista {
         });
         self.form = None;
         Outcome::Editar(vec![Edit::SetCarteira(Box::new(nova))])
+    }
+}
+
+#[cfg(test)]
+mod grafico_tests {
+    use super::*;
+    use crate::invest::model::Portfolio;
+    use crate::invest::module::{ctx_de_teste, providers_de_teste};
+    use crate::invest::provider::MarketSnapshot;
+
+    /// Uma carteira sem nenhum ativo vinculado diz **isso**, e não «falta histórico».
+    ///
+    /// São dois problemas diferentes e só um deles se resolve esperando a rede: uma tela
+    /// que diz «buscando o histórico de 0 papéis» manda esperar por uma busca que nunca
+    /// vai acontecer, porque não há o que buscar.
+    #[test]
+    fn sem_ativo_vinculado_o_grafico_diz_o_que_falta() {
+        let portfolio = Portfolio {
+            carteiras: vec![Carteira {
+                nome: "Nord".into(),
+                alvos: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let market = MarketSnapshot::default();
+        let providers = providers_de_teste();
+        let ctx = ctx_de_teste(&portfolio, &market, &providers);
+
+        for pane in [
+            grafico_diario(&ctx, &portfolio.carteiras[0], 0.0),
+            grafico_mensal(&ctx, &portfolio.carteiras[0], 0.0),
+        ] {
+            let Pane::Empty { note, .. } = pane else {
+                panic!("sem posição vinculada o gráfico não tem série para desenhar");
+            };
+            assert!(
+                note.contains("Nenhuma posição marcada como da carteira «Nord»"),
+                "a tela tem que dizer qual carteira está sem ativo: {note}"
+            );
+        }
     }
 }

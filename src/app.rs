@@ -1483,11 +1483,14 @@ pub struct TextView {
 /// Três caminhos, porque o certo depende de onde o programa está rodando — e ele
 /// frequentemente não está rodando onde você está:
 ///
+/// * **O próprio tmux**, quando o programa está dentro de um. É o caminho certo ali, e
+///   não a sequência embrulhada: desde o tmux 3.3 o `allow-passthrough` vem **desligado**,
+///   e um embrulho desses é engolido sem aviso nenhum — que é exatamente a cara de «o `c`
+///   não copia». Ver `tmux_buffer`.
 /// * **OSC 52**, a sequência que pede ao terminal para pôr um texto na área de
-///   transferência. É a única que funciona quando o monitorzinho está numa máquina e você
-///   está em outra, porque quem executa é o seu terminal, do seu lado da conexão SSH.
-///   Dentro do tmux ela precisa de um envelope para atravessar, e o tmux ainda precisa
-///   estar com `set-clipboard on` — por isso o retorno nunca afirma que deu certo.
+///   transferência. É a que funciona quando o monitorzinho está numa máquina e você
+///   está em outra, porque quem executa é o seu terminal, do seu lado da conexão SSH —
+///   e por isso o retorno nunca afirma que deu certo: não existe resposta.
 /// * **O programa do ambiente gráfico** (`wl-copy`, `xclip`, `xsel`, `pbcopy`), que
 ///   resolve quando o programa roda na mesma máquina em que você está sentado.
 /// * **O arquivo**, que sempre funciona e que é o único caminho honesto quando o terminal
@@ -1511,7 +1514,17 @@ fn copiar(titulo: &str, texto: &str) -> String {
         .and_then(|_| std::fs::write(&arquivo, texto))
         .is_ok();
 
-    let terminal = osc52(texto);
+    // Dentro do tmux, o tmux primeiro. Só se ele não estiver ali (ou recusar) é que a
+    // sequência vai direto — que é o caminho de quem está num SSH sem multiplexador.
+    let caminho = match tmux_buffer(texto) {
+        true => Caminho::Tmux {
+            repassa: tmux_repassa(),
+        },
+        false => match osc52(texto) {
+            true => Caminho::Terminal,
+            false => Caminho::Nenhum,
+        },
+    };
 
     // Só faz sentido na mesma máquina, e não há como saber daqui se é o caso: numa sessão
     // remota isto copia para a área de transferência do servidor, que não é a de ninguém.
@@ -1546,22 +1559,97 @@ fn copiar(titulo: &str, texto: &str) -> String {
     let linhas = texto.lines().count();
     let tamanho = crate::format::human_bytes(texto.len() as f64);
     let onde = match salvo {
-        true => format!(" · salvo em {}", arquivo.display()),
+        true => format!(" · e em {}", arquivo.display()),
         false => String::new(),
     };
-    match (terminal, local) {
-        (true, _) => format!(
-            "{linhas} linhas ({tamanho}) mandadas para a área de transferência do seu terminal{onde}"
+    match (caminho, local) {
+        // O tmux confirma: ele aceitou o texto e é ele quem fala com o seu terminal.
+        (Caminho::Tmux { repassa: true }, _) => {
+            format!("{linhas} linhas ({tamanho}) na área de transferência, via tmux{onde}")
+        }
+        // Ele aceitou, mas está configurado para não repassar: o texto está no buffer
+        // dele — `prefixo ]` cola — e não na área de transferência da sua máquina. Dizer
+        // «copiado» aqui seria a mentira mais fácil de contar desta tela.
+        (Caminho::Tmux { repassa: false }, _) => format!(
+            "{linhas} linhas ({tamanho}) no buffer do tmux (prefixo ] cola) — o tmux está com set-clipboard off{onde}"
         ),
-        (false, true) => format!("{linhas} linhas ({tamanho}) na área de transferência{onde}"),
-        (false, false) => match salvo {
+        // A sequência foi escrita. Se ela funcionou, só o Ctrl+V responde — um terminal
+        // que não faz OSC 52 a descarta calado, e prometer sucesso aqui seria mentir.
+        (Caminho::Terminal, _) => format!(
+            "{linhas} linhas ({tamanho}) pedidas ao seu terminal (OSC 52) — se não colar, o texto está em {}",
+            arquivo.display()
+        ),
+        (Caminho::Nenhum, true) => {
+            format!("{linhas} linhas ({tamanho}) na área de transferência{onde}")
+        }
+        (Caminho::Nenhum, false) => match salvo {
             true => format!(
-                "{linhas} linhas ({tamanho}) salvas em {}",
+                "grande demais para a área de transferência do terminal — {linhas} linhas ({tamanho}) salvas em {}",
                 arquivo.display()
             ),
             false => "não consegui copiar nem salvar o relatório".to_string(),
         },
     }
+}
+
+/// Por onde o texto saiu do programa.
+enum Caminho {
+    /// O tmux aceitou — ver `tmux_buffer`. `repassa` diz se ele leva daí para a área de
+    /// transferência da máquina de quem está olhando, ou se fica no buffer dele.
+    Tmux { repassa: bool },
+    /// A sequência OSC 52 foi escrita. Se o terminal a honrou, ninguém daqui sabe.
+    Terminal,
+    /// Nem um nem outro: sobra o arquivo, e o programa da área de trabalho local.
+    Nenhum,
+}
+
+/// Entrega o texto ao tmux, que é quem fala com o terminal de verdade lá do outro lado.
+///
+/// `load-buffer -w -` põe o texto no buffer do tmux **e** manda para a área de
+/// transferência do cliente, com o tmux emitindo a sequência ele mesmo. É o único caminho
+/// que funciona na configuração padrão de um tmux moderno: `allow-passthrough` é `off`
+/// desde a versão 3.3, e sem ele o embrulho `\x1bPtmux;…` que mandaríamos morre no
+/// multiplexador sem nunca chegar ao terminal — o texto não aparece em lugar nenhum e não
+/// há erro para mostrar. `set-clipboard`, que é quem autoriza o repasse, vem ligado
+/// (`external`) de fábrica.
+///
+/// O `-w` existe desde o tmux 3.2. Num tmux mais velho a chamada falha, e aí o caminho
+/// volta a ser a sequência direta.
+/// Se o tmux está configurado para levar o buffer até a área de transferência do cliente.
+///
+/// `set-clipboard` vem `external` de fábrica, que é o que se quer; `off` existe e é uma
+/// configuração legítima de quem não quer que um programa remoto mexa na área de
+/// transferência dele. Quando está `off`, a tela precisa dizer isso em vez de afirmar que
+/// copiou.
+fn tmux_repassa() -> bool {
+    std::process::Command::new("tmux")
+        .args(["show", "-gv", "set-clipboard"])
+        .output()
+        .map(|saida| String::from_utf8_lossy(&saida.stdout).trim() != "off")
+        .unwrap_or(true)
+}
+
+fn tmux_buffer(texto: &str) -> bool {
+    use std::io::Write;
+    if std::env::var_os("TMUX").is_none() {
+        return false;
+    }
+    let filho = std::process::Command::new("tmux")
+        .args(["load-buffer", "-w", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut filho) = filho else {
+        return false;
+    };
+    let escreveu = filho
+        .stdin
+        .as_mut()
+        .map(|entrada| entrada.write_all(texto.as_bytes()).is_ok())
+        .unwrap_or(false);
+    drop(filho.stdin.take());
+    escreveu && filho.wait().map(|saida| saida.success()).unwrap_or(false)
 }
 
 /// Pede ao terminal — o seu, do outro lado da conexão — para pôr o texto na área de
@@ -3706,13 +3794,37 @@ impl App {
         }
     }
 
+    /// Um texto colado inteiro no campo em foco.
+    ///
+    /// As quebras de linha entram **como são**: o campo do kubeconfig é o motivo de isto
+    /// existir, e um YAML sem as quebras não é um YAML. Quem desenha o campo mostra um
+    /// resumo quando o valor tem mais de uma linha — ver `field_value`.
+    pub fn wizard_paste(&mut self, texto: &str) {
+        if let Focus::Wizard(wizard) = &mut self.focus
+            && wizard.step == WizardStep::Params
+            && let Some(field) = wizard.fields.get_mut(wizard.field)
+            && matches!(field.spec.kind, ParamKind::Text)
+        {
+            field.value.push_str(texto);
+            wizard.error = None;
+        }
+    }
+
     pub fn wizard_backspace(&mut self) {
         if let Focus::Wizard(wizard) = &mut self.focus
             && wizard.step == WizardStep::Params
             && let Some(field) = wizard.fields.get_mut(wizard.field)
             && matches!(field.spec.kind, ParamKind::Text)
         {
-            field.value.pop();
+            // Um valor colado de várias linhas sai inteiro de uma vez. Ele não foi
+            // digitado caractere a caractere, e apagar um kubeconfig de três mil letras
+            // com três mil toques não é uma coisa que se peça a alguém.
+            match field.value.contains('\n') {
+                true => field.value.clear(),
+                false => {
+                    field.value.pop();
+                }
+            }
             wizard.error = None;
         }
     }

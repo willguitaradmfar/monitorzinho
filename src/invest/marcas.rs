@@ -120,14 +120,20 @@ impl<'a> Pintor<'a> {
         Self { marks, alvo: None }
     }
 
-    /// A cor da linha de uma tabela, com a coluna de cada tipo resolvida contra os
-    /// cabeçalhos **desta** tabela.
-    pub fn tabela(&self, headers: &[String], row: &Row) -> Option<MarkColor> {
+    /// A cor da linha de uma tabela **e em que coluna ela vale**, com a coluna de cada
+    /// tipo resolvida contra os cabeçalhos desta tabela.
+    ///
+    /// A coluna volta junto porque numa tela de mercado a cor já é linguagem: verde e
+    /// vermelho dizem o sinal do número, e pintar a linha inteira da cor da marca
+    /// apagava justamente isso — a coluna «Contra a leitura anterior» perdia o sinal no
+    /// instante em que alguém marcava o indicador. O assunto de uma marca é **uma
+    /// célula** — o ticker, o nome do indicador —, e é ela que se pinta.
+    pub fn tabela(&self, headers: &[String], row: &Row) -> Option<(MarkColor, usize)> {
         let alvo = self.alvo.as_ref()?;
         let tipos = tipos(alvo, headers);
         self.marks
             .hit(alvo.tabela, &tipos, &como_tabela(row))
-            .map(|hit| hit.color)
+            .map(|hit| (hit.color, hit.column))
     }
 
     /// A cor de uma linha que não tem colunas nomeadas — um fato, uma barra, uma célula
@@ -233,10 +239,40 @@ mod tests {
         let cabecalhos = vec!["Ativo".to_string()];
         assert_eq!(
             pintor.tabela(&cabecalhos, &Row::new(vec!["PETR4".into()])),
-            Some(MarkColor::Verde)
+            Some((MarkColor::Verde, 0))
         );
         assert_eq!(
             pintor.tabela(&cabecalhos, &Row::new(vec!["VALE3".into()])),
+            None
+        );
+    }
+
+    /// A marca diz **de que coluna** ela fala, e não só de que cor é.
+    ///
+    /// É o que faz o desenho pintar o ticker e deixar em paz a coluna ao lado, onde
+    /// verde e vermelho já querem dizer o sinal do número. Com a coluna errada, marcar
+    /// um papel apagaria a variação dele.
+    #[test]
+    fn a_marca_diz_a_coluna_do_assunto() {
+        let marks = com_marca("PETR4", MarkColor::Verde);
+        let pintor = Pintor::novo(
+            &marks,
+            Some(Marcavel {
+                tabela: "invest-x",
+                nome: "X",
+                tipos: TIPOS,
+            }),
+        );
+        // «Ativo» é a segunda coluna nesta tela, e a marca tem que dizer 1.
+        let cabecalhos = vec!["Data".to_string(), "Ativo".to_string()];
+        assert_eq!(
+            pintor.tabela(&cabecalhos, &Row::new(vec!["08/09".into(), "PETR4".into()])),
+            Some((MarkColor::Verde, 1))
+        );
+        // E o valor da outra coluna não casa: a marca é sobre o ticker, não sobre a
+        // linha inteira.
+        assert_eq!(
+            pintor.tabela(&cabecalhos, &Row::new(vec!["PETR4".into(), "VALE3".into()])),
             None
         );
     }

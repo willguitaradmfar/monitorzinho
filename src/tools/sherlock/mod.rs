@@ -38,10 +38,12 @@ use crate::painel::{Layout, Pane, Row, Tone};
 
 use super::{
     Board, Card, EventKind, Execution, MARK_ALERTA, MARK_AVISO, MARK_SUGESTAO, ParamSpec, Recorder,
-    Tool, lock_board,
+    Suggestion, Tool, lock_board,
 };
 
 mod bson;
+mod k8s;
+mod k8s_checks;
 mod mongo;
 mod mongo_checks;
 mod pg;
@@ -62,6 +64,7 @@ const ENGINES: &[&str] = &[
     "PostgreSQL — diagnóstico do banco",
     "MongoDB — diagnóstico do banco",
     "Linux por SSH — diagnóstico da máquina",
+    "Kubernetes — diagnóstico do cluster",
 ];
 const DEPTHS: &[&str] = &["raso", "médio", "profundo"];
 
@@ -84,6 +87,8 @@ pub enum Engine {
     Mongo,
     /// Uma máquina inteira, alcançada pelo `ssh` que já está instalado aqui.
     Ssh,
+    /// Um cluster inteiro, alcançado pelo `kubectl` que já está instalado aqui.
+    Kube,
 }
 
 impl Engine {
@@ -93,6 +98,7 @@ impl Engine {
         match texto {
             t if t.starts_with("MongoDB") => Engine::Mongo,
             t if t.starts_with("Linux") || t.starts_with("SSH") => Engine::Ssh,
+            t if t.starts_with("Kubernetes") || t.starts_with("K8s") => Engine::Kube,
             _ => Engine::Postgres,
         }
     }
@@ -101,6 +107,7 @@ impl Engine {
     /// formulário mostra.
     const BANCOS: &'static [&'static str] = &[ENGINES[0], ENGINES[1]];
     const MAQUINA: &'static [&'static str] = &[ENGINES[2]];
+    const CLUSTER: &'static [&'static str] = &[ENGINES[3]];
 }
 
 /// How hard to look, and therefore how much of the server's time to spend.
@@ -175,7 +182,7 @@ impl Tool for SherlockTool {
     }
 
     fn description(&self) -> &'static str {
-        "Diagnóstico completo, e só de leitura: um Postgres, um MongoDB ou uma máquina Linux inteira por SSH — o que está lento, o que está faltando, o que está prestes a acabar e o que está aberto para o mundo"
+        "Diagnóstico completo, e só de leitura: um Postgres, um MongoDB, uma máquina Linux por SSH ou um cluster de Kubernetes — o que está lento, o que está faltando, o que está prestes a acabar e o que está aberto para o mundo"
     }
 
     fn params(&self) -> Vec<ParamSpec> {
@@ -235,11 +242,33 @@ impl Tool for SherlockTool {
                 "Só se a máquina não aceita chave. Fica gravada junto com a execução, e chega ao ssh por uma variável de ambiente só dele — nunca pela linha de comando, que qualquer ps da máquina leria. Vazio usa chave e agente",
             )
             .only_when("motor", Engine::MAQUINA),
+            ParamSpec::text(
+                "kubeconfig",
+                "Kubeconfig",
+                "",
+                "Vazio usa o que esta máquina já usa: o $KUBECONFIG, ou o ~/.kube/config. ←/→ oferece os arquivos que estão em ~/.kube. Aceita também o caminho de outro arquivo — ou o conteúdo colado, que fica gravado junto com a execução, credencial inclusive, e vira um arquivo temporário 0600 apagado quando a investigação termina",
+            )
+            .suggesting(kubeconfigs())
+            .only_when("motor", Engine::CLUSTER),
+            ParamSpec::text(
+                "contexto",
+                "Contexto",
+                "",
+                "Vazio usa o contexto atual do arquivo. Preencha para investigar outro cluster do mesmo kubeconfig sem trocar o contexto da sua máquina — nada aqui escreve no arquivo",
+            )
+            .only_when("motor", Engine::CLUSTER),
+            ParamSpec::text(
+                "namespace",
+                "Namespace (opcional)",
+                "",
+                "Vazio investiga o cluster inteiro. Preencha para olhar um namespace só — útil quando o acesso é restrito a ele, e aí o que é do cluster aparece como não lido em vez de sumir",
+            )
+            .only_when("motor", Engine::CLUSTER),
             ParamSpec::choice(
                 "nivel",
                 "Profundidade",
                 DEPTHS,
-                "Quanto investigar. 'raso' lê o que o sistema já sabe de cor; 'médio' soma o que exige estatística acumulada — queries lentas, vacuum, processos, erros registrados; 'profundo' mede tamanho de cada tabela, inchaço, inventário de pacotes e configuração de serviço. Mais achados, mais leitura do outro lado",
+                "Quanto investigar. 'raso' lê o que o sistema já sabe de cor; 'médio' soma o que exige estatística acumulada — queries lentas, vacuum, processos, erros registrados, RBAC e rede do cluster; 'profundo' mede tamanho de cada tabela, inchaço, inventário de pacotes, configuração de serviço, webhooks e CRDs. Mais achados, mais leitura do outro lado",
             ),
         ]
     }
@@ -355,6 +384,22 @@ impl Tool for SherlockTool {
     }
 }
 
+/// Os kubeconfigs que já existem nesta máquina, como sugestões do campo.
+///
+/// A primeira é a vazia — «o que esta máquina já usa» —, para quem anda a lista de cima
+/// para baixo começar onde já está.
+fn kubeconfigs() -> Vec<Suggestion> {
+    let mut v = vec![Suggestion::new(
+        "",
+        "o que esta máquina já usa ($KUBECONFIG ou ~/.kube/config)",
+    )];
+    for caminho in k8s::candidatos() {
+        let nome = caminho.display().to_string();
+        v.push(Suggestion::new(nome, "arquivo em ~/.kube"));
+    }
+    v
+}
+
 /// Everything the form amounts to, already validated.
 pub struct Plan {
     engine: Engine,
@@ -371,6 +416,11 @@ pub struct Plan {
     /// caminho normal e o melhor. Preenchida, a senha vai até o `ssh` por uma variável de
     /// ambiente só dele — ver `ssh::Target::run`.
     senha: String,
+    /// Os três da engine de cluster. O primeiro é um caminho, ou o conteúdo colado, ou
+    /// vazio — que quer dizer «o kubeconfig que esta máquina já usa».
+    kubeconfig: String,
+    contexto: String,
+    namespace: String,
 }
 
 impl Plan {
@@ -381,9 +431,13 @@ impl Plan {
             // A máquina não tem string de conexão: o que a identifica é o host, e o resto
             // do que o `ssh` precisa saber está em campos próprios.
             Engine::Ssh => get("host").to_string(),
+            // O cluster também não: quem o identifica é o kubeconfig, que pode
+            // legitimamente estar vazio — é o caso mais comum, o arquivo que a máquina já
+            // usa. Por isso esta engine escapa da exigência abaixo.
+            Engine::Kube => get("kubeconfig").to_string(),
             _ => get("url").to_string(),
         };
-        if url.is_empty() {
+        if url.is_empty() && engine != Engine::Kube {
             return Err(match engine {
                 Engine::Ssh => "informe a máquina".to_string(),
                 _ => "informe a string de conexão".to_string(),
@@ -398,6 +452,9 @@ impl Plan {
             porta: get("porta_ssh").to_string(),
             chave: get("chave").to_string(),
             senha: get("senha").to_string(),
+            kubeconfig: get("kubeconfig").to_string(),
+            contexto: get("contexto").to_string(),
+            namespace: get("namespace").to_string(),
         };
         // Parsed here, while the user is still looking at the form: a URL that can't be
         // read is the one failure that must never wait until someone opens the module.
@@ -410,6 +467,7 @@ impl Plan {
             Engine::Postgres => pg::Target::parse(&self.url, &self.database).map(|_| ()),
             Engine::Mongo => mongo::Target::parse(&self.url, &self.database).map(|_| ()),
             Engine::Ssh => ssh::Target::parse(self).map(|_| ()),
+            Engine::Kube => k8s::Target::parse(self).map(|_| ()),
         }
     }
 
@@ -424,6 +482,9 @@ impl Plan {
                 .unwrap_or_default(),
             Engine::Ssh => ssh::Target::parse(self)
                 .map(|target| format!("ssh {}", target.summary()))
+                .unwrap_or_default(),
+            Engine::Kube => k8s::Target::parse(self)
+                .map(|target| format!("k8s {}", target.summary()))
                 .unwrap_or_default(),
         }
     }
@@ -508,6 +569,7 @@ enum Session {
     Postgres(Box<pg_checks::Session>),
     Mongo(Box<mongo_checks::Session>),
     Maquina(Box<ssh_checks::Session>),
+    Cluster(Box<k8s_checks::Session>),
 }
 
 impl Session {
@@ -516,6 +578,7 @@ impl Session {
             Engine::Postgres => Session::Postgres(Box::new(pg_checks::Session::open(plan)?)),
             Engine::Mongo => Session::Mongo(Box::new(mongo_checks::Session::open(plan)?)),
             Engine::Ssh => Session::Maquina(Box::new(ssh_checks::Session::open(plan)?)),
+            Engine::Kube => Session::Cluster(Box::new(k8s_checks::Session::open(plan)?)),
         })
     }
 
@@ -524,6 +587,7 @@ impl Session {
             Session::Postgres(session) => session.pass(report),
             Session::Mongo(session) => session.pass(report),
             Session::Maquina(session) => session.pass(report),
+            Session::Cluster(session) => session.pass(report),
         }
     }
 }

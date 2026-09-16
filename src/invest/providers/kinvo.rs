@@ -173,12 +173,16 @@ fn anunciados(
 ) -> Result<Vec<crate::invest::provento::Anunciado>, FeedError> {
     use crate::invest::provento::Anunciado;
     let valor = feed::get_json(url)?;
-    let meses = valor
-        .get("data")
-        .and_then(|d| d.get("dateCom"))
-        .and_then(|d| d.get("months"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| FeedError::Formato("resposta sem «dateCom.months»".into()))?;
+    // `dateCom` presente e **vazio** é a resposta de quem nunca pagou nada — o AXIA3
+    // volta com `{"dateCom": {}}` e HTTP 200. Isso é uma lista vazia, não um formato
+    // quebrado: tratá-lo como erro fazia a busca não carimbar, e um papel assim nunca
+    // marcava a fonte como respondida.
+    let Some(mapa) = valor.get("data").and_then(|d| d.get("dateCom")) else {
+        return Err(FeedError::Formato("resposta sem «data.dateCom»".into()));
+    };
+    let Some(meses) = mapa.get("months").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
     let mut saida: Vec<Anunciado> = meses
         .iter()
         .filter_map(|m| m.get("values")?.as_array())
@@ -189,10 +193,7 @@ fn anunciados(
             let por_cota = d.get("payment")?.as_f64().filter(|v| *v > 0.0)?;
             Some(Anunciado {
                 ativo: ativo.clone(),
-                em: crate::invest::tempo::epoch_de_iso(&format!(
-                    "{}T00:00:00Z",
-                    d.get("eventDate")?.as_str()?
-                ))?,
+                em: data_com(d.get("eventDate")?.as_str()?)?,
                 por_cota,
                 dy: d
                     .get("dividendYield")
@@ -205,6 +206,18 @@ fn anunciados(
     // chegada mistura 2018 com 2026.
     saida.sort_by_key(|a| std::cmp::Reverse(a.em));
     Ok(saida)
+}
+
+/// `2026-08-31` como instante — **meio-dia de Brasília daquele dia**.
+///
+/// A data-com é uma data de pregão da B3, sem hora e sem fuso: ela não significa um
+/// instante, significa um dia. Quem a lê de volta pergunta `Data::de_epoch(em,
+/// BRT_OFFSET)`, e é aí que a escolha do instante importa — lida como meia-noite **UTC**,
+/// toda data-com voltava três horas para trás e virava o dia anterior na tela. Um provento
+/// anunciado para 31/08 aparecia como 30/08, todos eles, sempre. Meio-dia porque ele está
+/// longe das duas bordas: nenhum fuso que a B3 use o empurra para outro dia.
+fn data_com(dia: &str) -> Option<u64> {
+    crate::invest::tempo::epoch_de_iso(&format!("{dia}T12:00:00-03:00"))
 }
 
 /// Uma cotação a partir da série intradiária de um ticker.
@@ -434,6 +447,25 @@ mod tests {
 #[cfg(test)]
 mod proventos_tests {
     use super::*;
+
+    /// A data-com é um **dia**, e tem que voltar sendo o mesmo dia em Brasília.
+    ///
+    /// O erro que este teste tranca era silencioso e valia para todos: lida como
+    /// meia-noite UTC, a data-com de 31/08 aparecia na tela como 30/08 — três horas para
+    /// trás bastam para trocar o dia, e a tela da Invest lê tudo em BRT.
+    #[test]
+    fn a_data_com_nao_anda_um_dia_para_tras() {
+        use crate::invest::tempo::{BRT_OFFSET, Data};
+        for dia in ["2026-08-31", "2026-01-01", "2026-12-31", "2026-03-19"] {
+            let em = data_com(dia).expect("lê a data");
+            let d = Data::de_epoch(em, BRT_OFFSET);
+            assert_eq!(
+                format!("{}-{:02}-{:02}", d.ano, d.mes, d.dia),
+                dia,
+                "a data-com {dia} voltou como outro dia"
+            );
+        }
+    }
 
     /// Ao vivo: `cargo test -- --ignored proventos`.
     #[test]

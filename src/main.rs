@@ -1,7 +1,9 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -40,7 +42,7 @@ fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         original_hook(panic_info);
     }));
 }
@@ -160,14 +162,21 @@ fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Colagem entre marcas: sem ela, colar um arquivo de várias linhas num campo chega
+    // como as teclas de cada caractere, e cada quebra de linha vira um Enter que envia o
+    // formulário no meio do texto. É o que permite colar um kubeconfig inteiro.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal, pedido);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -189,8 +198,9 @@ fn open_shell(
     let outcome = app.run_shell(container, size);
 
     // Volta para a tela alternativa e reconstrói o quadro do zero: o shell escreveu por
-    // toda a tela, e o `ratatui` só redesenha o que ele acha que mudou.
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    // toda a tela, e o `ratatui` só redesenha o que ele acha que mudou. A colagem entre
+    // marcas é religada junto: o programa que rodou no lugar dela pode tê-la desligado.
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     terminal.clear()?;
     if let Err(error) = outcome {
         app.report_shell_failure(error);
@@ -221,7 +231,7 @@ fn open_attach(
     enable_raw_mode()?;
     // Volta para a tela alternativa e reconstrói o quadro do zero: o tmux escreveu por
     // toda a tela, e o `ratatui` só redesenha o que ele acha que mudou.
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     terminal.clear()?;
     if let Err(error) = outcome {
         app.report_attach_failure(error);
@@ -315,6 +325,15 @@ fn run(
             // Any event at all, not just keys: a resize redraws too, and reading one
             // without acting on it would leave the screen at the old size.
             dirty = true;
+            // Um texto colado chega inteiro, como um evento só. Vai para o formulário
+            // de ferramenta e para lugar nenhum mais: é ali que existe um campo que
+            // legitimamente recebe um arquivo inteiro — o kubeconfig do Sherlock —, e
+            // aceitar colagem no resto da interface seria abrir caminho para um texto de
+            // mil linhas cair numa caixa de busca.
+            if let Event::Paste(texto) = event {
+                app.wizard_paste(&texto);
+                continue;
+            }
             if let Event::Key(key) = event {
                 // Ctrl+C twice in a row is the one and only way out: the first press arms
                 // the quit, the second confirms it, and any other key in between disarms

@@ -123,12 +123,19 @@ impl Mark {
     }
 }
 
-/// What the marks have to say about one row: which colour it wears, and whether the
-/// mark that put it there reaches its children too.
+/// What the marks have to say about one row: which colour it wears, whether the mark
+/// that put it there reaches its children too, and which cell it is actually about.
 #[derive(Clone, Copy)]
 pub struct Hit {
     pub color: MarkColor,
     pub subtree: bool,
+    /// The column of the kind that matched — the ticker, the indicator's name, the port.
+    ///
+    /// The subject of a mark is one cell, not the whole row, and a screen whose other
+    /// columns already carry meaning in their colour needs to know which one. Nothing
+    /// forces a painter to use it: the system tables still wear the colour across the
+    /// row, where no column is coloured for any other reason.
+    pub column: usize,
 }
 
 /// Every run of digits in a cell, so a number is compared as a number: the port column
@@ -266,8 +273,9 @@ impl Marks {
     }
 
     /// What the marks say about this row, or `None` where none of them is about it.
-    /// Where several match, the colour is the first one's — the list screen shows that
-    /// order, so the tie is broken by something the user can see and reorder.
+    /// Where several match, the colour — and the column — are the first one's: the list
+    /// screen shows that order, so the tie is broken by something the user can see and
+    /// reorder.
     pub fn hit(&self, table: &str, kinds: &[MarkKind], row: &TableRow) -> Option<Hit> {
         let mut hit: Option<Hit> = None;
         for mark in &self.all {
@@ -278,6 +286,13 @@ impl Marks {
                         *none = Some(Hit {
                             color: mark.color,
                             subtree: mark.subtree,
+                            // `matches` already found this kind — it is what made the
+                            // mark match at all, so the lookup cannot come up empty.
+                            column: kinds
+                                .iter()
+                                .find(|kind| kind.name == mark.kind)
+                                .map(|kind| kind.column)
+                                .unwrap_or(0),
                         });
                     }
                 }

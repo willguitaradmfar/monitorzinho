@@ -215,19 +215,74 @@ fn rotulo(nome: &str, de: &Data, ate: &Data) -> String {
     )
 }
 
+/// O fim de cada um dos últimos `n` meses, do mais antigo para o mais recente.
+///
+/// O ponto do mês corrente é **hoje**, e não o último dia dele: o mês não fechou, e uma
+/// data no futuro não tem cotação nenhuma para reconstruir.
+///
+/// Fora da `Vista` porque a carteira recomendada desenha os mesmos períodos — e duas
+/// listas de datas seriam duas chances de o eixo de um gráfico não bater com o do outro.
+///
+/// **O fim é o último dia do mês, e era o primeiro.** O cálculo anterior somava trinta e
+/// dois dias e voltava um mês, e `mes_anterior` zera o dia — então «ago/26» era o valor de
+/// 1º de agosto. O gráfico ficava com um salto de quarenta e seis dias entre o penúltimo
+/// ponto e hoje, e cada coluna mostrava o mês que tinha acabado de começar em vez do que
+/// tinha acabado.
+pub(super) fn ultimos_meses(hoje: &Data, n: usize) -> Vec<(String, Data)> {
+    let mut meses: Vec<(String, Data)> = Vec::new();
+    let mut m = *hoje;
+    for _ in 0..n {
+        let fim = match (m.ano, m.mes) == (hoje.ano, hoje.mes) {
+            true => *hoje,
+            // A véspera do primeiro dia do mês seguinte — o único jeito de dizer «o
+            // último dia» sem uma tabela de quantos dias cada mês tem.
+            false => {
+                let seguinte = m.mes_seguinte();
+                tempo::data_de_dias(tempo::dias_de(seguinte.ano, seguinte.mes, 1) - 1)
+            }
+        };
+        meses.push((rotulo_do_mes(&m), fim));
+        m = m.mes_anterior();
+    }
+    meses.reverse();
+    meses
+}
+
+/// `out/25` — o mês em três letras e o ano em dois dígitos.
+///
+/// Curto porque ele é rótulo de **eixo**: o eixo escreve todos os que couberem, e com
+/// «fevereiro/26» cabiam cinco de doze — e o quinto saía cortado no meio da palavra. As
+/// três primeiras letras do nome do mês já são a abreviação que se usa em português.
+fn rotulo_do_mes(m: &Data) -> String {
+    let nome: String = tempo::nome_mes(m.mes).chars().take(3).collect();
+    format!("{nome}/{:02}", m.ano % 100)
+}
+
+/// Os últimos `n` dias, um ponto por dia, do mais antigo para hoje.
+pub(super) fn ultimos_dias(hoje: &Data, n: i64) -> Vec<(String, Data)> {
+    let base = tempo::dias_de(hoje.ano, hoje.mes, hoje.dia);
+    (0..n)
+        .rev()
+        .map(|i| {
+            let d = tempo::data_de_dias(base - i);
+            (format!("{:02}/{:02}", d.dia, d.mes), d)
+        })
+        .collect()
+}
+
 /// A série reconstruída, com a ressalva de como ela foi montada.
-struct Reconstrucao {
-    valores: Vec<f64>,
+pub(super) struct Reconstrucao {
+    pub(super) valores: Vec<f64>,
     /// Quantas posições entraram com série de verdade.
-    com_serie: usize,
+    pub(super) com_serie: usize,
     /// Quantas entraram paradas no valor de hoje, por não terem cotação histórica.
-    parados: usize,
+    pub(super) parados: usize,
 }
 
 impl Reconstrucao {
     /// A ressalva do rodapé. Vazia quando toda a carteira tem série — aí não há o que
     /// ressalvar.
-    fn ressalva(&self) -> Option<String> {
+    pub(super) fn ressalva(&self) -> Option<String> {
         (self.parados > 0).then(|| {
             format!(
                 "hoje é o valor ao vivo · {} com série · {} sem cotação, parados",
@@ -260,6 +315,21 @@ struct Reconstruido {
 ///   afirmação certa: não é que valessem zero, é que não se sabe o que mudou — e o
 ///   rodapé diz quantos estão assim.
 fn reconstruir(ctx: &Ctx, datas: &[Data]) -> Result<Reconstrucao, String> {
+    reconstruir_de(ctx, datas, &|_| true)
+}
+
+/// O mesmo, sobre um **recorte** das posições — as de uma carteira recomendada, por
+/// exemplo.
+///
+/// O filtro é um parâmetro e não um segundo laço copiado porque as duas regras acima são
+/// justamente as que não podem divergir entre a curva do patrimônio e a de uma carteira:
+/// duas cópias seriam dois lugares para o degrau que não aconteceu voltar a aparecer em
+/// um deles.
+pub(super) fn reconstruir_de(
+    ctx: &Ctx,
+    datas: &[Data],
+    inclui: &dyn Fn(&carteira::Linha) -> bool,
+) -> Result<Reconstrucao, String> {
     use crate::invest::historico::Estado;
     if datas.is_empty() {
         return Err("sem período".into());
@@ -270,7 +340,10 @@ fn reconstruir(ctx: &Ctx, datas: &[Data]) -> Result<Reconstrucao, String> {
         .collect();
     // O valor de hoje de cada linha, já em BRL e já com câmbio e preço informado
     // resolvidos — é ele que serve de piso para quem não tem série.
-    let linhas = carteira::linhas(ctx.portfolio, ctx.market, ctx.agora);
+    let linhas: Vec<carteira::Linha> = carteira::linhas(ctx.portfolio, ctx.market, ctx.agora)
+        .into_iter()
+        .filter(|l| inclui(l))
+        .collect();
 
     let mut buscando = 0usize;
     let mut parados = 0usize;
@@ -430,35 +503,17 @@ impl Vista {
     /// O total de patrimônio no fim de cada um dos últimos doze meses.
     fn mensal(&self, ctx: &Ctx) -> Pane {
         let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
-        let mut meses: Vec<(String, Data)> = Vec::new();
-        let mut m = hoje;
-        for _ in 0..12 {
-            // O fim de cada mês; o do mês corrente é hoje, que ainda não fechou.
-            let fim = match (m.ano, m.mes) == (hoje.ano, hoje.mes) {
-                true => hoje,
-                false => {
-                    tempo::data_de_dias(tempo::dias_de(m.ano, m.mes, 1) - 1 + 32).mes_anterior()
-                }
-            };
-            meses.push((format!("{}/{}", tempo::nome_mes(m.mes), m.ano % 100), fim));
-            m = m.mes_anterior();
-        }
-        meses.reverse();
-        self.grafico(ctx, "Patrimônio por mês · 12 meses", meses)
+        self.grafico(
+            ctx,
+            "Patrimônio por mês · 12 meses",
+            ultimos_meses(&hoje, 12),
+        )
     }
 
     /// O total de patrimônio dia a dia, nos últimos sete dias.
     fn diario(&self, ctx: &Ctx) -> Pane {
         let hoje = Data::de_epoch(ctx.agora, tempo::BRT_OFFSET);
-        let base = tempo::dias_de(hoje.ano, hoje.mes, hoje.dia);
-        let dias: Vec<(String, Data)> = (0..7)
-            .rev()
-            .map(|i| {
-                let d = tempo::data_de_dias(base - i);
-                (format!("{:02}/{:02}", d.dia, d.mes), d)
-            })
-            .collect();
-        self.grafico(ctx, "Patrimônio dia a dia · 7 dias", dias)
+        self.grafico(ctx, "Patrimônio dia a dia · 7 dias", ultimos_dias(&hoje, 7))
     }
 
     /// Um dos dois gráficos: uma coluna por período, o tempo correndo para a direita.
@@ -891,5 +946,72 @@ mod tests {
         assert_eq!(domingo.dia_da_semana(), 0);
         let pontos = sextas(domingo);
         assert_eq!(*pontos.last().expect("há ponto"), domingo);
+    }
+}
+
+#[cfg(test)]
+mod periodos_tests {
+    use super::*;
+
+    /// Trinta dias são trinta pontos, terminando em hoje e sem buraco no meio.
+    ///
+    /// É a lista que os gráficos da carteira recomendada usam, e um erro de um dia aqui
+    /// vira um eixo que diz a data errada em todos eles.
+    #[test]
+    fn os_ultimos_dias_terminam_em_hoje_e_andam_de_um_em_um() {
+        let hoje = Data {
+            ano: 2026,
+            mes: 9,
+            dia: 16,
+        };
+        let dias = ultimos_dias(&hoje, 30);
+        assert_eq!(dias.len(), 30);
+        assert_eq!(dias.last().expect("há ponto").1, hoje);
+        // Trinta dias para trás a partir de 16/09 caem em 18/08.
+        assert_eq!(
+            dias.first().expect("há ponto").1,
+            Data {
+                ano: 2026,
+                mes: 8,
+                dia: 18
+            }
+        );
+        let passos: Vec<i64> = dias
+            .windows(2)
+            .map(|p| {
+                tempo::dias_de(p[1].1.ano, p[1].1.mes, p[1].1.dia)
+                    - tempo::dias_de(p[0].1.ano, p[0].1.mes, p[0].1.dia)
+            })
+            .collect();
+        assert!(passos.iter().all(|d| *d == 1), "passo diferente de um dia");
+    }
+
+    /// Doze meses são doze pontos, um por mês, e o do mês corrente é **hoje** — o mês não
+    /// fechou, e uma data no futuro não tem cotação para reconstruir.
+    #[test]
+    fn os_ultimos_meses_fecham_no_ultimo_dia_e_o_corrente_e_hoje() {
+        let hoje = Data {
+            ano: 2026,
+            mes: 9,
+            dia: 16,
+        };
+        let meses = ultimos_meses(&hoje, 12);
+        assert_eq!(meses.len(), 12);
+        assert_eq!(meses.last().expect("há ponto").1, hoje);
+        // O mês anterior fecha no dia 31 de agosto, e não no dia 16.
+        assert_eq!(
+            meses[10].1,
+            Data {
+                ano: 2026,
+                mes: 8,
+                dia: 31
+            }
+        );
+        // Doze meses seguidos: nenhum rótulo se repete, senão o eixo mente sobre onde as
+        // coisas estão.
+        let mut rotulos: Vec<&str> = meses.iter().map(|(r, _)| r.as_str()).collect();
+        rotulos.sort_unstable();
+        rotulos.dedup();
+        assert_eq!(rotulos.len(), 12);
     }
 }

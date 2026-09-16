@@ -2464,6 +2464,12 @@ fn field_value(
     match field.spec.kind {
         ParamKind::Choice(_) => (vec![value(format!("◂ {} ▸", field.value))], Vec::new()),
         ParamKind::Rules => (vec![value(rules_summary(&field.value))], Vec::new()),
+        // Um valor colado de várias linhas não cabe — e não deve caber: o que se quer
+        // ver dele é que ele está ali e qual é o tamanho dele, não o texto inteiro de um
+        // arquivo de configuração dentro de uma linha de formulário.
+        ParamKind::Text if field.value.contains('\n') => {
+            (vec![value(colado(&field.value))], Vec::new())
+        }
         ParamKind::Text if field.spec.suggestions.is_empty() => {
             let caret = if focused { "▏" } else { "" };
             let mut chunks = wrap(&format!("{}{caret}", field.value), width);
@@ -2534,6 +2540,15 @@ fn rules_summary(encoded: &str) -> String {
     }
 }
 
+/// O resumo de um texto colado: o que ele é e quanto ele tem.
+fn colado(valor: &str) -> String {
+    format!(
+        "«colado» {} linhas, {} caracteres  ⌫ apaga",
+        valor.lines().count(),
+        valor.chars().count()
+    )
+}
+
 fn value_style(focused: bool) -> Style {
     if focused {
         Style::default().fg(palette::YELLOW)
@@ -2598,9 +2613,16 @@ fn wizard_confirm_lines(app: &App, wizard: &ToolWizard) -> Vec<Line<'static>> {
                 // An optional field left blank still gets a line, so the confirmation
                 // shows the whole form rather than quietly hiding part of it.
                 ("", None) => Span::styled("(vazio)", Style::default().fg(palette::DIM)),
+                // Um arquivo colado vira o resumo dele também aqui: a última tela antes
+                // de conectar deve mostrar o que se vai usar, e o que se vai usar é «um
+                // kubeconfig de 42 linhas», não quarenta e duas linhas de YAML.
+                (value, _) if value.contains('\n') => Span::raw(colado(value)),
                 (value, _) => Span::raw(first_chunk(value, confirm_value_width())),
             },
         ]));
+        if field.value.contains('\n') {
+            continue;
+        }
         // The rest of a long value, under itself: the last screen before something
         // connects should show the whole of what it is about to connect to.
         for chunk in wrap(&field.value, confirm_value_width())
@@ -4173,7 +4195,10 @@ fn render_pane_table(
     let needle = query.to_lowercase();
     let visiveis: Vec<&crate::invest::module::Row> =
         rows.iter().filter(|r| r.matches(&needle)).collect();
-    let marcas: Vec<Option<MarkColor>> =
+    // A cor da marca **e a coluna de que ela fala** — o ticker, o nome do indicador. Ver
+    // `Pintor::tabela`: nesta aba a cor das outras colunas já é o sinal do número, e
+    // repintá-las apagaria a informação que se veio ler.
+    let marcas: Vec<Option<(MarkColor, usize)>> =
         visiveis.iter().map(|r| pintor.tabela(headers, r)).collect();
 
     // A coluna da estrela só aparece onde há estrela. Nas tabelas do sistema ela é fixa,
@@ -4190,7 +4215,7 @@ fn render_pane_table(
             let mut celulas: Vec<Cell> = Vec::with_capacity(r.cells.len() + 1);
             if marcada {
                 celulas.push(match marca {
-                    Some(cor) => Cell::from(Span::styled(
+                    Some((cor, _)) => Cell::from(Span::styled(
                         "★",
                         Style::default()
                             .fg(mark_color(cor))
@@ -4215,28 +4240,37 @@ fn render_pane_table(
                             .strip_suffix(sufixo.as_str())
                             .map(|antes| (antes.to_string(), sufixo.clone(), tone_color(*tom)))
                     });
-                // A linha seguida é da cor da marca inteira, célula por célula: o tom que
-                // o módulo pediu para cada coluna perde aqui de propósito. A estrela diz
-                // *qual* marca; a cor é o que o olho acha sem procurar, e ela só funciona
-                // se a linha for de uma cor só.
-                let cor = match marca {
-                    Some(cor) => mark_color(cor),
+                // **A marca pinta uma coluna, não a linha.**
+                //
+                // Pintar tudo era o desenho anterior, e nesta aba ele custava caro: a
+                // cor de cada coluna já quer dizer alguma coisa — verde e vermelho pelo
+                // sinal em «Contra a leitura anterior», em «Var%», no P&L —, e a marca
+                // por cima apagava justamente o que se veio ler. Quem diz que a linha
+                // está marcada é a estrela na borda, que não disputa nada com ninguém.
+                let marcada_aqui = marca.filter(|(_, coluna)| *coluna == i);
+                let cor = match marcada_aqui {
+                    Some((cor, _)) => mark_color(cor),
                     None => tone_color(r.cell_tones.get(i).copied().unwrap_or(r.tone)),
                 };
-                // A marca vence o rabicho: uma linha seguida é de uma cor só, e o
-                // amarelo do «não é de agora» dentro dela leria como outra marca.
-                let Some((antes, sufixo, cor_rabicho)) = rabicho.filter(|_| marca.is_none()) else {
-                    return Cell::from(com_seta(&texto, Style::default().fg(cor)));
+                // A marca vence o rabicho **dentro da célula dela**: a origem do preço em
+                // amarelo colada no ticker marcado leria como uma segunda marca.
+                let Some((antes, sufixo, cor_rabicho)) = rabicho.filter(|_| marcada_aqui.is_none())
+                else {
+                    return Cell::from(match marcada_aqui.is_some() {
+                        true => com_seta(
+                            &texto,
+                            Style::default().fg(cor).add_modifier(Modifier::BOLD),
+                        ),
+                        false => com_seta(&texto, Style::default().fg(cor)),
+                    });
                 };
                 let mut spans = com_seta(&antes, Style::default().fg(cor)).spans;
                 spans.push(Span::styled(sufixo, Style::default().fg(cor_rabicho)));
                 Cell::from(Line::from(spans))
             }));
             let linha = UiRow::new(celulas);
-            match (marca, r.tone) {
-                (Some(_), _) | (None, Tone::Destaque) => {
-                    linha.style(Style::default().add_modifier(Modifier::BOLD))
-                }
+            match r.tone {
+                Tone::Destaque => linha.style(Style::default().add_modifier(Modifier::BOLD)),
                 _ => linha,
             }
         })
@@ -4456,7 +4490,12 @@ fn render_pane_chart(
                 .max()
                 .unwrap_or(5)
                 + 2;
-            let cabem = (dentro.width as usize / largura.max(1)).clamp(2, x_labels.len());
+            // **A largura do eixo, e não a do painel.** A coluna dos rótulos do eixo
+            // vertical come uma dúzia de caracteres — a mesma que a reamostragem acima
+            // desconta —, e contar com ela fazia caber mais rótulo do que cabe: com doze
+            // meses, «nov/25» saía como «nov/2», cortado no último dígito do ano.
+            let eixo = dentro.width.saturating_sub(12).max(4) as usize;
+            let cabem = (eixo / largura.max(1)).clamp(2, x_labels.len());
             // Espaçados por igual, sempre com o primeiro e o último: um eixo que começa no
             // segundo ponto mente sobre onde a série começa.
             let amostrar = |n: usize| -> Vec<String> {
@@ -5437,4 +5476,89 @@ pub fn render_pane_teste(frame: &mut Frame, area: Rect, pane: &crate::invest::mo
         &Pintor::nenhum(&Default::default()),
         None,
     );
+}
+
+#[cfg(test)]
+mod marca_na_coluna_tests {
+    use super::*;
+    use crate::invest::marcas;
+    use crate::invest::module::{Pane, Row, Tone};
+    use crate::monitor::mark::{Mark, MarkColor, Marks};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// A cor de cada célula de uma linha, depois de desenhada com as marcas dadas.
+    fn cores_da_linha(marks: &Marks, headers: &[&str], row: Row) -> Vec<Color> {
+        let pane = Pane::Table {
+            title: "t".into(),
+            headers: headers.iter().map(|h| h.to_string()).collect(),
+            rows: vec![row],
+            selected: None,
+            query: String::new(),
+            note: None,
+        };
+        let pintor = marcas::Pintor::novo(marks, Some(crate::invest::marcas::ATIVOS));
+        let (largura, altura) = (60u16, 6u16);
+        let mut terminal = Terminal::new(TestBackend::new(largura, altura)).unwrap();
+        terminal
+            .draw(|f| render_pane(f, Rect::new(0, 0, largura, altura), &pane, &pintor, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        // A linha de dados é a terceira de dentro da moldura: borda, cabeçalho, linha.
+        (0..largura)
+            .map(|x| buffer[(x, 2)].style().fg.unwrap_or(Color::Reset))
+            .collect()
+    }
+
+    fn com_marca(valor: &str) -> Marks {
+        let mut marks = Marks::default();
+        marks.add(Mark {
+            table: marcas::ATIVOS.tabela.into(),
+            kind: "ativo".into(),
+            value: valor.into(),
+            subtree: false,
+            color: MarkColor::Roxo,
+        });
+        marks
+    }
+
+    /// Marcar um papel pinta **o ticker**, e deixa o sinal do número em paz.
+    ///
+    /// O sintoma que trouxe isto: com a linha inteira da cor da marca, marcar um
+    /// indicador em «Índices e macro» apagava o verde e o vermelho das colunas «Agora» e
+    /// «Contra a leitura anterior» — que são a coisa que se veio ler naquela tela.
+    #[test]
+    fn a_marca_pinta_so_a_coluna_do_assunto() {
+        let marks = com_marca("PETR4");
+        let cores = cores_da_linha(
+            &marks,
+            &["Ativo", "Var%"],
+            Row::new(vec!["PETR4".into(), "-2,08%".into()])
+                .with_cell_tones(vec![Tone::Normal, Tone::Ruim]),
+        );
+        assert!(
+            cores.contains(&mark_color(MarkColor::Roxo)),
+            "o ticker marcado tem que sair na cor da marca"
+        );
+        assert!(
+            cores.contains(&palette::RED),
+            "a variação negativa continua vermelha: {cores:?}"
+        );
+    }
+
+    /// Sem marca nenhuma, nada muda — a linha sai com os tons que o módulo pediu.
+    #[test]
+    fn sem_marca_a_linha_sai_com_os_tons_do_modulo() {
+        let cores = cores_da_linha(
+            &Marks::default(),
+            &["Ativo", "Var%"],
+            Row::new(vec!["PETR4".into(), "+2,08%".into()])
+                .with_cell_tones(vec![Tone::Normal, Tone::Bom]),
+        );
+        assert!(cores.contains(&palette::GREEN));
+        assert!(
+            !cores.contains(&mark_color(MarkColor::Roxo)),
+            "nada de cor de marca numa tabela sem marca"
+        );
+    }
 }
