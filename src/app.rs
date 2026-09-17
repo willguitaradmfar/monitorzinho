@@ -1501,15 +1501,9 @@ pub struct TextView {
 fn copiar(titulo: &str, texto: &str) -> String {
     use std::io::Write;
 
-    let arquivo = crate::db::dados_dir().join("relatorios").join(format!(
-        "{}.txt",
-        titulo
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_lowercase()
-    ));
+    let arquivo = crate::db::dados_dir()
+        .join("relatorios")
+        .join(nome_de_arquivo(titulo));
     let salvo = std::fs::create_dir_all(arquivo.parent().unwrap_or(&arquivo))
         .and_then(|_| std::fs::write(&arquivo, texto))
         .is_ok();
@@ -1563,6 +1557,21 @@ fn copiar(titulo: &str, texto: &str) -> String {
         false => String::new(),
     };
     match (caminho, local) {
+        // **O tmux aceita qualquer tamanho; o terminal atrás dele, não.**
+        //
+        // `load-buffer` engole um relatório de 150 KB sem reclamar e o repassa adiante —
+        // e é lá, no terminal de verdade, que a sequência é descartada calada. De onde se
+        // está aqui não há como saber o teto dele nem perguntar, então o que não se pode
+        // é afirmar. Foi assim que a tela disse «na área de transferência, via tmux» sobre
+        // um texto que não chegou a lugar nenhum, e a única pista era que os relatórios
+        // pequenos colavam e os grandes não.
+        //
+        // A frase é curta e o caminho vem cedo de propósito: esta linha é uma borda de
+        // moldura, ela é cortada, e o que não pode ser cortado é onde o texto está.
+        (Caminho::Tmux { repassa: true }, _) if !cabe_no_terminal(texto) => format!(
+            "{tamanho} passa do que o terminal costuma aceitar — se não colar, está em {}",
+            arquivo.display()
+        ),
         // O tmux confirma: ele aceitou o texto e é ele quem fala com o seu terminal.
         (Caminho::Tmux { repassa: true }, _) => {
             format!("{linhas} linhas ({tamanho}) na área de transferência, via tmux{onde}")
@@ -1589,6 +1598,54 @@ fn copiar(titulo: &str, texto: &str) -> String {
             ),
             false => "não consegui copiar nem salvar o relatório".to_string(),
         },
+    }
+}
+
+/// Se um texto cabe na área de transferência de um terminal.
+///
+/// O teto é do **terminal**, e ele vale igual nos dois caminhos: escrever a sequência
+/// direto, e mandar o tmux escrevê-la. O tmux não recusa nada — `load-buffer` engole um
+/// relatório de 150 KB e o repassa —, então tratá-lo como um caminho sem limite era
+/// justamente o que fazia a tela prometer uma cópia que o terminal tinha descartado.
+///
+/// O número não é exato porque não existe um: cada terminal tem o seu e nenhum responde
+/// quando perguntado. 74 000 caracteres de base64 — uns 55 KB de texto — é o que os
+/// terminais comuns aceitam, e o bastante para os relatórios que cabem em algum lugar.
+fn cabe_no_terminal(texto: &str) -> bool {
+    /// O maior payload que os terminais costumam aceitar, já em base64.
+    const LIMITE: usize = 74_000;
+    // Sem codificar nada: o base64 são quatro caracteres a cada três bytes, e a conta
+    // responde a pergunta sem alocar duzentos KB para depois jogá-los fora.
+    texto.len().div_ceil(3) * 4 <= LIMITE
+}
+
+/// O nome do arquivo em que um relatório é salvo, a partir do título dele.
+///
+/// **Cortado.** O título de uma investigação carrega a string de conexão inteira, e um
+/// nome de arquivo de cento e trinta caracteres não cabia na linha que existe para
+/// dizer onde o texto ficou — a única linha que importa justamente quando a cópia não
+/// funcionou.
+fn nome_de_arquivo(titulo: &str) -> String {
+    const MAX: usize = 60;
+    let limpo: String = titulo
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .to_lowercase();
+    // Um hífen a cada corrida deles: `pg---doadmin-x---profundo` vira `pg-doadmin-x-profundo`.
+    let mut nome = String::new();
+    for parte in limpo.split('-').filter(|p| !p.is_empty()) {
+        if nome.chars().count() + parte.len() + 1 > MAX {
+            break;
+        }
+        if !nome.is_empty() {
+            nome.push('-');
+        }
+        nome.push_str(parte);
+    }
+    match nome.is_empty() {
+        true => "relatorio.txt".to_string(),
+        false => format!("{nome}.txt"),
     }
 }
 
@@ -1664,13 +1721,10 @@ fn tmux_buffer(texto: &str) -> bool {
 fn osc52(texto: &str) -> bool {
     use std::io::Write;
 
-    /// O maior payload que os terminais costumam aceitar, já em base64.
-    const LIMITE: usize = 74_000;
-
-    let codificado = crate::tools::sherlock::scram::b64_encode(texto.as_bytes());
-    if codificado.len() > LIMITE {
+    if !cabe_no_terminal(texto) {
         return false;
     }
+    let codificado = crate::tools::sherlock::scram::b64_encode(texto.as_bytes());
     let sequencia = format!("\x1b]52;c;{codificado}\x07");
     // Dentro do tmux ou do screen, a sequência precisa de um envelope para chegar ao
     // terminal de verdade — e o ESC de dentro precisa ser dobrado.
@@ -5391,5 +5445,55 @@ mod home_tests {
         ordenar_cartoes(&mut v);
         assert_eq!(v.len(), 28);
         assert_eq!(antes, ids(&v).into_iter().collect());
+    }
+}
+
+#[cfg(test)]
+mod copia_tests {
+    use super::{cabe_no_terminal, nome_de_arquivo};
+
+    /// O teto é do terminal e vale para todo caminho — inclusive o do tmux, que aceita
+    /// qualquer tamanho e repassa para quem não aceita.
+    ///
+    /// Os números são os medidos na tela: um relatório de k8s de 31 KB colava, e um de
+    /// Postgres de 155 KB não — com a mesma mensagem de sucesso nos dois.
+    #[test]
+    fn o_limite_separa_o_relatorio_que_cola_do_que_nao_cola() {
+        assert!(cabe_no_terminal(&"x".repeat(31_000)));
+        assert!(!cabe_no_terminal(&"x".repeat(155_000)));
+        // A conta é a do base64 — quatro caracteres a cada três bytes —, e não o tamanho
+        // cru: 74 000 caracteres codificados são 55 500 bytes de texto.
+        assert!(cabe_no_terminal(&"x".repeat(55_500)));
+        assert!(!cabe_no_terminal(&"x".repeat(55_501)));
+        assert!(cabe_no_terminal(""));
+    }
+
+    /// O nome do arquivo cabe numa linha, e continua dizendo de que investigação ele é.
+    ///
+    /// O título carrega a string de conexão inteira; sem corte, o caminho tinha cento e
+    /// trinta caracteres e era cortado da tela justamente quando a cópia falhava e ele
+    /// virava a única saída.
+    #[test]
+    fn o_nome_do_arquivo_e_curto_e_ainda_identifica() {
+        let nome = nome_de_arquivo(
+            "sherlock — pg://doadmin@devmania-prd-postgres-do-user-15325786-0-g.db.ondigitalocean.com:25060/condominia — profundo — relatório",
+        );
+        assert!(nome.ends_with(".txt"));
+        assert!(
+            nome.chars().count() <= 64,
+            "ficou com {}: {nome}",
+            nome.len()
+        );
+        assert!(nome.starts_with("sherlock-pg-doadmin"), "{nome}");
+        // Sem corrida de hífens, que é o que o título cheio de pontuação produzia.
+        assert!(!nome.contains("--"), "{nome}");
+    }
+
+    /// Um título sem nada aproveitável ainda dá um arquivo — o relatório não pode deixar
+    /// de ser salvo por causa do nome.
+    #[test]
+    fn um_titulo_impronunciavel_ainda_vira_arquivo() {
+        assert_eq!(nome_de_arquivo("—— ··· ——"), "relatorio.txt");
+        assert_eq!(nome_de_arquivo(""), "relatorio.txt");
     }
 }
