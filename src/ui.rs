@@ -1876,9 +1876,9 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if app.tools.executions.is_empty() {
         "a adicionar uma execução"
     } else if selected_off {
-        "a adicionar · espaço ligar · Enter ver o log · e editar · Del remover · ↑/↓ e PgUp/PgDn navegar"
+        "a adicionar · espaço ligar · Enter ver o log · e editar · c clonar · Del remover · ↑/↓ e PgUp/PgDn navegar"
     } else {
-        "a adicionar · Enter monitorar · espaço desligar · e editar · r reiniciar · Del remover · ↑/↓ navegar"
+        "a adicionar · Enter monitorar · espaço desligar · e editar · c clonar · r reiniciar · Del remover · ↑/↓ navegar"
     };
     let block = Block::default()
         .title(" Execuções ")
@@ -3509,7 +3509,14 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
         partes[0],
     );
 
-    let pintor = Pintor::novo(&app.marks, None);
+    // A busca do cartão aberto vai no pintor: é ele que chega à célula, e é na célula
+    // que o acerto é pintado — sem tirar linha nenhuma da tela.
+    let realce = focus
+        .card
+        .and_then(|index| quadro.cards.get(index))
+        .map(|card| card.query.clone())
+        .unwrap_or_default();
+    let pintor = Pintor::novo(&app.marks, None).realcando(realce);
     let mut desenhados = quadro.cards.len();
     match focus.card.and_then(|index| quadro.cards.get(index)) {
         // Um cartão navegável mostra os dois: a tabela com o cursor em cima, e o que a
@@ -3582,14 +3589,30 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
     // um achado perdido.
     // Sem grade atrás do cartão, o Esc sai — e o rodapé tem que dizer isso, porque
     // «volta para a grade» prometeria uma tela que não existe.
-    let esc = match quadro.direto {
-        true => "Esc sair",
-        false => "Esc volta para a grade",
+    let buscando = focus
+        .card
+        .and_then(|index| quadro.cards.get(index))
+        .is_some_and(|card| !card.query.is_empty());
+    let esc = match (quadro.direto, buscando) {
+        (true, true) => "Esc limpa a busca",
+        (true, false) => "Esc sair",
+        (false, _) => "Esc volta para a grade",
+    };
+    let busca = match quadro.direto {
+        true => "digite para buscar · ",
+        false => "",
     };
     let rodape = match focus.card {
         Some(index) => match quadro.cards.get(index).map(|card| card.rows() > 0) {
+            Some(true) if buscando => format!(
+                " ↑/↓ pular entre os {} acertos · linha {} de {} · {esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
+                quadro.cards[index].acertos(),
+                quadro.cards[index].row + 1,
+                quadro.cards[index].rows(),
+                rotulos.pedir_inf
+            ),
             Some(true) => format!(
-                " ↑/↓ andar pelas linhas ({} de {}) · {esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
+                " ↑/↓ andar pelas linhas ({} de {}) · {busca}{esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
                 quadro.cards[index].row + 1,
                 quadro.cards[index].rows(),
                 rotulos.pedir_inf
@@ -4198,8 +4221,12 @@ fn render_pane_table(
     use crate::invest::module::Tone;
 
     let mut titulo = title.to_string();
-    if !query.is_empty() {
-        titulo.push_str(&format!(" · buscando «{query}»"));
+    let buscando = match query.is_empty() {
+        true => pintor.realce(),
+        false => query,
+    };
+    if !buscando.is_empty() {
+        titulo.push_str(&format!(" · buscando «{buscando}»"));
     }
     let mut bloco = moldura(&titulo);
     if let Some((note, tom)) = note.filter(|(n, _)| !n.is_empty()) {
@@ -4280,6 +4307,16 @@ fn render_pane_table(
                     Some((cor, _)) => mark_color(cor),
                     None => tone_color(r.cell_tones.get(i).copied().unwrap_or(r.tone)),
                 };
+                // Um acerto da busca é pintado **no trecho**, como no log: a linha fica
+                // onde está, e o que casou salta aos olhos dentro dela.
+                let realce = pintor.realce();
+                if !realce.is_empty() && format::contains_ci(&texto, realce) {
+                    return Cell::from(Line::from(highlight(
+                        &texto,
+                        realce,
+                        Style::default().fg(cor),
+                    )));
+                }
                 // A marca vence o rabicho **dentro da célula dela**: a origem do preço em
                 // amarelo colada no ticker marcado leria como uma segunda marca.
                 let Some((antes, sufixo, cor_rabicho)) = rabicho.filter(|_| marcada_aqui.is_none())

@@ -4218,6 +4218,18 @@ impl App {
     /// Opens the wizard on an execution that already exists ('e'), pre-filled with what
     /// it was started with.
     pub fn edit_selected_execution(&mut self) {
+        self.open_form_on_selected(false);
+    }
+
+    /// The same form, pre-filled the same way, but confirming it **adds** a second
+    /// execution instead of replacing this one ('c'). A view against another base, a
+    /// tunnel to the next port: most new executions are an old one with one field
+    /// changed, and retyping the other nine is how typos get in.
+    pub fn clone_selected_execution(&mut self) {
+        self.open_form_on_selected(true);
+    }
+
+    fn open_form_on_selected(&mut self, clone: bool) {
         let Some(existing) = self.tools.selected() else {
             return;
         };
@@ -4234,13 +4246,18 @@ impl App {
         let tool = &self.tools_available[index];
         let fields = tools::form_params(tool.as_ref())
             .into_iter()
-            .map(|spec| ParamField {
-                value: saved
+            .map(|spec| {
+                let mut value = saved
                     .params
                     .get(spec.key)
                     .cloned()
-                    .unwrap_or_else(|| spec.default.to_string()),
-                spec,
+                    .unwrap_or_else(|| spec.default.to_string());
+                // Two rows with the same name read as a mistake; the copy says it is
+                // one until somebody gives it a name of its own.
+                if clone && spec.key == tools::NOME && !value.trim().is_empty() {
+                    value = format!("{} (cópia)", value.trim());
+                }
+                ParamField { value, spec }
             })
             .collect();
         self.focus = Focus::Wizard(ToolWizard {
@@ -4251,7 +4268,7 @@ impl App {
             field: 0,
             error: None,
             editor: None,
-            editing: Some(id),
+            editing: (!clone).then_some(id),
         });
     }
 
@@ -5130,21 +5147,89 @@ impl App {
     }
 
     /// Esc no painel: volta do cartão para a grade, e só então sai. Num quadro que
-    /// abre direto no cartão não há grade para onde voltar, e o Esc sai de uma vez.
+    /// abre direto no cartão não há grade para onde voltar — ali o Esc primeiro limpa
+    /// a busca, se houver uma, e só depois sai.
     pub fn board_escape(&mut self) {
         let Focus::Board(board) = &mut self.focus else {
             return;
         };
-        let direto = self
+        let quadro = self
             .tools
             .by_id(board.execution_id)
-            .and_then(|execution| execution.board().cloned())
-            .is_some_and(|quadro| tools::lock_board(&quadro).direto);
+            .and_then(|execution| execution.board().cloned());
+        let direto = quadro
+            .as_ref()
+            .is_some_and(|quadro| tools::lock_board(quadro).direto);
+        if direto
+            && let Some(quadro) = &quadro
+            && let Some(card) = board.card.and_then(|index| {
+                tools::lock_board(quadro)
+                    .cards
+                    .get(index)
+                    .map(|c| c.query.clone())
+            })
+            && !card.is_empty()
+        {
+            self.board_set_query(String::new());
+            return;
+        }
         if board.card.is_some() && !direto {
             board.card = None;
             return;
         }
         self.focus = Focus::None;
+    }
+
+    /// Uma letra dentro de uma visão **busca**, como no log: a tabela vai sendo
+    /// filtrada a cada tecla. Só num quadro de um cartão só — nos outros as letras
+    /// são as teclas dos cartões, e é isso que o `false` devolve para dizer.
+    pub fn board_type(&mut self, c: char) -> bool {
+        let Some(atual) = self.board_query() else {
+            return false;
+        };
+        let mut query = atual;
+        query.push(c);
+        self.board_set_query(query);
+        true
+    }
+
+    /// Backspace na busca de uma visão.
+    pub fn board_backspace(&mut self) {
+        let Some(mut query) = self.board_query() else {
+            return;
+        };
+        query.pop();
+        self.board_set_query(query);
+    }
+
+    /// A busca do cartão aberto, quando é um quadro que aceita busca.
+    fn board_query(&self) -> Option<String> {
+        let Focus::Board(board) = &self.focus else {
+            return None;
+        };
+        let quadro = self.tools.by_id(board.execution_id)?.board()?.clone();
+        let quadro = tools::lock_board(&quadro);
+        if !quadro.direto {
+            return None;
+        }
+        Some(quadro.cards.get(board.card?)?.query.clone())
+    }
+
+    fn board_set_query(&mut self, query: String) {
+        let Focus::Board(board) = &self.focus else {
+            return;
+        };
+        let Some(quadro) = self
+            .tools
+            .by_id(board.execution_id)
+            .and_then(|e| e.board().cloned())
+        else {
+            return;
+        };
+        let mut quadro = tools::lock_board(&quadro);
+        if let Some(card) = board.card.and_then(|index| quadro.cards.get_mut(index)) {
+            card.set_query(query);
+        }
     }
 
     /// ↑/↓ e PgUp/PgDn dentro de um cartão ampliado.
@@ -5172,6 +5257,11 @@ impl App {
             return;
         };
         if card.rows() > 0 {
+            // Buscando, a seta vai de acerto em acerto, como no log. Um PgDn também:
+            // o que se quer é o próximo, não quinze adiante.
+            if card.jump(delta.signum()) {
+                return;
+            }
             let onde = (card.row as i32 + delta).clamp(0, card.rows() as i32 - 1) as usize;
             card.select(onde);
             return;

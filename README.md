@@ -434,8 +434,10 @@ or, where the tool says so, sits idle until you ask it for something.
 
 `a` walks you through adding one: pick the tool, fill in what it needs, look at
 it once, and confirm. `e` reopens that form on an execution that already
-exists, `r` restarts one (or, for a tool that works on demand, runs it again),
-`Del` stops and forgets it.
+exists; `c` opens it filled in the same way but confirming adds a second
+execution instead of replacing this one, since most new executions are an old
+one with one field changed. `r` restarts one (or, for a tool that works on
+demand, runs it again), `Del` stops and forgets it.
 
 Every form starts with the same field, **Nome**: what this execution is for, in
 your own words. It is the column between the tool and the detail, and it exists

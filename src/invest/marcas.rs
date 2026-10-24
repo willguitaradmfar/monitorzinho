@@ -107,17 +107,40 @@ pub struct Pintor<'a> {
     marks: &'a Marks,
     /// `None` quando a tela não aceita marca nenhuma — e aí o pintor não pinta nada.
     alvo: Option<Marcavel>,
+    /// O que **realçar** nas células, sem esconder linha nenhuma — a busca de uma
+    /// visão, que funciona como a do log. Diferente da `query` do `Pane::Table`, que
+    /// filtra: lá a lista é curta e ver só o que casa é o que se espera; aqui as linhas
+    /// em volta de um acerto costumam ser o assunto. Vazio não realça nada.
+    realce: String,
 }
 
 impl<'a> Pintor<'a> {
     pub fn novo(marks: &'a Marks, alvo: Option<Marcavel>) -> Self {
-        Self { marks, alvo }
+        Self {
+            marks,
+            alvo,
+            realce: String::new(),
+        }
     }
 
     /// Um pintor que não pinta. Para os painéis desenhados fora de qualquer módulo.
     #[cfg(test)]
     pub fn nenhum(marks: &'a Marks) -> Self {
-        Self { marks, alvo: None }
+        Self {
+            marks,
+            alvo: None,
+            realce: String::new(),
+        }
+    }
+
+    /// O mesmo pintor, realçando `texto` onde ele aparecer.
+    pub fn realcando(mut self, texto: String) -> Self {
+        self.realce = texto;
+        self
+    }
+
+    pub fn realce(&self) -> &str {
+        &self.realce
     }
 
     /// A cor da linha de uma tabela **e em que coluna ela vale**, com a coluna de cada

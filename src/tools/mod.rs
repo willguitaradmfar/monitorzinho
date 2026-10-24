@@ -912,6 +912,9 @@ impl Board {
                     .scroll
                     .min(card.lines().saturating_sub(1) as u16),
             );
+            // A busca sobrevive à reescrita: o que se estava filtrando continua
+            // filtrado depois do Ctrl+R, agora sobre as linhas novas.
+            card.set_query(self.cards[old].query.clone());
             // O cursor também sobrevive à reescrita: quem estava lendo a décima linha
             // continua nela depois de um Ctrl+R, e não volta para o topo.
             let onde = self.cards[old].row;
@@ -946,6 +949,12 @@ pub struct Card {
     /// Em que linha o cursor está. Guardado no cartão, como a rolagem, para sobreviver a
     /// sair e voltar.
     pub row: usize,
+    /// O que está sendo buscado na tabela do cartão, letra a letra. Como no log, a busca
+    /// **realça** e não filtra: toda linha fica, o acerto aparece destacado e as setas
+    /// pulam de um acerto para o outro. Mora no cartão pelo mesmo motivo do cursor: a
+    /// ferramenta reescreve o cartão a cada passada, e uma busca que sumisse no Ctrl+R
+    /// seria perdida exatamente enquanto estivesse sendo usada.
+    pub query: String,
     /// How many rows the card asks for in the grid, content only — the frame is added
     /// by whoever draws it.
     pub height: u16,
@@ -975,13 +984,66 @@ impl Card {
             scroll: 0,
             rows_detail: Vec::new(),
             row: 0,
+            query: String::new(),
             tone: crate::painel::Tone::Normal,
         }
+    }
+
+    /// As linhas em que a busca acerta, pelo índice. Sem busca, nenhuma — não há o que
+    /// pular. O mesmo teste que o desenho usa para realçar (`Row::matches`).
+    fn acertos_em(&self) -> Vec<usize> {
+        if self.query.is_empty() {
+            return Vec::new();
+        }
+        let needle = self.query.to_lowercase();
+        match self.detail.primeira_tabela() {
+            Some(crate::painel::Pane::Table { rows, .. }) => rows
+                .iter()
+                .enumerate()
+                .filter(|(i, row)| *i < self.rows_detail.len() && row.matches(&needle))
+                .map(|(i, _)| i)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Quantas linhas a busca acerta.
+    pub fn acertos(&self) -> usize {
+        self.acertos_em().len()
     }
 
     /// Quantas linhas dá para navegar.
     pub fn rows(&self) -> usize {
         self.rows_detail.len()
+    }
+
+    /// Troca a busca e leva o cursor ao primeiro acerto — é para lá que o olho vai.
+    pub fn set_query(&mut self, query: String) {
+        self.query = query;
+        if let Some(primeiro) = self.acertos_em().first().copied() {
+            self.select(primeiro);
+        }
+    }
+
+    /// Com uma busca ativa, a seta pula para o acerto seguinte (ou anterior), dando a
+    /// volta no fim. Devolve `false` sem busca, e aí a seta anda linha a linha.
+    pub fn jump(&mut self, delta: i32) -> bool {
+        if self.query.is_empty() {
+            return false;
+        }
+        let acertos = self.acertos_em();
+        let alvo = match delta > 0 {
+            true => acertos.iter().find(|&&i| i > self.row).or(acertos.first()),
+            false => acertos
+                .iter()
+                .rev()
+                .find(|&&i| i < self.row)
+                .or(acertos.last()),
+        };
+        if let Some(&i) = alvo {
+            self.select(i);
+        }
+        true
     }
 
     /// Move o cursor e diz à tabela qual linha pintar.

@@ -385,11 +385,17 @@ fn run(
                     // Antes do Esc e do Tab globais: numa grade de cartões essas duas
                     // teclas são da grade (voltar um nível, ver o log), e não da janela.
                     KeyCode::Esc if matches!(app.focus, Focus::Board(_)) => app.board_escape(),
+                    // Numa visão o 'q' é uma letra como as outras — vai para a busca.
                     KeyCode::Char('q')
                         if matches!(app.focus, Focus::Board(_))
                             && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        app.board_escape();
+                        if !app.board_type('q') {
+                            app.board_escape();
+                        }
+                    }
+                    KeyCode::Backspace if matches!(app.focus, Focus::Board(_)) => {
+                        app.board_backspace();
                     }
                     KeyCode::Tab if matches!(app.focus, Focus::Board(_)) => app.board_log(),
                     // Ctrl+T de texto: a investigação inteira em texto corrido, para
@@ -414,13 +420,16 @@ fn run(
                     KeyCode::PageDown if matches!(app.focus, Focus::Board(_)) => {
                         app.board_scroll(15);
                     }
-                    // As letras e os números são dos cartões. Com Ctrl não: aqueles são
-                    // os gestos do programa inteiro, e eles continuam valendo aqui.
+                    // As letras e os números são dos cartões — ou, numa visão, da busca.
+                    // Com Ctrl não: aqueles são os gestos do programa inteiro, e eles
+                    // continuam valendo aqui.
                     KeyCode::Char(c)
                         if matches!(app.focus, Focus::Board(_))
                             && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        app.board_open_card(c);
+                        if !app.board_type(c) {
+                            app.board_open_card(c);
+                        }
                     }
 
                     // A fullscreened table's search box swallows every letter, including
@@ -593,6 +602,13 @@ fn run(
                         if on_tools_tab(&app) && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
                         app.edit_selected_execution()
+                    }
+                    // 'c' clona: o mesmo formulário do 'e', mas confirmar cria outra
+                    // linha em vez de trocar esta.
+                    KeyCode::Char('c')
+                        if on_tools_tab(&app) && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.clone_selected_execution()
                     }
                     KeyCode::Char('r') if on_tools_tab(&app) => app.restart_selected_execution(),
                     // Space, ahead of the global "refresh now" arm below: this tab has
