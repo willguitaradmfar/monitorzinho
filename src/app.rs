@@ -809,6 +809,10 @@ impl ToolsState {
                 .collect(),
             enabled,
         };
+        let nome = values
+            .get(tools::NOME)
+            .map(|nome| nome.trim().to_string())
+            .unwrap_or_default();
         if !enabled {
             return Execution::switched_off(
                 id,
@@ -816,12 +820,14 @@ impl ToolsState {
                 tool.summarize(&values),
                 off_note(tool, &values),
             )
+            .with_nome(nome)
             .with_spec(spec);
         }
         match tool.start(id, &values) {
             Ok(execution) => execution,
             Err(error) => Execution::failed(id, tool.name(), tool.summarize(&values), error),
         }
+        .with_nome(nome)
         .with_spec(spec)
     }
 
@@ -860,7 +866,7 @@ fn off_note(tool: &dyn Tool, values: &HashMap<&'static str, String>) -> String {
 /// a parameter added since the file was written gets its default, and one that no
 /// longer exists is dropped. That way an upgrade never rejects an old config outright.
 fn restore_params(tool: &dyn Tool, saved: &ExecutionSpec) -> HashMap<&'static str, String> {
-    tool.params()
+    tools::form_params(tool)
         .into_iter()
         .map(|spec| {
             let value = saved
@@ -2798,8 +2804,7 @@ impl App {
             return;
         };
         let tool = &self.tools_available[index];
-        let mut values: HashMap<&'static str, String> = tool
-            .params()
+        let mut values: HashMap<&'static str, String> = tools::form_params(tool.as_ref())
             .into_iter()
             .map(|spec| (spec.key, spec.default.to_string()))
             .collect();
@@ -4042,8 +4047,7 @@ impl App {
                 };
                 // Rebuilt from the spec on every entry, so backing out to pick a
                 // different tool can't leave the previous one's fields behind.
-                wizard.fields = tool
-                    .params()
+                wizard.fields = tools::form_params(tool.as_ref())
                     .into_iter()
                     .map(|spec| ParamField {
                         value: spec.default.to_string(),
@@ -4150,7 +4154,14 @@ impl App {
                         .collect(),
                     enabled: true,
                 };
-                let execution = execution.with_spec(spec);
+                // The name is the form's, not the tool's — `start` never sees it as
+                // anything but a key it ignores, so it is put on here, as `launch_as`
+                // does for a restored or switched-off one.
+                let nome = params
+                    .get(tools::NOME)
+                    .map(|nome| nome.trim().to_string())
+                    .unwrap_or_default();
+                let execution = execution.with_nome(nome).with_spec(spec);
                 match replacing {
                     Some(index) => {
                         self.tools.executions[index] = execution;
@@ -4221,8 +4232,7 @@ impl App {
             return;
         };
         let tool = &self.tools_available[index];
-        let fields = tool
-            .params()
+        let fields = tools::form_params(tool.as_ref())
             .into_iter()
             .map(|spec| ParamField {
                 value: saved

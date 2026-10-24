@@ -176,6 +176,32 @@ impl ParamSpec {
     }
 }
 
+/// The one field every form starts with, and that no tool declares: what this
+/// execution is *for*, in the user's own words.
+///
+/// The detail column says what an execution does — `ssh root@10.0.0.5 · raso` — and
+/// after a week that is exactly the line nobody remembers the reason for. The name is
+/// the reason. It belongs to the execution rather than to any tool, so it lives here
+/// and is added in front of every tool's own parameters by `form_params`; a tool never
+/// sees it as anything but one more key it has no use for.
+pub const NOME: &str = "nome";
+
+fn nome_spec() -> ParamSpec {
+    ParamSpec::text(
+        NOME,
+        "Nome",
+        "",
+        "Para que serve esta execução, nas suas palavras — «banco da loja via bastion», «API de pedidos». Aparece na lista, entre a ferramenta e o detalhe. Pode ficar vazio",
+    )
+}
+
+/// What the form asks for: the name, then whatever the tool itself needs.
+pub fn form_params(tool: &dyn Tool) -> Vec<ParamSpec> {
+    let mut specs = vec![nome_spec()];
+    specs.extend(tool.params());
+    specs
+}
+
 /// A tool the user can launch from the Ferramentas tab.
 pub trait Tool: Send + Sync {
     /// Stable key used to match a saved execution back to its tool on the next run —
@@ -1036,6 +1062,8 @@ pub fn lock_board(board: &Mutex<Board>) -> MutexGuard<'_, Board> {
 pub struct Execution {
     pub id: u64,
     pub tool: &'static str,
+    /// What the user called it — see `NOME`. Empty when they didn't.
+    pub nome: String,
     /// One-line description of what this instance is doing, e.g.
     /// `TCP 127.0.0.1:8080 → 10.0.0.5:5432`.
     pub summary: String,
@@ -1112,6 +1140,7 @@ impl Execution {
         let execution = Self {
             id,
             tool,
+            nome: String::new(),
             summary,
             started,
             log,
@@ -1297,6 +1326,12 @@ impl Execution {
     /// reopened, not a restart.
     pub fn failed_to_start(&self) -> bool {
         self.failed
+    }
+
+    /// The name the user gave it. Set by whoever launches, never by the tool.
+    pub fn with_nome(mut self, nome: String) -> Self {
+        self.nome = nome;
+        self
     }
 
     /// Records what would recreate this execution across restarts.

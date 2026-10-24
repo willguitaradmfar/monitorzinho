@@ -1838,11 +1838,13 @@ fn render_detail(frame: &mut Frame, area: Rect, focus: &DetailFocus) {
 
 const TOOLS_HEADERS: [&str; 5] = [
     "Ferramenta",
+    // What the user called it — the reason the row exists, which the detail beside it
+    // never says. See `tools::NOME`.
+    "Nome",
     "Detalhe",
-    // Deliberately unnamed: what these two hold is the tool's business, and a tunnel's
-    // byte counters and a scan's open-port tally have nothing in common but their place.
+    // Deliberately vague: what this holds is the tool's business, and a tunnel's byte
+    // counters and a scan's open-port tally have nothing in common but their place.
     "Resultado",
-    "Resumo",
     "Estado",
 ];
 
@@ -1923,16 +1925,18 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
                 State::Off => ("desligada", Style::default().fg(palette::DIM)),
             };
             // Straight from the tool that owns this execution. A row whose tool is
-            // somehow missing still renders — just without the two result columns.
-            let (headline, summary) = app
+            // somehow missing still renders — just without the result column. Only the
+            // headline is shown: the second half of what a tool reports was costing a
+            // third of the width to say what the headline already said in a word.
+            let (headline, _) = app
                 .tool_for(execution)
                 .map(|tool| tool.columns(execution))
                 .unwrap_or_default();
             let row = UiRow::new(vec![
                 Cell::from(execution.tool),
+                Cell::from(execution.nome.clone()),
                 Cell::from(execution.summary.clone()),
                 Cell::from(headline),
-                Cell::from(summary),
                 Cell::from(Span::styled(state, style)),
             ]);
             // Switched off wins over everything else the row could be saying: struck
@@ -1959,11 +1963,14 @@ fn render_tools_tab(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
+    // The tool column fits the longest name there is («Acordar máquina (Wake-on-LAN)»)
+    // instead of clipping it; the name column is a sentence's worth, since that is
+    // what people write in it; the detail takes what is left.
     let widths = [
-        Constraint::Length(18),
+        Constraint::Length(30),
+        Constraint::Length(32),
         Constraint::Fill(1),
         Constraint::Length(22),
-        Constraint::Length(46),
         Constraint::Length(10),
     ];
     let table = Table::new(body, widths)

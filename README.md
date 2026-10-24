@@ -437,9 +437,13 @@ it once, and confirm. `e` reopens that form on an execution that already
 exists, `r` restarts one (or, for a tool that works on demand, runs it again),
 `Del` stops and forgets it.
 
-Two columns of each row are the tool's own — what it has to report, and a
-summary beside it — so a tunnel's byte counters and a scan's open-port tally
-share a place without pretending to be the same thing. The last column is where
+Every form starts with the same field, **Nome**: what this execution is for, in
+your own words. It is the column between the tool and the detail, and it exists
+because the detail says what an execution does — `ssh root@10.0.0.5 · raso` —
+and after a week that is exactly the line nobody remembers the reason for. It
+can be left blank. The **Resultado** column is the tool's own — a tunnel's byte
+counters, a scan's open-port tally, a view's row count — so unlike things share
+a place without pretending to be the same thing. The last column is where
 the row stands: `pronta` for an on-demand execution nobody has asked anything
 of yet, `rodando`, `concluída` once there's a result to read, `parada` for one
 that was stopped or never started.
