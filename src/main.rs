@@ -331,7 +331,10 @@ fn run(
             // aceitar colagem no resto da interface seria abrir caminho para um texto de
             // mil linhas cair numa caixa de busca.
             if let Event::Paste(texto) = event {
-                app.wizard_paste(&texto);
+                match app.board_editor_open() {
+                    true => app.board_editor_paste(&texto),
+                    false => app.wizard_paste(&texto),
+                }
                 continue;
             }
             if let Event::Key(key) = event {
@@ -373,6 +376,14 @@ fn run(
                     // The rules screen sits on top of the wizard and takes every key,
                     // including Esc and 'q': in its Edit mode they're just characters.
                     code if app.rules_editor_open() => app.rules_key(code),
+                    // O editor de texto longo também: ali toda tecla é texto, Enter é
+                    // quebra de linha e Esc é a volta ao formulário.
+                    code if app.texto_editor_open() => {
+                        app.texto_key(code, key.modifiers.contains(KeyModifiers::CONTROL))
+                    }
+                    code if app.board_editor_open() => {
+                        app.board_editor_key(code, key.modifiers.contains(KeyModifiers::CONTROL))
+                    }
                     // Same reason: the hand-off picker sits over a log whose search box
                     // takes every letter, so it has to see the keys first.
                     code if app.handoff_open() => app.handoff_key(code),
@@ -411,6 +422,20 @@ fn run(
                             && key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
                         app.board_refresh();
+                    }
+                    // Ctrl+O: a consulta desta visão, no editor, por cima do resultado.
+                    KeyCode::Char('o')
+                        if matches!(app.focus, Focus::Board(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.board_open_editor();
+                    }
+                    // Ctrl+F: a mesma busca, no outro modo — só as linhas que casam.
+                    KeyCode::Char('f')
+                        if matches!(app.focus, Focus::Board(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.board_toggle_filter();
                     }
                     KeyCode::Up if matches!(app.focus, Focus::Board(_)) => app.board_scroll(-1),
                     KeyCode::Down if matches!(app.focus, Focus::Board(_)) => app.board_scroll(1),
@@ -508,7 +533,39 @@ fn run(
                     }
 
                     // --- add-an-execution wizard ---
+                    // Alt+Enter (e Ctrl+J, para o terminal que engole o Alt) quebra a
+                    // linha dentro do valor; o Enter sozinho continua avançando o
+                    // formulário.
+                    KeyCode::Enter
+                        if matches!(app.focus, Focus::Wizard(_))
+                            && key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        app.wizard_newline();
+                    }
+                    KeyCode::Char('j')
+                        if matches!(app.focus, Focus::Wizard(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.wizard_newline();
+                    }
                     KeyCode::Enter if matches!(app.focus, Focus::Wizard(_)) => app.wizard_advance(),
+                    // Ctrl+O e F4 abrem o editor de um campo de texto longo.
+                    KeyCode::Char('o')
+                        if matches!(app.focus, Focus::Wizard(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.wizard_open_editor();
+                    }
+                    KeyCode::F(4) if matches!(app.focus, Focus::Wizard(_)) => {
+                        app.wizard_open_editor()
+                    }
+                    KeyCode::Delete if matches!(app.focus, Focus::Wizard(_)) => app.wizard_delete(),
+                    KeyCode::Home if matches!(app.focus, Focus::Wizard(_)) => {
+                        app.wizard_home_end(false);
+                    }
+                    KeyCode::End if matches!(app.focus, Focus::Wizard(_)) => {
+                        app.wizard_home_end(true);
+                    }
                     KeyCode::Up if matches!(app.focus, Focus::Wizard(_)) => app.wizard_move(-1),
                     KeyCode::Down if matches!(app.focus, Focus::Wizard(_)) => app.wizard_move(1),
                     // A form is shorter than a page, so these land on its first and last

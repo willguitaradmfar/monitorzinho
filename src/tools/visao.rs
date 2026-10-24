@@ -283,7 +283,7 @@ impl Tool for VisaoTool {
                 "O caminho do banco SQLite. Aberto só para leitura",
             )
             .only_when("fonte", Fonte::SQLITE),
-            ParamSpec::text(
+            ParamSpec::editor(
                 "consulta",
                 "Consulta",
                 "",
@@ -299,7 +299,7 @@ impl Tool for VisaoTool {
             .only_when("fonte", Fonte::HTTP),
             ParamSpec::choice("metodo", "Método", METODOS, "GET pede; POST manda o corpo abaixo")
                 .only_when("fonte", Fonte::HTTP),
-            ParamSpec::text(
+            ParamSpec::editor(
                 "corpo",
                 "Corpo",
                 "",

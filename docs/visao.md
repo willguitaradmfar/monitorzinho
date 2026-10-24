@@ -107,11 +107,19 @@ corpo como `application/json`.
 
 ## 3. A tela
 
-`Enter` abre direto na tabela — não há grade de cartões, porque há um cartão só. `↑`/`↓`
-andam pelas linhas e a linha sob o cursor aparece embaixo como campo/valor, que é o que
-salva uma tabela larga demais para caber. `Ctrl+R` executa de novo; o cabeçalho diz há
-quanto tempo foi a última execução. `Tab` abre o log, onde ficam os erros e o tempo de
-cada execução. `Esc` sai.
+A consulta (e o corpo do POST) é escrita num **editor próprio**, aberto com `Ctrl+O` (ou
+`F4`) no campo — `Enter` continua sendo «continuar», como nos outros campos: ocupa quase o terminal inteiro, numera as linhas, o cursor vai a qualquer lugar,
+`Enter` quebra linha, `Tab` recua quatro espaços, colar mantém a formatação. `Esc` volta
+ao formulário, que mostra a primeira linha e a contagem como prévia. É o
+`ParamKind::Editor`, que qualquer ferramenta pode usar num campo de texto longo.
+
+`Enter` na execução abre direto na tabela — não há grade de cartões, porque há um cartão
+só. `↑`/`↓` andam pelas linhas e a linha sob o cursor aparece embaixo como campo/valor,
+que é o que salva uma tabela larga demais para caber. **Digitar busca**, como no log: toda
+linha fica, o trecho que casa é realçado e as setas pulam de acerto em acerto. `Ctrl+F`
+alterna para o outro modo da mesma busca — só as linhas que casam — e volta. `Esc` limpa
+a busca antes de sair. `Ctrl+R` executa de novo; o cabeçalho diz há quanto tempo foi a
+última execução. `Tab` abre o log, onde ficam os erros e o tempo de cada execução.
 
 A linha na lista mostra, nas duas colunas da ferramenta, quantas linhas vieram e quanto
 tempo levou — ou `falhou` e o motivo.

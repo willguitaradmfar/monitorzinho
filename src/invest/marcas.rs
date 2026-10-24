@@ -112,6 +112,9 @@ pub struct Pintor<'a> {
     /// filtra: lá a lista é curta e ver só o que casa é o que se espera; aqui as linhas
     /// em volta de um acerto costumam ser o assunto. Vazio não realça nada.
     realce: String,
+    /// Com `realce`, mostrar **só** as linhas que casam — o outro modo da mesma busca,
+    /// para quando o que se quer é a lista curta e não o contexto. Ver `Card::so_acertos`.
+    filtra: bool,
 }
 
 impl<'a> Pintor<'a> {
@@ -120,6 +123,7 @@ impl<'a> Pintor<'a> {
             marks,
             alvo,
             realce: String::new(),
+            filtra: false,
         }
     }
 
@@ -130,6 +134,7 @@ impl<'a> Pintor<'a> {
             marks,
             alvo: None,
             realce: String::new(),
+            filtra: false,
         }
     }
 
@@ -141,6 +146,16 @@ impl<'a> Pintor<'a> {
 
     pub fn realce(&self) -> &str {
         &self.realce
+    }
+
+    /// O mesmo pintor, escondendo as linhas em que o realce não acerta.
+    pub fn filtrando(mut self, filtra: bool) -> Self {
+        self.filtra = filtra;
+        self
+    }
+
+    pub fn filtra(&self) -> bool {
+        self.filtra && !self.realce.is_empty()
     }
 
     /// A cor da linha de uma tabela **e em que coluna ela vale**, com a coluna de cada

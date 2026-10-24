@@ -82,6 +82,10 @@ pub mod palette {
     /// The original One Dark comment gray (`#5C6370`) was tuned for that theme's own
     /// background and read as barely-visible on plainer dark terminals.
     pub const DIM: Color = Color::Rgb(0x8B, 0x94, 0x9E);
+    /// O fundo de uma linha em que a busca acertou: um tom acima do fundo da tela, de
+    /// propósito quase imperceptível — é uma zebra para o olho seguir a linha até o
+    /// acerto, não um segundo realce disputando com o do trecho que casou.
+    pub const REALCE_FUNDO: Color = Color::Rgb(0x33, 0x38, 0x42);
 }
 
 /// Builds the shortcut-key badges shown per panel: which chart/table index maps to
@@ -1994,6 +1998,25 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
         render_rules(frame, area, editor);
         return;
     }
+    if let Some(editor) = &wizard.texto {
+        if let Some(field) = wizard.fields.get(editor.field) {
+            let tool = app
+                .tools_available
+                .get(wizard.tool)
+                .map(|tool| tool.name())
+                .unwrap_or("");
+            render_texto_editor(
+                frame,
+                area,
+                &format!("{} — {tool}", field.spec.label),
+                field,
+                &editor.scroll,
+                "Esc volta ao formulário",
+                None,
+            );
+        }
+        return;
+    }
     let tool = app.tools_available.get(wizard.tool);
     let editing = wizard.editing.is_some();
     let (subtitle, hint) = match wizard.step {
@@ -2015,14 +2038,19 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
                         parts.push("Enter continuar");
                     }
                     Some(ParamKind::Rules) => parts.push("Enter abre a lista de regras"),
+                    Some(ParamKind::Editor) => {
+                        parts.push("Ctrl+O ou F4 abre o editor");
+                        parts.push("Enter continuar");
+                        parts.push("Ctrl+U limpar");
+                    }
                     _ => {
                         // A suggested value is a shortcut, not a replacement: the field
                         // still takes anything typed, so it's offered as one more key
                         // rather than in place of the typing.
+                        parts.push("←/→ cursor");
                         if field.is_some_and(|field| !field.spec.suggestions.is_empty()) {
-                            parts.push("←/→ sugestões");
+                            parts.push("na ponta, sugestões");
                         }
-                        parts.push("digite para editar");
                         parts.push("Ctrl+U limpar");
                         parts.push("Enter continuar");
                     }
@@ -2078,6 +2106,93 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
     let inner = block.inner(box_area);
     frame.render_widget(Clear, box_area);
     frame.render_widget(block, box_area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The long-text editor: the field opened as wide and as tall as the screen allows, its
+/// text in the shape it was written, a line number on every written line, and the
+/// cursor where the next letter goes. The form row it came from was the wrong size for
+/// a query; this is the right one.
+///
+/// Shared by the form (`ToolWizard::texto`) and the view (`BoardFocus::editor`): the
+/// same text, the same keys, the same screen — only the title and what Esc does differ.
+fn render_texto_editor(
+    frame: &mut Frame,
+    area: Rect,
+    titulo: &str,
+    field: &ParamField,
+    scroll_guardado: &std::cell::Cell<usize>,
+    saida: &str,
+    error: Option<&str>,
+) {
+    let width = area.width.saturating_sub(4).max(40).min(area.width);
+    let height = area.height.saturating_sub(2).max(10).min(area.height);
+    let box_area = centered(area, width, height);
+    let block = Block::default()
+        .title(format!(" {titulo} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::PURPLE))
+        .title_bottom(hint_line(&format!(
+            "Enter nova linha · setas, Home/End, PgUp/PgDn · Tab recua 4 · Ctrl+U limpar · colar funciona · {saida}"
+        )));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+
+    // The help first, so what the field expects is on the same screen as the typing —
+    // and the refusal, when there was one, right under it, in red.
+    let text_width = (inner.width as usize).saturating_sub(2);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for chunk in wrap(field.spec.help, text_width) {
+        lines.push(Line::styled(
+            format!(" {chunk}"),
+            Style::default().fg(palette::DIM),
+        ));
+    }
+    if let Some(error) = error {
+        for (i, chunk) in wrap(error, text_width.saturating_sub(3))
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if i == 0 { " ⚠ " } else { "   " };
+            lines.push(Line::styled(
+                format!("{prefix}{chunk}"),
+                Style::default()
+                    .fg(palette::RED)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+
+    let cursor = field.cursor.min(field.value.chars().count());
+    let total_escritas = field.value.lines().count().max(1);
+    let gutter = total_escritas.to_string().len().max(2);
+    let largura_texto = text_width.saturating_sub(gutter + 3);
+    let linhas = linhas_visuais(&field.value, cursor, largura_texto);
+
+    // The viewport follows the cursor: scrolled only as far as needed to keep its line
+    // on screen, so reading up and down the text doesn't jump.
+    let altura = (inner.height as usize).saturating_sub(lines.len()).max(1);
+    let atual = linha_do_cursor(&linhas, cursor);
+    let mut scroll = scroll_guardado.get().min(linhas.len().saturating_sub(1));
+    if atual < scroll {
+        scroll = atual;
+    } else if atual >= scroll + altura {
+        scroll = atual + 1 - altura;
+    }
+    scroll_guardado.set(scroll);
+
+    let base = Style::default().fg(palette::YELLOW);
+    for linha in linhas.iter().skip(scroll).take(altura) {
+        let numero = match linha.numero {
+            Some(n) => format!(" {n:>gutter$} │ "),
+            None => format!(" {:>gutter$} │ ", ""),
+        };
+        let mut spans = vec![Span::styled(numero, Style::default().fg(palette::DIM))];
+        spans.extend(spans_da_linha(linha, cursor, true, base));
+        lines.push(Line::from(spans));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -2424,10 +2539,9 @@ fn wizard_param_lines(wizard: &ToolWizard, text_width: usize) -> Vec<Line<'stati
         row.extend(spans);
         lines.push(Line::from(row));
         for chunk in rest {
-            lines.push(Line::styled(
-                format!("{}{chunk}", " ".repeat(PARAM_LABEL_WIDTH + 5)),
-                value_style(focused),
-            ));
+            let mut spans = vec![Span::raw(" ".repeat(PARAM_LABEL_WIDTH + 5))];
+            spans.extend(chunk);
+            lines.push(Line::from(spans));
         }
     }
     // The focused field's help sits below the whole form rather than beside its row, so
@@ -2456,71 +2570,248 @@ fn wizard_param_lines(wizard: &ToolWizard, text_width: usize) -> Vec<Line<'stati
     lines
 }
 
+/// How many lines of a long value the focused field shows at once. The window follows
+/// the cursor; what is above or below it is counted, not drawn, so a pasted kubeconfig
+/// doesn't push the help and the other fields off the screen.
+const CAMPO_LINHAS: usize = 12;
+
 /// A choice shows its arrows so it's visibly cycled rather than typed; a text field
-/// shows a caret while focused so it's visibly editable. A text field with suggestions
-/// is both, and shows both — plus, when the value is one of them, the note that says
-/// what it is: the whole point of offering the machine's own networks is that a CIDR
-/// alone doesn't say which one is the wifi.
-/// Returns the spans for the field's own row, plus whatever had to wrap onto the lines
-/// below it — empty for every value that fits, which is most of them.
+/// shows its cursor while focused so it's visibly editable — and shows its value the
+/// way it was written, line breaks and all, because a query formatted over ten lines
+/// is read over ten lines. A text field with suggestions is both, and shows both —
+/// plus, when the value is one of them, the note that says what it is: the whole point
+/// of offering the machine's own networks is that a CIDR alone doesn't say which one
+/// is the wifi.
+///
+/// Returns the spans for the field's own row, plus the lines that follow it — empty for
+/// every value that fits on one, which is most of them.
 fn field_value(
     field: &ParamField,
     focused: bool,
     width: usize,
-) -> (Vec<Span<'static>>, Vec<String>) {
+) -> (Vec<Span<'static>>, Vec<Vec<Span<'static>>>) {
     let value = |text: String| Span::styled(text, value_style(focused));
     match field.spec.kind {
         ParamKind::Choice(_) => (vec![value(format!("◂ {} ▸", field.value))], Vec::new()),
         ParamKind::Rules => (vec![value(rules_summary(&field.value))], Vec::new()),
-        // Um valor colado de várias linhas não cabe — e não deve caber: o que se quer
-        // ver dele é que ele está ali e qual é o tamanho dele, não o texto inteiro de um
-        // arquivo de configuração dentro de uma linha de formulário.
-        ParamKind::Text if field.value.contains('\n') => {
-            (vec![value(colado(&field.value))], Vec::new())
-        }
-        ParamKind::Text if field.spec.suggestions.is_empty() => {
-            let caret = if focused { "▏" } else { "" };
-            let mut chunks = wrap(&format!("{}{caret}", field.value), width);
-            if chunks.is_empty() {
-                chunks.push(caret.to_string());
-            }
-            (vec![value(chunks.remove(0))], chunks)
-        }
-        ParamKind::Text => {
-            let caret = if focused { "▏" } else { "" };
-            // The arrows have to stay on the row with the field, so only the value wraps
-            // and the closing arrow rides the last line of it.
-            let mut chunks = wrap(&format!("{}{caret}", field.value), width.saturating_sub(4));
-            if chunks.is_empty() {
-                chunks.push(caret.to_string());
-            }
-            let last = chunks.len() == 1;
-            let mut spans = vec![value(format!(
-                "◂ {}{}",
-                chunks.remove(0),
-                if last { " ▸" } else { "" }
+        // A long text shows its preview here and is edited on its own screen: the
+        // first line that says something, how many there are, and the key that opens
+        // it — never the cursor, which lives over there.
+        ParamKind::Editor => {
+            // Room is left for the line count and for the hint that follows while
+            // focused, so the preview never pushes either past the border.
+            let mut spans = vec![value(previa_de_texto(
+                &field.value,
+                width.saturating_sub(36),
             ))];
-            if last && let Some(note) = suggestion_note(field) {
+            if focused {
                 spans.push(Span::styled(
-                    format!("   {note}"),
+                    "  Ctrl+O abre o editor",
                     Style::default().fg(palette::DIM),
                 ));
             }
-            if let Some(final_line) = chunks.last_mut() {
-                final_line.push_str(" ▸");
+            (spans, Vec::new())
+        }
+        // Fora de foco, um valor de várias linhas vira o resumo dele: o que se quer
+        // saber de um kubeconfig colado é que ele está ali e qual é o tamanho dele. Em
+        // foco, ele é o texto, para ser lido e corrigido.
+        ParamKind::Text if !focused && field.value.contains('\n') => {
+            (vec![value(colado(&field.value))], Vec::new())
+        }
+        ParamKind::Text if field.spec.suggestions.is_empty() => {
+            let mut linhas = texto_com_cursor(field, focused, width);
+            (linhas.remove(0), linhas)
+        }
+        ParamKind::Text => {
+            // The arrows have to stay on the row with the field, so only the value wraps
+            // and the closing arrow rides the last line of it.
+            let mut linhas = texto_com_cursor(field, focused, width.saturating_sub(4));
+            let last = linhas.len() == 1;
+            let mut spans = vec![value("◂ ".to_string())];
+            spans.extend(linhas.remove(0));
+            if last {
+                spans.push(value(" ▸".to_string()));
+                if let Some(note) = suggestion_note(field) {
+                    spans.push(Span::styled(
+                        format!("   {note}"),
+                        Style::default().fg(palette::DIM),
+                    ));
+                }
+            } else if let Some(final_line) = linhas.last_mut() {
+                final_line.push(value(" ▸".to_string()));
             }
             (
                 spans,
-                chunks.into_iter().map(|line| format!("  {line}")).collect(),
+                linhas
+                    .into_iter()
+                    .map(|mut line| {
+                        line.insert(0, Span::raw("  "));
+                        line
+                    })
+                    .collect(),
             )
         }
     }
+}
+
+/// One line as it is drawn: its characters with their index into the value, whether
+/// the cursor sits at its very end (after the last character, or on the line break),
+/// and the number of the written line it begins — `None` for the continuation of a
+/// line broken at the width.
+struct LinhaVisual {
+    chars: Vec<(usize, char)>,
+    cursor_no_fim: bool,
+    numero: Option<usize>,
+}
+
+/// The value cut into the lines it is drawn as: its own line breaks kept, anything
+/// longer than `width` broken at the width. Shared by the form field and the editor,
+/// so the two never disagree about where the cursor is.
+fn linhas_visuais(value: &str, cursor: usize, width: usize) -> Vec<LinhaVisual> {
+    let width = width.max(8);
+    let chars: Vec<char> = value.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let nova = |numero: Option<usize>| LinhaVisual {
+        chars: Vec::new(),
+        cursor_no_fim: false,
+        numero,
+    };
+    let mut linhas = vec![nova(Some(1))];
+    let mut numero = 1;
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '\n' {
+            if i == cursor {
+                linhas.last_mut().unwrap().cursor_no_fim = true;
+            }
+            numero += 1;
+            linhas.push(nova(Some(numero)));
+            continue;
+        }
+        if linhas.last().unwrap().chars.len() >= width {
+            linhas.push(nova(None));
+        }
+        linhas.last_mut().unwrap().chars.push((i, *c));
+    }
+    if cursor == chars.len() {
+        linhas.last_mut().unwrap().cursor_no_fim = true;
+    }
+    linhas
+}
+
+/// Which visual line the cursor is on.
+fn linha_do_cursor(linhas: &[LinhaVisual], cursor: usize) -> usize {
+    linhas
+        .iter()
+        .position(|linha| linha.cursor_no_fim || linha.chars.iter().any(|(i, _)| *i == cursor))
+        .unwrap_or(0)
+}
+
+/// One visual line as spans, the character under the cursor inverted when `focused`.
+fn spans_da_linha(
+    linha: &LinhaVisual,
+    cursor: usize,
+    focused: bool,
+    base: Style,
+) -> Vec<Span<'static>> {
+    let cursor_style = base.add_modifier(Modifier::REVERSED);
+    let mut spans = Vec::new();
+    let mut corrente = String::new();
+    for (i, c) in &linha.chars {
+        if focused && *i == cursor {
+            if !corrente.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut corrente), base));
+            }
+            spans.push(Span::styled(c.to_string(), cursor_style));
+        } else {
+            corrente.push(*c);
+        }
+    }
+    if !corrente.is_empty() {
+        spans.push(Span::styled(corrente, base));
+    }
+    if focused && linha.cursor_no_fim {
+        spans.push(Span::styled(" ".to_string(), cursor_style));
+    }
+    spans
+}
+
+/// The preview a long-text field shows in the form: its first line that says
+/// something, and how many lines there are.
+fn previa_de_texto(value: &str, width: usize) -> String {
+    let primeira = value
+        .lines()
+        .map(str::trim)
+        .find(|linha| !linha.is_empty())
+        .unwrap_or("");
+    if primeira.is_empty() {
+        return "(vazio)".to_string();
+    }
+    let linhas = value.lines().count();
+    let texto = corta(primeira, width.max(16));
+    match linhas > 1 {
+        true => format!("{texto}  · {linhas} linhas"),
+        false => texto,
+    }
+}
+
+/// The value as lines of spans: its own line breaks kept, anything longer than `width`
+/// broken at the width, and — while focused — the character under the cursor drawn
+/// inverted, so where the next letter lands is never a guess. A value longer than
+/// `CAMPO_LINHAS` shows the window around the cursor and says how much is outside it.
+fn texto_com_cursor(field: &ParamField, focused: bool, width: usize) -> Vec<Vec<Span<'static>>> {
+    let base = value_style(focused);
+    let cursor = field.cursor.min(field.value.chars().count());
+    let linhas = linhas_visuais(&field.value, cursor, width);
+
+    // The window: the cursor's line, and as many around it as fit.
+    let total = linhas.len();
+    let linha_do_cursor = linha_do_cursor(&linhas, cursor);
+    let inicio = match total > CAMPO_LINHAS {
+        true => linha_do_cursor
+            .saturating_sub(CAMPO_LINHAS / 2)
+            .min(total - CAMPO_LINHAS),
+        false => 0,
+    };
+    let fim = (inicio + CAMPO_LINHAS).min(total);
+
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    if inicio > 0 {
+        out.push(vec![Span::styled(
+            format!("… {inicio} linhas acima"),
+            Style::default().fg(palette::DIM),
+        )]);
+    }
+    for linha in &linhas[inicio..fim] {
+        out.push(spans_da_linha(linha, cursor, focused, base));
+    }
+    if fim < total {
+        out.push(vec![Span::styled(
+            format!("… {} linhas abaixo", total - fim),
+            Style::default().fg(palette::DIM),
+        )]);
+    }
+    out
 }
 
 /// The value column on the confirmation screen: the box, less its borders, the indent
 /// and the label column.
 fn confirm_value_width() -> usize {
     (WIZARD_WIDTH as usize).saturating_sub(WIZARD_TEXT_MARGIN + PARAM_LABEL_WIDTH)
+}
+
+/// `text` as written — indentation kept — cut at `width` with a mark. For a line of a
+/// query, where the leading spaces are the formatting and wrapping would undo it.
+fn corta(text: &str, width: usize) -> String {
+    let text = text.trim_end();
+    match text.chars().count() > width {
+        true => format!(
+            "{}…",
+            text.chars()
+                .take(width.saturating_sub(1))
+                .collect::<String>()
+        ),
+        false => text.to_string(),
+    }
 }
 
 /// The first wrapped line of `text`, or the whole of it when it fits.
@@ -2551,7 +2842,7 @@ fn rules_summary(encoded: &str) -> String {
 /// O resumo de um texto colado: o que ele é e quanto ele tem.
 fn colado(valor: &str) -> String {
     format!(
-        "«colado» {} linhas, {} caracteres  ⌫ apaga",
+        "{} linhas, {} caracteres — ↑/↓ até aqui para ver e editar",
         valor.lines().count(),
         valor.chars().count()
     )
@@ -2621,10 +2912,13 @@ fn wizard_confirm_lines(app: &App, wizard: &ToolWizard) -> Vec<Line<'static>> {
                 // An optional field left blank still gets a line, so the confirmation
                 // shows the whole form rather than quietly hiding part of it.
                 ("", None) => Span::styled("(vazio)", Style::default().fg(palette::DIM)),
-                // Um arquivo colado vira o resumo dele também aqui: a última tela antes
-                // de conectar deve mostrar o que se vai usar, e o que se vai usar é «um
-                // kubeconfig de 42 linhas», não quarenta e duas linhas de YAML.
-                (value, _) if value.contains('\n') => Span::raw(colado(value)),
+                // Um valor de várias linhas — uma consulta, um kubeconfig — aparece
+                // como a prévia do formulário: a primeira linha e a contagem. A
+                // confirmação é para bater o olho no conjunto; o texto inteiro é do
+                // editor, e quarenta linhas aqui empurravam o resto para fora da tela.
+                (value, _) if value.contains('\n') => {
+                    Span::raw(previa_de_texto(value, confirm_value_width()))
+                }
                 (value, _) => Span::raw(first_chunk(value, confirm_value_width())),
             },
         ]));
@@ -3511,12 +3805,12 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
 
     // A busca do cartão aberto vai no pintor: é ele que chega à célula, e é na célula
     // que o acerto é pintado — sem tirar linha nenhuma da tela.
-    let realce = focus
-        .card
-        .and_then(|index| quadro.cards.get(index))
-        .map(|card| card.query.clone())
-        .unwrap_or_default();
-    let pintor = Pintor::novo(&app.marks, None).realcando(realce);
+    let aberto = focus.card.and_then(|index| quadro.cards.get(index));
+    let realce = aberto.map(|card| card.query.clone()).unwrap_or_default();
+    let so_acertos = aberto.is_some_and(|card| card.so_acertos);
+    let pintor = Pintor::novo(&app.marks, None)
+        .realcando(realce)
+        .filtrando(so_acertos);
     let mut desenhados = quadro.cards.len();
     match focus.card.and_then(|index| quadro.cards.get(index)) {
         // Um cartão navegável mostra os dois: a tabela com o cursor em cima, e o que a
@@ -3599,16 +3893,20 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
         (false, _) => "Esc volta para a grade",
     };
     let busca = match quadro.direto {
-        true => "digite para buscar · ",
+        true => "digite para buscar · Ctrl+O editar a consulta · ",
         false => "",
     };
     let rodape = match focus.card {
         Some(index) => match quadro.cards.get(index).map(|card| card.rows() > 0) {
             Some(true) if buscando => format!(
-                " ↑/↓ pular entre os {} acertos · linha {} de {} · {esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
+                " ↑/↓ pular entre os {} acertos · linha {} de {} · Ctrl+F {} · {esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
                 quadro.cards[index].acertos(),
                 quadro.cards[index].row + 1,
                 quadro.cards[index].rows(),
+                match so_acertos {
+                    true => "mostrar todas",
+                    false => "só acertos",
+                },
                 rotulos.pedir_inf
             ),
             Some(true) => format!(
@@ -3642,6 +3940,24 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
         Paragraph::new(Line::styled(rodape, Style::default().fg(palette::DIM))),
         partes[2],
     );
+
+    // A consulta sendo editada fica por cima de tudo isto, que continua desenhado por
+    // baixo: é o resultado atual que se está olhando enquanto se escreve a próxima.
+    if let Some(editor) = &focus.editor {
+        let quem = match execution.nome.is_empty() {
+            true => execution.summary.clone(),
+            false => execution.nome.clone(),
+        };
+        render_texto_editor(
+            frame,
+            area,
+            &format!("{} — {quem}", editor.field.spec.label),
+            &editor.field,
+            &editor.scroll,
+            "Esc aplica e executa de novo",
+            editor.error.as_deref(),
+        );
+    }
 }
 
 /// Works out where the viewport should sit this frame, and returns which match — as an
@@ -4227,6 +4543,9 @@ fn render_pane_table(
     };
     if !buscando.is_empty() {
         titulo.push_str(&format!(" · buscando «{buscando}»"));
+        if pintor.filtra() && query.is_empty() {
+            titulo.push_str(" · só acertos");
+        }
     }
     let mut bloco = moldura(&titulo);
     if let Some((note, tom)) = note.filter(|(n, _)| !n.is_empty()) {
@@ -4247,9 +4566,24 @@ fn render_pane_table(
     // A busca filtra: uma lista de módulos ou de posições é curta, e ver só o que casa é
     // o que se espera dela — diferente das tabelas do sistema, onde as linhas em volta de
     // um acerto costumam ser o assunto.
-    let needle = query.to_lowercase();
-    let visiveis: Vec<&crate::invest::module::Row> =
-        rows.iter().filter(|r| r.matches(&needle)).collect();
+    // Numa visão em modo «só acertos» é o realce que filtra, e o cursor do cartão —
+    // que conta linhas da tabela inteira — é traduzido para a posição entre as visíveis.
+    let por_realce = query.is_empty() && pintor.filtra();
+    let needle = match por_realce {
+        true => pintor.realce().to_lowercase(),
+        false => query.to_lowercase(),
+    };
+    let indices: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.matches(&needle))
+        .map(|(i, _)| i)
+        .collect();
+    let visiveis: Vec<&crate::invest::module::Row> = indices.iter().map(|&i| &rows[i]).collect();
+    let selected = match por_realce {
+        true => selected.and_then(|original| indices.iter().position(|&i| i == original)),
+        false => selected,
+    };
     // A cor da marca **e a coluna de que ela fala** — o ticker, o nome do indicador. Ver
     // `Pintor::tabela`: nesta aba a cor das outras colunas já é o sinal do número, e
     // repintá-las apagaria a informação que se veio ler.
@@ -4262,6 +4596,10 @@ fn render_pane_table(
     // painel — inclusive dos cartões estreitos da home — para uma coluna quase sempre
     // vazia sairiam mais caro do que o pulo de uma vez só quando a primeira marca nasce.
     let marcada = marcas.iter().any(Option::is_some);
+    // A linha inteira em que a busca acertou ganha um fundo discreto, além do trecho
+    // realçado: numa tabela larga o acerto fica numa coluna e o que se quer ler está
+    // em outra, e sem a faixa o olho perde a linha no caminho.
+    let realce_needle = pintor.realce().to_lowercase();
 
     let ui_rows: Vec<UiRow> = visiveis
         .iter()
@@ -4333,11 +4671,14 @@ fn render_pane_table(
                 spans.push(Span::styled(sufixo, Style::default().fg(cor_rabicho)));
                 Cell::from(Line::from(spans))
             }));
-            let linha = UiRow::new(celulas);
-            match r.tone {
-                Tone::Destaque => linha.style(Style::default().add_modifier(Modifier::BOLD)),
-                _ => linha,
+            let mut estilo = Style::default();
+            if !realce_needle.is_empty() && r.matches(&realce_needle) {
+                estilo = estilo.bg(palette::REALCE_FUNDO);
             }
+            if matches!(r.tone, Tone::Destaque) {
+                estilo = estilo.add_modifier(Modifier::BOLD);
+            }
+            UiRow::new(celulas).style(estilo)
         })
         .collect();
 

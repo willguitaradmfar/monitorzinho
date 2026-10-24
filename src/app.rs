@@ -888,13 +888,168 @@ pub enum WizardStep {
     Confirm,
 }
 
-/// One parameter being filled in, i.e. its spec plus what's been typed so far.
+/// One parameter being filled in: its spec, what's been typed so far, and where the
+/// cursor is in it.
+///
+/// A real cursor, not "the end of the string": a connection string with one wrong
+/// character, a query that needs a column added in the middle, were being retyped from
+/// the start, and a form that only appends is a form that is only ever filled in once.
 pub struct ParamField {
     pub spec: ParamSpec,
     pub value: String,
+    /// Where typing goes, as a **character** index into `value` — never a byte index,
+    /// because the text has accents and a cursor between two bytes of one is a panic.
+    pub cursor: usize,
 }
 
 impl ParamField {
+    /// A field holding `value`, with the cursor after it — where typing would carry on.
+    pub fn new(spec: ParamSpec, value: String) -> Self {
+        let cursor = value.chars().count();
+        Self {
+            spec,
+            value,
+            cursor,
+        }
+    }
+
+    /// Whether typing goes into it — a plain text field, or a long one that has its own
+    /// screen but is the same string underneath.
+    fn is_text(&self) -> bool {
+        matches!(self.spec.kind, ParamKind::Text | ParamKind::Editor)
+    }
+
+    fn len(&self) -> usize {
+        self.value.chars().count()
+    }
+
+    /// The byte offset of character `index` — `value.len()` for one past the end.
+    fn byte_at(&self, index: usize) -> usize {
+        self.value
+            .char_indices()
+            .nth(index)
+            .map(|(byte, _)| byte)
+            .unwrap_or(self.value.len())
+    }
+
+    /// Replaces the whole value — a picked option, a picked suggestion — and parks the
+    /// cursor after it.
+    fn set_value(&mut self, value: String) {
+        self.value = value;
+        self.cursor = self.len();
+    }
+
+    pub fn insert(&mut self, c: char) {
+        let at = self.byte_at(self.cursor);
+        self.value.insert(at, c);
+        self.cursor += 1;
+    }
+
+    /// Pasted text goes in whole, newlines and all — a YAML without them isn't a YAML,
+    /// and a query formatted over ten lines should stay formatted over ten lines.
+    pub fn insert_str(&mut self, text: &str) {
+        let at = self.byte_at(self.cursor);
+        self.value.insert_str(at, text);
+        self.cursor += text.chars().count();
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let from = self.byte_at(self.cursor - 1);
+        let to = self.byte_at(self.cursor);
+        self.value.replace_range(from..to, "");
+        self.cursor -= 1;
+    }
+
+    pub fn delete(&mut self) {
+        if self.cursor >= self.len() {
+            return;
+        }
+        let from = self.byte_at(self.cursor);
+        let to = self.byte_at(self.cursor + 1);
+        self.value.replace_range(from..to, "");
+    }
+
+    pub fn clear(&mut self) {
+        self.value.clear();
+        self.cursor = 0;
+    }
+
+    /// ←/→ inside the text. `false` at the edge, where there is nowhere left to go —
+    /// which is when the arrow is free to mean something else (see `cycle`).
+    fn move_cursor(&mut self, delta: i32) -> bool {
+        if !self.is_text() {
+            return false;
+        }
+        if delta < 0 && self.cursor > 0 {
+            self.cursor -= 1;
+            return true;
+        }
+        if delta > 0 && self.cursor < self.len() {
+            self.cursor += 1;
+            return true;
+        }
+        false
+    }
+
+    /// Where each line of the value starts, as character indices, plus a sentinel one
+    /// past the end — so line `i` spans `starts[i]..starts[i + 1] - 1`.
+    fn line_starts(&self) -> Vec<usize> {
+        let mut starts = vec![0];
+        for (i, c) in self.value.chars().enumerate() {
+            if c == '\n' {
+                starts.push(i + 1);
+            }
+        }
+        starts.push(self.len() + 1);
+        starts
+    }
+
+    /// Which line the cursor is on, and how far into it.
+    fn line_and_column(&self) -> (usize, usize) {
+        let starts = self.line_starts();
+        let line = starts
+            .iter()
+            .rposition(|start| *start <= self.cursor)
+            .unwrap_or(0)
+            .min(starts.len().saturating_sub(2));
+        (line, self.cursor - starts[line])
+    }
+
+    /// ↑/↓ inside a value that has more than one line: moves to the line above or below,
+    /// keeping the column where it can. `false` on the first/last line — and then the
+    /// key means what it always meant in the form, the next field.
+    fn move_line(&mut self, delta: i32) -> bool {
+        if !self.is_text() || !self.value.contains('\n') {
+            return false;
+        }
+        let starts = self.line_starts();
+        let lines = starts.len() - 1;
+        let (line, column) = self.line_and_column();
+        let target = line as i32 + delta.signum();
+        if target < 0 || target as usize >= lines {
+            return false;
+        }
+        let target = target as usize;
+        let width = starts[target + 1] - 1 - starts[target];
+        self.cursor = starts[target] + column.min(width);
+        true
+    }
+
+    /// Home/End: the start and the end of the current line.
+    pub fn home(&mut self) {
+        let (line, _) = self.line_and_column();
+        self.cursor = self.line_starts()[line];
+    }
+
+    pub fn end(&mut self) {
+        let starts = self.line_starts();
+        let (line, _) = self.line_and_column();
+        self.cursor = starts[line + 1] - 1;
+    }
+
     /// Moves a `Choice` field to the next/previous option, wrapping — and a text field
     /// that has suggestions through those, since walking a list the machine already
     /// knows beats typing it back in. A text field with nothing to suggest is edited by
@@ -904,10 +1059,10 @@ impl ParamField {
             let current = options.iter().position(|o| *o == self.value).unwrap_or(0);
             let len = options.len() as i32;
             let next = (current as i32 + delta).rem_euclid(len) as usize;
-            self.value = options[next].to_string();
+            self.set_value(options[next].to_string());
             return;
         }
-        if !matches!(self.spec.kind, ParamKind::Text) || self.spec.suggestions.is_empty() {
+        if !self.is_text() || self.spec.suggestions.is_empty() {
             return;
         }
         let suggestions = &self.spec.suggestions;
@@ -919,7 +1074,8 @@ impl ParamField {
             None if delta >= 0 => 0,
             None => suggestions.len() - 1,
         };
-        self.value = suggestions[next].value.clone();
+        let picked = suggestions[next].value.clone();
+        self.set_value(picked);
     }
 }
 
@@ -936,6 +1092,8 @@ pub struct ToolWizard {
     pub error: Option<String>,
     /// The rules screen, while it's open on top of the form.
     pub editor: Option<RulesEditor>,
+    /// The long-text editor, while it's open on top of the form — see `ParamKind::Editor`.
+    pub texto: Option<TextoEditor>,
     /// The execution being reconfigured, or `None` when adding a new one. An edit skips
     /// the tool-picking step — the tool is what it already is — and replaces that
     /// execution instead of appending one.
@@ -1006,6 +1164,63 @@ impl ToolWizard {
             self.field = self.first_field();
         }
     }
+}
+
+/// One key into a long text, wherever the editor is open — the form's or the view's.
+/// Enter is a line break here, because the text is the point. Returns `true` on Esc,
+/// which is the way out.
+fn tecla_no_texto(field: &mut ParamField, code: KeyCode, ctrl: bool) -> bool {
+    match code {
+        KeyCode::Esc => return true,
+        KeyCode::Enter => field.insert('\n'),
+        KeyCode::Char('u') if ctrl => field.clear(),
+        KeyCode::Char(_) if ctrl => {}
+        KeyCode::Char(c) => field.insert(c),
+        KeyCode::Tab => field.insert_str("    "),
+        KeyCode::Backspace => field.backspace(),
+        KeyCode::Delete => field.delete(),
+        KeyCode::Left => {
+            field.move_cursor(-1);
+        }
+        KeyCode::Right => {
+            field.move_cursor(1);
+        }
+        KeyCode::Up => {
+            field.move_line(-1);
+        }
+        KeyCode::Down => {
+            field.move_line(1);
+        }
+        KeyCode::PageUp => {
+            for _ in 0..10 {
+                if !field.move_line(-1) {
+                    break;
+                }
+            }
+        }
+        KeyCode::PageDown => {
+            for _ in 0..10 {
+                if !field.move_line(1) {
+                    break;
+                }
+            }
+        }
+        KeyCode::Home => field.home(),
+        KeyCode::End => field.end(),
+        _ => {}
+    }
+    false
+}
+
+/// The long-text editor: a field of the form, opened wide.
+///
+/// It holds no text of its own — the field does, cursor included — only which field,
+/// and how far the view is scrolled. So there is nothing to save or discard on the way
+/// out: Esc closes it and the field is whatever it was last typed into.
+pub struct TextoEditor {
+    pub field: usize,
+    /// First visual line on screen. Settled while drawing, to keep the cursor in view.
+    pub scroll: Cell<usize>,
 }
 
 /// Editing one execution's list of rewrite rules.
@@ -1391,6 +1606,23 @@ pub struct BoardFocus {
     pub execution_id: u64,
     /// Qual cartão está ampliado, pelo índice na grade. `None` é a grade.
     pub card: Option<usize>,
+    /// O editor da consulta, aberto por cima da tabela (Ctrl+O). É o mesmo editor do
+    /// formulário, chamado de onde o resultado está à vista: muda-se a consulta, sai-se
+    /// com Esc, e a tabela se refaz — sem passar pela lista, pelo 'e' e pela confirmação.
+    pub editor: Option<BoardEditor>,
+}
+
+/// A consulta de uma visão sendo editada em cima do próprio resultado.
+pub struct BoardEditor {
+    /// Qual parâmetro — «consulta», ou «corpo» numa fonte HTTP com POST.
+    pub key: &'static str,
+    pub field: ParamField,
+    pub scroll: Cell<usize>,
+    /// O texto como estava ao abrir: sair sem mudar nada não reexecuta nada.
+    original: String,
+    /// Por que a consulta nova não foi aceita, quando não foi. Fica na tela, com o
+    /// editor ainda aberto, para ser corrigida ali mesmo.
+    pub error: Option<String>,
 }
 
 pub enum Focus {
@@ -3793,6 +4025,7 @@ impl App {
             field: 0,
             error: None,
             editor: None,
+            texto: None,
             editing: None,
         });
     }
@@ -3812,6 +4045,14 @@ impl App {
                 }
             }
             WizardStep::Params => {
+                // Inside a value of several lines, ↑/↓ first walk the lines; only past
+                // the first or last one do they leave the field.
+                if delta.abs() == 1
+                    && let Some(field) = wizard.fields.get_mut(wizard.field)
+                    && field.move_line(delta)
+                {
+                    return;
+                }
                 // One applicable field per step: a field that doesn't apply isn't shown,
                 // so stopping on it would be focus landing on nothing.
                 let step = delta.signum();
@@ -3834,6 +4075,11 @@ impl App {
             && wizard.step == WizardStep::Params
             && let Some(field) = wizard.fields.get_mut(wizard.field)
         {
+            // In a text field the arrow moves the cursor; only at the edge, with nowhere
+            // left to move, does it go on to walk the suggestions.
+            if field.move_cursor(delta) {
+                return;
+            }
             field.cycle(delta);
             wizard.error = None;
             // Changing a choice can take other fields away — a tunnel that becomes a
@@ -3846,10 +4092,234 @@ impl App {
         if let Focus::Wizard(wizard) = &mut self.focus
             && wizard.step == WizardStep::Params
             && let Some(field) = wizard.fields.get_mut(wizard.field)
-            && matches!(field.spec.kind, ParamKind::Text)
+            && field.is_text()
         {
-            field.value.push(c);
+            // Typing straight into a long-text field opens its editor around the
+            // keystroke, so the letter lands where it can be seen.
+            if matches!(field.spec.kind, ParamKind::Editor) && wizard.texto.is_none() {
+                wizard.texto = Some(TextoEditor {
+                    field: wizard.field,
+                    scroll: Cell::new(0),
+                });
+            }
+            field.insert(c);
             wizard.error = None;
+        }
+    }
+
+    /// Ctrl+O (or F4) on a long-text field: opens its editor. Not Enter — Enter is
+    /// how every other field moves the form along, and a key that means "continue" on
+    /// nine fields and "open" on the tenth is a key that gets pressed wrong.
+    pub fn wizard_open_editor(&mut self) {
+        if let Focus::Wizard(wizard) = &mut self.focus
+            && wizard.step == WizardStep::Params
+            && wizard.texto.is_none()
+            && let Some(field) = wizard.fields.get(wizard.field)
+            && matches!(field.spec.kind, ParamKind::Editor)
+        {
+            wizard.texto = Some(TextoEditor {
+                field: wizard.field,
+                scroll: Cell::new(0),
+            });
+        }
+    }
+
+    /// Whether the long-text editor is on top of the form.
+    pub fn texto_editor_open(&self) -> bool {
+        matches!(&self.focus, Focus::Wizard(wizard) if wizard.texto.is_some())
+    }
+
+    /// Every key while the long-text editor is open. Enter is a line break here — the
+    /// text is the point — and Esc is the way back to the form, with the text as typed.
+    pub fn texto_key(&mut self, code: KeyCode, ctrl: bool) {
+        let Focus::Wizard(wizard) = &mut self.focus else {
+            return;
+        };
+        let Some(editor) = &wizard.texto else {
+            return;
+        };
+        let index = editor.field;
+        let Some(field) = wizard.fields.get_mut(index) else {
+            wizard.texto = None;
+            return;
+        };
+        if tecla_no_texto(field, code, ctrl) {
+            wizard.texto = None;
+        }
+        wizard.error = None;
+    }
+
+    // --- a consulta editada de dentro da visão --------------------------------------
+
+    /// Whether the query editor is open over a view.
+    pub fn board_editor_open(&self) -> bool {
+        matches!(&self.focus, Focus::Board(board) if board.editor.is_some())
+    }
+
+    /// Ctrl+O numa visão: abre a consulta dela no editor, por cima do resultado.
+    pub fn board_open_editor(&mut self) {
+        let Focus::Board(board) = &self.focus else {
+            return;
+        };
+        if board.editor.is_some() {
+            return;
+        }
+        let Some(execution) = self.tools.by_id(board.execution_id) else {
+            return;
+        };
+        if !execution
+            .board()
+            .is_some_and(|quadro| tools::lock_board(quadro).direto)
+        {
+            return;
+        }
+        let Some((tool, params)) = self.params_of(execution) else {
+            return;
+        };
+        // O primeiro campo de texto longo que vale para esta configuração: a consulta,
+        // ou o corpo de um POST. Uma fonte sem nenhum não tem o que editar aqui.
+        let Some(spec) = tools::form_params(tool)
+            .into_iter()
+            .filter(|spec| matches!(spec.kind, ParamKind::Editor))
+            .find(|spec| {
+                spec.only_when.iter().all(|(key, values)| {
+                    params
+                        .get(key)
+                        .is_some_and(|value| values.contains(&value.as_str()))
+                })
+            })
+        else {
+            return;
+        };
+        let value = params.get(spec.key).cloned().unwrap_or_default();
+        let editor = BoardEditor {
+            key: spec.key,
+            original: value.clone(),
+            field: ParamField::new(spec, value),
+            scroll: Cell::new(0),
+            error: None,
+        };
+        if let Focus::Board(board) = &mut self.focus {
+            board.editor = Some(editor);
+        }
+    }
+
+    pub fn board_editor_key(&mut self, code: KeyCode, ctrl: bool) {
+        let Focus::Board(board) = &mut self.focus else {
+            return;
+        };
+        let Some(editor) = &mut board.editor else {
+            return;
+        };
+        editor.error = None;
+        if tecla_no_texto(&mut editor.field, code, ctrl) {
+            self.board_editor_close();
+        }
+    }
+
+    pub fn board_editor_paste(&mut self, texto: &str) {
+        if let Focus::Board(board) = &mut self.focus
+            && let Some(editor) = &mut board.editor
+        {
+            let texto = texto
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .replace('\t', "    ");
+            editor.field.insert_str(&texto);
+            editor.error = None;
+        }
+    }
+
+    /// Esc no editor da visão: se a consulta mudou, ela passa a ser a consulta da
+    /// execução — gravada, como pelo formulário — e roda agora, com a tabela à vista.
+    /// Uma consulta que a ferramenta recusa não substitui nada: o editor fica aberto,
+    /// com o motivo, para ser corrigida ali.
+    fn board_editor_close(&mut self) {
+        let Focus::Board(board) = &mut self.focus else {
+            return;
+        };
+        let Some(editor) = board.editor.take() else {
+            return;
+        };
+        let novo = editor.field.value.trim().to_string();
+        if novo == editor.original.trim() {
+            return;
+        }
+        let id = board.execution_id;
+        let Some(index) = self.tools.index_of(id) else {
+            return;
+        };
+        let Some(saved) = self.tools.executions[index].spec().cloned() else {
+            return;
+        };
+        let Some(tool_index) = self
+            .tools_available
+            .iter()
+            .position(|tool| tool.id() == saved.tool)
+        else {
+            return;
+        };
+        let tool = &self.tools_available[tool_index];
+        let mut params = restore_params(tool.as_ref(), &saved);
+        params.insert(editor.key, novo);
+
+        // A mesma validação do formulário, antes de mexer em qualquer coisa: uma
+        // consulta que não presta volta para o editor com o que a ferramenta disse.
+        if let Err(message) = tool.start(u64::MAX, &params) {
+            let mut editor = editor;
+            editor.error = Some(message);
+            if let Focus::Board(board) = &mut self.focus {
+                board.editor = Some(editor);
+            }
+            return;
+        }
+
+        // Trocada como o 'e' troca: a execução antiga para, a nova toma o lugar dela na
+        // lista, e a tela passa a olhar para a nova.
+        self.tools.executions[index].stop();
+        thread::sleep(RESTART_GRACE);
+        let replacement = self.tools.launch(tool.as_ref(), params.clone());
+        let new_id = replacement.id;
+        self.tools.executions[index] = replacement;
+        self.tools.selected = index;
+        self.tools.persist();
+        if let Focus::Board(board) = &mut self.focus {
+            board.execution_id = new_id;
+        }
+        if let Some(execution) = self.tools.by_id(new_id) {
+            tool.rerun(execution, &params);
+        }
+    }
+
+    /// Alt+Enter (or Ctrl+J): a line break inside the value. Enter itself moves the
+    /// form along, and a query is the one value that wants to keep its own lines.
+    pub fn wizard_newline(&mut self) {
+        self.wizard_type('\n');
+    }
+
+    /// Delete: the character under the cursor.
+    pub fn wizard_delete(&mut self) {
+        if let Focus::Wizard(wizard) = &mut self.focus
+            && wizard.step == WizardStep::Params
+            && let Some(field) = wizard.fields.get_mut(wizard.field)
+            && field.is_text()
+        {
+            field.delete();
+            wizard.error = None;
+        }
+    }
+
+    /// Home/End: start and end of the current line of the value.
+    pub fn wizard_home_end(&mut self, end: bool) {
+        if let Focus::Wizard(wizard) = &mut self.focus
+            && wizard.step == WizardStep::Params
+            && let Some(field) = wizard.fields.get_mut(wizard.field)
+            && field.is_text()
+        {
+            match end {
+                true => field.end(),
+                false => field.home(),
+            }
         }
     }
 
@@ -3859,12 +4329,27 @@ impl App {
     /// existir, e um YAML sem as quebras não é um YAML. Quem desenha o campo mostra um
     /// resumo quando o valor tem mais de uma linha — ver `field_value`.
     pub fn wizard_paste(&mut self, texto: &str) {
+        // O terminal entrega as quebras de uma colagem como CR, não como LF — é o que
+        // o bracketed paste faz em quase todo emulador —, e um CR solto não é uma
+        // linha para ninguém aqui: as linhas emendavam e a indentação sumia junto. O
+        // tab vira quatro espaços pelo mesmo motivo: na tela ele não tem largura.
+        let texto = texto
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+        let texto = texto.as_str();
         if let Focus::Wizard(wizard) = &mut self.focus
             && wizard.step == WizardStep::Params
             && let Some(field) = wizard.fields.get_mut(wizard.field)
-            && matches!(field.spec.kind, ParamKind::Text)
+            && field.is_text()
         {
-            field.value.push_str(texto);
+            if matches!(field.spec.kind, ParamKind::Editor) && wizard.texto.is_none() {
+                wizard.texto = Some(TextoEditor {
+                    field: wizard.field,
+                    scroll: Cell::new(0),
+                });
+            }
+            field.insert_str(texto);
             wizard.error = None;
         }
     }
@@ -3873,17 +4358,10 @@ impl App {
         if let Focus::Wizard(wizard) = &mut self.focus
             && wizard.step == WizardStep::Params
             && let Some(field) = wizard.fields.get_mut(wizard.field)
-            && matches!(field.spec.kind, ParamKind::Text)
+            && field.is_text()
         {
-            // Um valor colado de várias linhas sai inteiro de uma vez. Ele não foi
-            // digitado caractere a caractere, e apagar um kubeconfig de três mil letras
-            // com três mil toques não é uma coisa que se peça a alguém.
-            match field.value.contains('\n') {
-                true => field.value.clear(),
-                false => {
-                    field.value.pop();
-                }
-            }
+            // Uma letra, a que está antes do cursor. Um valor inteiro sai pelo Ctrl+U.
+            field.backspace();
             wizard.error = None;
         }
     }
@@ -3894,9 +4372,9 @@ impl App {
         if let Focus::Wizard(wizard) = &mut self.focus
             && wizard.step == WizardStep::Params
             && let Some(field) = wizard.fields.get_mut(wizard.field)
-            && matches!(field.spec.kind, ParamKind::Text)
+            && field.is_text()
         {
-            field.value.clear();
+            field.clear();
             wizard.error = None;
         }
     }
@@ -4049,9 +4527,9 @@ impl App {
                 // different tool can't leave the previous one's fields behind.
                 wizard.fields = tools::form_params(tool.as_ref())
                     .into_iter()
-                    .map(|spec| ParamField {
-                        value: spec.default.to_string(),
-                        spec,
+                    .map(|spec| {
+                        let value = spec.default.to_string();
+                        ParamField::new(spec, value)
                     })
                     .collect();
                 wizard.field = wizard.first_field();
@@ -4067,6 +4545,7 @@ impl App {
                     wizard.editor = Some(RulesEditor::new(wizard.field, &field.value));
                     return;
                 }
+
                 wizard.error = None;
                 wizard.step = WizardStep::Confirm;
             }
@@ -4257,7 +4736,7 @@ impl App {
                 if clone && spec.key == tools::NOME && !value.trim().is_empty() {
                     value = format!("{} (cópia)", value.trim());
                 }
-                ParamField { value, spec }
+                ParamField::new(spec, value)
             })
             .collect();
         self.focus = Focus::Wizard(ToolWizard {
@@ -4268,6 +4747,7 @@ impl App {
             field: 0,
             error: None,
             editor: None,
+            texto: None,
             editing: (!clone).then_some(id),
         });
     }
@@ -4438,6 +4918,7 @@ impl App {
             self.focus = Focus::Board(Box::new(BoardFocus {
                 execution_id: execution.id,
                 card: direto.then_some(0),
+                editor: None,
             }));
             return;
         }
@@ -5193,6 +5674,27 @@ impl App {
         true
     }
 
+    /// Ctrl+F numa visão: alterna entre realçar os acertos e mostrar só eles.
+    pub fn board_toggle_filter(&mut self) {
+        let Focus::Board(board) = &self.focus else {
+            return;
+        };
+        let Some(quadro) = self
+            .tools
+            .by_id(board.execution_id)
+            .and_then(|e| e.board().cloned())
+        else {
+            return;
+        };
+        let mut quadro = tools::lock_board(&quadro);
+        if !quadro.direto {
+            return;
+        }
+        if let Some(card) = board.card.and_then(|index| quadro.cards.get_mut(index)) {
+            card.toggle_so_acertos();
+        }
+    }
+
     /// Backspace na busca de uma visão.
     pub fn board_backspace(&mut self) {
         let Some(mut query) = self.board_query() else {
@@ -5474,6 +5976,7 @@ impl App {
                     true => Focus::Board(Box::new(BoardFocus {
                         execution_id: id,
                         card: None,
+                        editor: None,
                     })),
                     false => Focus::None,
                 };

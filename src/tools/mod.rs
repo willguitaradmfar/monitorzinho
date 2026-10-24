@@ -64,6 +64,10 @@ pub enum ParamKind {
     /// A list of search/replace rules, edited on its own screen because it's the one
     /// parameter that isn't a single value. The stored value is `rewrite::encode`d.
     Rules,
+    /// Long text — a query, a JSON body — edited on its own screen, opened with Ctrl+O:
+    /// a form row is the wrong size for forty lines of SQL, and a query is read in the
+    /// shape it was written in. The form shows a preview of it.
+    Editor,
 }
 
 /// One ready-made value a text field offers alongside what can be typed into it.
@@ -137,6 +141,24 @@ impl ParamSpec {
     pub fn suggesting(mut self, suggestions: Vec<Suggestion>) -> Self {
         self.suggestions = suggestions;
         self
+    }
+
+    /// A long text, edited on its own screen. See `ParamKind::Editor`.
+    pub fn editor(
+        key: &'static str,
+        label: &'static str,
+        default: &'static str,
+        help: &'static str,
+    ) -> Self {
+        Self {
+            key,
+            label,
+            help,
+            default,
+            kind: ParamKind::Editor,
+            suggestions: Vec::new(),
+            only_when: Vec::new(),
+        }
     }
 
     pub fn rules(key: &'static str, label: &'static str, help: &'static str) -> Self {
@@ -914,6 +936,7 @@ impl Board {
             );
             // A busca sobrevive à reescrita: o que se estava filtrando continua
             // filtrado depois do Ctrl+R, agora sobre as linhas novas.
+            card.so_acertos = self.cards[old].so_acertos;
             card.set_query(self.cards[old].query.clone());
             // O cursor também sobrevive à reescrita: quem estava lendo a décima linha
             // continua nela depois de um Ctrl+R, e não volta para o topo.
@@ -955,6 +978,9 @@ pub struct Card {
     /// ferramenta reescreve o cartão a cada passada, e uma busca que sumisse no Ctrl+R
     /// seria perdida exatamente enquanto estivesse sendo usada.
     pub query: String,
+    /// O outro modo da busca (Ctrl+F): em vez de realçar os acertos no meio das outras
+    /// linhas, mostrar só eles. Um alterna para o outro e volta.
+    pub so_acertos: bool,
     /// How many rows the card asks for in the grid, content only — the frame is added
     /// by whoever draws it.
     pub height: u16,
@@ -985,6 +1011,7 @@ impl Card {
             rows_detail: Vec::new(),
             row: 0,
             query: String::new(),
+            so_acertos: false,
             tone: crate::painel::Tone::Normal,
         }
     }
@@ -1022,6 +1049,21 @@ impl Card {
         self.query = query;
         if let Some(primeiro) = self.acertos_em().first().copied() {
             self.select(primeiro);
+        }
+    }
+
+    /// Alterna entre realçar os acertos e mostrar só eles. Entrando no modo «só
+    /// acertos» com o cursor numa linha que não casa, ele vai para o primeiro acerto —
+    /// a linha em que estava deixou de existir na tela.
+    pub fn toggle_so_acertos(&mut self) {
+        self.so_acertos = !self.so_acertos;
+        if self.so_acertos {
+            let acertos = self.acertos_em();
+            if !acertos.contains(&self.row)
+                && let Some(primeiro) = acertos.first().copied()
+            {
+                self.select(primeiro);
+            }
         }
     }
 

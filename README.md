@@ -439,8 +439,11 @@ execution instead of replacing this one, since most new executions are an old
 one with one field changed. `r` restarts one (or, for a tool that works on
 demand, runs it again), `Del` stops and forgets it.
 
-Every form starts with the same field, **Nome**: what this execution is for, in
-your own words. It is the column between the tool and the detail, and it exists
+Inside a form, `←`/`→` move the cursor through a field, `Home`/`End` go to the
+ends of the line, `Ctrl+U` empties it, and `Alt+Enter` breaks a line; a field
+that holds a long text — a query, a request body — opens an editor of its own
+on `Ctrl+O` (or `F4`); `Enter` keeps meaning "continue" there as everywhere. Every form starts with the same field, **Nome**: what this
+execution is for, in your own words. It is the column between the tool and the detail, and it exists
 because the detail says what an execution does — `ssh root@10.0.0.5 · raso` —
 and after a week that is exactly the line nobody remembers the reason for. It
 can be left blank. The **Resultado** column is the tool's own — a tunnel's byte
@@ -1098,12 +1101,21 @@ wrote them). GET or POST with a JSON body, no authentication or a `Bearer` token
 or `Basic` credentials, redirects followed. An object at the end of the path is
 one row; a list of scalars is one column called `valor`.
 
-`Enter` opens straight onto the table — there is no card grid, because there is
-one card. `↑`/`↓` walk the rows and the row under the cursor appears underneath
-as field/value, which is what saves a table too wide to fit. The screen shows at
-most a thousand rows and says so when it cut; the query should carry its own
-`LIMIT`. The row in the list shows how many rows came back and how long it
-took.
+The query itself is written in an editor of its own, opened with `Ctrl+O` (or
+`F4`) on the field: as wide and as tall as the terminal, line numbers down the side, a cursor
+that goes anywhere, `Enter` for a new line, paste that keeps its shape. A form
+row is the wrong size for forty lines of SQL. `Esc` returns to the form, which
+shows the first line and the line count as a preview.
+
+`Enter` on the execution opens straight onto the table — there is no card grid,
+because there is one card. `↑`/`↓` walk the rows and the row under the cursor
+appears underneath as field/value, which is what saves a table too wide to fit.
+Typing searches, the way the log is searched: every row stays, the text that
+matched is painted in place, and the arrows step from hit to hit. `Ctrl+F`
+switches to the other mode of the same search, only the rows that match, and
+back; `Esc` clears the search before it leaves. The screen shows at most a
+thousand rows and says so when it cut; the query should carry its own `LIMIT`.
+The row in the list shows how many rows came back and how long it took.
 
 ## Keys
 
