@@ -429,18 +429,24 @@ impl Plan {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        // The kernel's own guarantee that no tunnel outlives the app: if the thread that
-        // spawned this dies — which is what happens to every thread when the process
-        // exits — the child is killed rather than inherited by init and left forwarding.
-        unsafe {
-            command.pre_exec(|| {
-                // Best effort: a system that refuses this still gets the explicit kill
-                // on the way out of every path that has one.
-                prctl(PR_SET_PDEATHSIG, SIGKILL as u64);
-                Ok(())
-            });
-        }
+        morrer_com_o_pai(&mut command);
         command
+    }
+}
+
+/// The kernel's own guarantee that no tunnel outlives the app: if the thread that
+/// spawned the child dies — which is what happens to every thread when the process
+/// exits — the child is killed rather than inherited by init and left forwarding.
+///
+/// Shared with the Visão tool, whose SSH hop is the same `ssh -N -L` on a shorter leash.
+pub(crate) fn morrer_com_o_pai(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            // Best effort: a system that refuses this still gets the explicit kill on
+            // the way out of every path that has one.
+            prctl(PR_SET_PDEATHSIG, SIGKILL as u64);
+            Ok(())
+        });
     }
 }
 
@@ -643,7 +649,7 @@ fn exit_reason(status: ExitStatus) -> String {
 /// Asks the child to go, then makes it. `SIGTERM` first so the `ssh` closes the session
 /// properly — which for a remote forward is what tells the server to give the port back
 /// now rather than when it notices the socket is gone.
-fn terminate(child: &mut Child) {
+pub(crate) fn terminate(child: &mut Child) {
     unsafe { kill(child.id() as i32, SIGTERM) };
     let deadline = Instant::now();
     while deadline.elapsed() < Duration::from_secs(2) {
@@ -685,7 +691,7 @@ fn number(text: &str, what: &str) -> Result<u16, String> {
 }
 
 /// `~/...` the way every ssh file is written down.
-fn expand(path: &str) -> PathBuf {
+pub(crate) fn expand(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => match dirs::home_dir() {
             Some(home) => home.join(rest),
@@ -697,7 +703,7 @@ fn expand(path: &str) -> PathBuf {
 
 /// The `ssh` this will run, found the way the shell would find it. Looked up while the
 /// form is still open so "there is no ssh here" is an answer, not a thread that dies.
-fn ssh_binary() -> Option<PathBuf> {
+pub(crate) fn ssh_binary() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join("ssh"))
@@ -708,7 +714,7 @@ fn executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-fn user_suggestions() -> Vec<Suggestion> {
+pub(crate) fn user_suggestions() -> Vec<Suggestion> {
     // The blank is first because the blank is the default, and here it means something:
     // the ~/.ssh/config entry for this host usually already says who you are there.
     let mut suggestions = vec![Suggestion::new(
@@ -727,7 +733,7 @@ fn user_suggestions() -> Vec<Suggestion> {
 /// The hosts `~/.ssh/config` already names. A machine you tunnel to is a machine you
 /// have connected to before, so the answer is usually already written down — and the
 /// `HostName` beside it is what tells two similar aliases apart.
-fn host_suggestions() -> Vec<Suggestion> {
+pub(crate) fn host_suggestions() -> Vec<Suggestion> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
@@ -771,7 +777,7 @@ fn host_suggestions() -> Vec<Suggestion> {
 /// The private keys in `~/.ssh`, found by the public half sitting beside them — which
 /// picks up the ones with names nobody would guess and leaves out `config`,
 /// `known_hosts` and the `.pub` files themselves.
-fn key_suggestions() -> Vec<Suggestion> {
+pub(crate) fn key_suggestions() -> Vec<Suggestion> {
     let mut suggestions = vec![Suggestion::new("", "o agente e as chaves padrão do ~/.ssh")];
     let Some(dir) = dirs::home_dir().map(|home| home.join(".ssh")) else {
         return suggestions;

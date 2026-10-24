@@ -515,6 +515,14 @@ fn run(
                     KeyCode::Backspace if matches!(app.focus, Focus::Wizard(_)) => {
                         app.wizard_backspace();
                     }
+                    // Ctrl+U, como no shell: apaga o campo inteiro. Trocar uma query
+                    // longa por outra letra a letra não é coisa que se peça a alguém.
+                    KeyCode::Char('u')
+                        if matches!(app.focus, Focus::Wizard(_))
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.wizard_clear();
+                    }
                     KeyCode::Char(c) if matches!(app.focus, Focus::Wizard(_)) => app.wizard_type(c),
 
                     // --- one execution's live log ---

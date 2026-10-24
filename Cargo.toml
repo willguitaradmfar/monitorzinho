@@ -1,6 +1,6 @@
 [package]
 name = "monitorzinho"
-version = "0.53.1"
+version = "0.54.0"
 edition = "2024"
 description = "A lightweight terminal system monitor: CPU, memory, disk, network, and GPU"
 license = "MIT"
@@ -8,6 +8,10 @@ license = "MIT"
 [dependencies]
 crossterm = "0.29.0"
 dirs = "6.0.0"
+# O único cliente de banco que entra como crate — os do Postgres e do Mongo são escritos à
+# mão em `tools/sherlock`. `minimal-rust` em vez de `minimal` para não puxar a libz do
+# sistema, que quebraria o build musl; e o TLS é o mesmo rustls + ring do resto do programa.
+mysql = { version = "28.0.4", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
 nvml-wrapper = "0.12.1"
 ratatui = "0.30.2"
 regex = "1.13.1"
@@ -22,6 +26,8 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8.4"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# `preserve_order`: um comando do MongoDB é identificado pela **primeira** chave do
+# documento, e as colunas de uma resposta HTTP saem na ordem em que a API as escreveu.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sysinfo = "0.39.6"
 webpki-roots = "1.0.9"

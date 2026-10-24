@@ -2016,6 +2016,7 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App, wizard: &ToolWizard) 
                             parts.push("←/→ sugestões");
                         }
                         parts.push("digite para editar");
+                        parts.push("Ctrl+U limpar");
                         parts.push("Enter continuar");
                     }
                 }
@@ -3465,18 +3466,27 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
     // Um retrato precisa dizer de quando é, e com mais insistência do que um monitor: o
     // painel não se atualiza sozinho, e um número de dez minutos atrás com cara de agora
     // faz decidir errado.
+    let rotulos = quadro.rotulos;
     let idade = match (quadro.working, quadro.updated) {
-        (true, _) => "investigando…".to_string(),
+        (true, _) => rotulos.andamento.to_string(),
         (false, Some(quando)) => format!(
-            "investigado há {} · Ctrl+R investiga de novo",
-            format::human_duration(quando.elapsed().as_secs())
+            "{} há {} · Ctrl+R {}",
+            rotulos.feito,
+            format::human_duration(quando.elapsed().as_secs()),
+            rotulos.pedir
         ),
-        (false, None) => "ainda não investigou nada".to_string(),
+        (false, None) => rotulos.nunca.to_string(),
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                match focus.card.and_then(|index| quadro.cards.get(index)) {
+                // Num quadro de um cartão só, o nome do cartão não situa ninguém — a
+                // moldura da tabela já o carrega, e o resumo já diz a pergunta.
+                match focus
+                    .card
+                    .filter(|_| !quadro.direto)
+                    .and_then(|index| quadro.cards.get(index))
+                {
                     Some(card) => format!(
                         " {} — {} · {} ",
                         execution.tool, execution.summary, card.title
@@ -3563,15 +3573,24 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
     // Os cartões que não couberam na tela continuam acessíveis pela tecla, e o rodapé é
     // onde isso é dito: um cartão que existe, tem achado e não aparece em lugar nenhum é
     // um achado perdido.
+    // Sem grade atrás do cartão, o Esc sai — e o rodapé tem que dizer isso, porque
+    // «volta para a grade» prometeria uma tela que não existe.
+    let esc = match quadro.direto {
+        true => "Esc sair",
+        false => "Esc volta para a grade",
+    };
     let rodape = match focus.card {
         Some(index) => match quadro.cards.get(index).map(|card| card.rows() > 0) {
             Some(true) => format!(
-                " ↑/↓ andar pelas linhas ({} de {}) · Esc volta para a grade · Ctrl+T relatório · Ctrl+R investigar de novo",
+                " ↑/↓ andar pelas linhas ({} de {}) · {esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
                 quadro.cards[index].row + 1,
-                quadro.cards[index].rows()
+                quadro.cards[index].rows(),
+                rotulos.pedir_inf
             ),
-            _ => " ↑/↓ e PgUp/PgDn rolar · Esc volta para a grade · Ctrl+T relatório · Tab log · Ctrl+R investigar de novo"
-                .to_string(),
+            _ => format!(
+                " ↑/↓ e PgUp/PgDn rolar · {esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
+                rotulos.pedir_inf
+            ),
         },
         None if desenhados < quadro.cards.len() => {
             let resto: Vec<String> = quadro.cards[desenhados..]
@@ -3584,8 +3603,10 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
                 .collect();
             format!(" não coube na tela: {}", resto.join(" · "))
         }
-        None => " a tecla de cada cartão abre o que ele achou · Ctrl+T relatório para copiar · Tab log · Ctrl+R investigar de novo · Esc voltar"
-            .to_string(),
+        None => format!(
+            " a tecla de cada cartão abre o que ele achou · Ctrl+T relatório para copiar · Tab log · Ctrl+R {} · Esc voltar",
+            rotulos.pedir_inf
+        ),
     };
     frame.render_widget(
         Paragraph::new(Line::styled(rodape, Style::default().fg(palette::DIM))),

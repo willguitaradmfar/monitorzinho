@@ -141,7 +141,7 @@ pub fn utc(epoch: u64) -> String {
 }
 
 /// The inverse of `days_from_civil`, by the same algorithm read backwards.
-fn civil_from_days(days: i64) -> (i64, u64, u64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u64, u64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let day_of_era = z - era * 146_097;

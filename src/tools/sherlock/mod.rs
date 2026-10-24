@@ -41,12 +41,12 @@ use super::{
     Suggestion, Tool, lock_board,
 };
 
-mod bson;
+pub(crate) mod bson;
 mod k8s;
 mod k8s_checks;
-mod mongo;
+pub(crate) mod mongo;
 mod mongo_checks;
-mod pg;
+pub(crate) mod pg;
 mod pg_checks;
 mod ssh;
 mod ssh_checks;

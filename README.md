@@ -1054,6 +1054,51 @@ binary would be wrong the month after it shipped.
 once**, which is the whole point of the pair: find what's out there, then look
 at it properly.
 
+#### Visão
+
+A question of yours, kept and answered as a table. A SQL statement against a
+Postgres, a MySQL or a SQLite file, a command against a MongoDB, or the JSON
+array an HTTP endpoint returns — saved once, run when its screen opens for the
+first time in a session, and again on every `Ctrl+R`. Nothing refreshes on its
+own, and nothing is written anywhere: Postgres runs the statement inside a
+`BEGIN READ ONLY`, MySQL gets a `READ ONLY` session before anything else, the
+SQLite file is opened read-only with `query_only` set, and MongoDB only accepts
+a command from a fixed list of readers (`find`, `aggregate` without `$out` or
+`$merge`, `count`, `distinct`, `dbStats`, `serverStatus`, …). A `DELETE` fails
+with the server's own refusal in the log.
+
+The first field is the source and it decides the rest. The three database
+servers take host, port, user, password and database as separate fields, and an
+optional **SSH hop**: switched on, the `ssh` on this machine opens a tunnel to
+the jump host and the database is reached through it, the way pgAdmin does it —
+host and port become what the jump host sees. Key only (agent, the default keys,
+or a named file), never a password: the tunnel can't ask anything, because
+there is nowhere to answer. It is closed as soon as the query is done.
+
+MongoDB takes its command as JSON, the same document you would hand to
+`db.runCommand`: `{"find": "pedidos", "filter": {"status": "preso"}, "limit":
+50}`. `{"$oid": "…"}` becomes an ObjectId and `{"$date": ms}` a date, so an
+`_id` or a "since yesterday" can be asked for. Commands that answer with a
+cursor become one column per key; the others become a field/value table of the
+reply, opened one level deep.
+
+The HTTP source has a question of its own, since a JSON — unlike SQL — doesn't
+say which columns you want. Two fields, both in `jq`'s spelling: the **path**
+to the array inside the response (`.data.items`, `.results[0].rows`; blank is
+the root, or the first array inside a root object, and the log says which it
+picked) and the **columns** of each item (`.id, .name as nome, .address.city as
+cidade, .tags[0] as tag`; blank shows every top-level key in the order the API
+wrote them). GET or POST with a JSON body, no authentication or a `Bearer` token
+or `Basic` credentials, redirects followed. An object at the end of the path is
+one row; a list of scalars is one column called `valor`.
+
+`Enter` opens straight onto the table — there is no card grid, because there is
+one card. `↑`/`↓` walk the rows and the row under the cursor appears underneath
+as field/value, which is what saves a table too wide to fit. The screen shows at
+most a thousand rows and says so when it cut; the query should carry its own
+`LIMIT`. The row in the list shows how many rows came back and how long it
+took.
+
 ## Keys
 
 | Key | Where | What |

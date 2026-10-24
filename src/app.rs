@@ -3883,6 +3883,19 @@ impl App {
         }
     }
 
+    /// Ctrl+U: o campo em foco fica vazio. É o jeito de trocar uma consulta inteira sem
+    /// apagá-la tecla a tecla — e o Backspace continua tirando uma letra, como sempre.
+    pub fn wizard_clear(&mut self) {
+        if let Focus::Wizard(wizard) = &mut self.focus
+            && wizard.step == WizardStep::Params
+            && let Some(field) = wizard.fields.get_mut(wizard.field)
+            && matches!(field.spec.kind, ParamKind::Text)
+        {
+            field.value.clear();
+            wizard.error = None;
+        }
+    }
+
     /// True while the rules screen is on top of the wizard, so key handling can go
     /// there first instead of to the form underneath.
     pub fn rules_editor_open(&self) -> bool {
@@ -4392,10 +4405,12 @@ impl App {
         // Uma ferramenta que publica um quadro abre no quadro. O log continua lá,
         // completo, a um Tab de distância — quem quiser ler a investigação como narrativa
         // ainda pode.
-        if execution.board().is_some() {
+        if let Some(quadro) = execution.board() {
+            // Um quadro de um cartão só abre dentro dele — ver `Board::direto`.
+            let direto = tools::lock_board(quadro).direto;
             self.focus = Focus::Board(Box::new(BoardFocus {
                 execution_id: execution.id,
-                card: None,
+                card: direto.then_some(0),
             }));
             return;
         }
@@ -5104,12 +5119,18 @@ impl App {
         true
     }
 
-    /// Esc no painel: volta do cartão para a grade, e só então sai.
+    /// Esc no painel: volta do cartão para a grade, e só então sai. Num quadro que
+    /// abre direto no cartão não há grade para onde voltar, e o Esc sai de uma vez.
     pub fn board_escape(&mut self) {
         let Focus::Board(board) = &mut self.focus else {
             return;
         };
-        if board.card.is_some() {
+        let direto = self
+            .tools
+            .by_id(board.execution_id)
+            .and_then(|execution| execution.board().cloned())
+            .is_some_and(|quadro| tools::lock_board(&quadro).direto);
+        if board.card.is_some() && !direto {
             board.card = None;
             return;
         }

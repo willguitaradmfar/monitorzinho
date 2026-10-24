@@ -6,9 +6,13 @@
 //! provedores desta aba usam, para que a superfície seja pequena o bastante para se
 //! confiar nela.
 //!
-//! O que ele deliberadamente não faz: WebSocket, POST e autenticação. Nenhum provedor da
-//! v1 precisa. `gzip` ele lê — não por escolha, mas porque servidores comprimem mesmo
-//! quando se pede `identity`, e a alternativa era perder o feed. Ver `super::gzip`.
+//! O que ele deliberadamente não faz: WebSocket. `gzip` ele lê — não por escolha, mas
+//! porque servidores comprimem mesmo quando se pede `identity`, e a alternativa era
+//! perder o feed. Ver `super::gzip`.
+//!
+//! POST, cabeçalhos e corpo entraram depois, por `pedir`, para a ferramenta Visão — que
+//! consulta uma API com token ou um endpoint que só responde a POST. O `get` de sempre
+//! continua sendo o caso de uma linha, e é o que todo provedor usa.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -160,9 +164,38 @@ fn tls_config() -> Arc<ClientConfig> {
         .clone()
 }
 
+/// Um pedido além do GET simples: o método, cabeçalhos a mais e, se houver, o corpo com
+/// o seu tipo. O que a ferramenta Visão manda para uma API.
+#[derive(Clone)]
+pub struct Pedido {
+    pub metodo: String,
+    pub cabecalhos: Vec<(String, String)>,
+    /// `(Content-Type, bytes)`. `None` manda sem corpo — e, num POST, com
+    /// `Content-Length: 0`, que é o que um servidor exige para não ficar esperando.
+    pub corpo: Option<(String, Vec<u8>)>,
+}
+
+impl Pedido {
+    pub fn get() -> Self {
+        Self {
+            metodo: "GET".to_string(),
+            cabecalhos: Vec::new(),
+            corpo: None,
+        }
+    }
+}
+
 /// GET, seguindo redirecionamento, devolvendo o corpo.
 pub fn get(url: &str) -> Result<Response, FeedError> {
-    buscar_ate(url, MAX_BODY)
+    buscar_ate(url, &Pedido::get(), MAX_BODY)
+}
+
+/// Qualquer método, seguindo redirecionamento, devolvendo o corpo.
+///
+/// Um redirecionamento que não é 307/308 vira GET sem corpo, que é o que todo navegador
+/// faz com um POST redirecionado e o que o servidor que redirecionou está esperando.
+pub fn pedir(url: &str, pedido: &Pedido) -> Result<Response, FeedError> {
+    buscar_ate(url, pedido, MAX_BODY)
 }
 
 /// GET que **para de ler** depois de `teto` bytes, e devolve o que chegou.
@@ -176,16 +209,21 @@ pub fn get(url: &str) -> Result<Response, FeedError> {
 /// O corpo truncado é montado com tolerância: um `chunked` cortado no meio perde o
 /// último pedaço em vez de virar erro, porque o que interessa já veio no começo.
 pub fn get_ate(url: &str, teto: usize) -> Result<Response, FeedError> {
-    buscar_ate(url, teto)
+    buscar_ate(url, &Pedido::get(), teto)
 }
 
-fn buscar_ate(url: &str, teto: usize) -> Result<Response, FeedError> {
+fn buscar_ate(url: &str, pedido: &Pedido, teto: usize) -> Result<Response, FeedError> {
     let mut alvo = Target::parse(url)?;
+    let mut pedido = pedido.clone();
     for _ in 0..=MAX_REDIRECTS {
-        match buscar(&alvo, teto)? {
+        match buscar(&alvo, &pedido, teto)? {
             Buscado::Corpo(r) => return Ok(r),
-            Buscado::Redireciona(destino) => {
+            Buscado::Redireciona(destino, status) => {
                 alvo = resolver_destino(&alvo, &destino)?;
+                if status != 307 && status != 308 && pedido.metodo != "GET" {
+                    pedido.metodo = "GET".to_string();
+                    pedido.corpo = None;
+                }
             }
         }
     }
@@ -200,7 +238,8 @@ pub fn get_json(url: &str) -> Result<serde_json::Value, FeedError> {
 
 enum Buscado {
     Corpo(Response),
-    Redireciona(String),
+    /// Para onde, e com que status — o status decide se o método sobrevive à viagem.
+    Redireciona(String, u16),
 }
 
 fn resolver_destino(de: &Target, location: &str) -> Result<Target, FeedError> {
@@ -218,7 +257,7 @@ fn resolver_destino(de: &Target, location: &str) -> Result<Target, FeedError> {
     }
 }
 
-fn buscar(alvo: &Target, teto: usize) -> Result<Buscado, FeedError> {
+fn buscar(alvo: &Target, pedido: &Pedido, teto: usize) -> Result<Buscado, FeedError> {
     let endereco = (alvo.host.as_str(), alvo.port)
         .to_socket_addrs()
         .map_err(|e| FeedError::Rede(e.to_string()))?
@@ -238,12 +277,29 @@ fn buscar(alvo: &Target, teto: usize) -> Result<Buscado, FeedError> {
         .set_write_timeout(Some(READ_TIMEOUT))
         .map_err(|e| FeedError::Rede(e.to_string()))?;
 
-    let pedido = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: monitorzinho/{}\r\nAccept: application/json, text/xml, */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+    let mut texto = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: monitorzinho/{}\r\nAccept: application/json, text/xml, */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
+        pedido.metodo,
         alvo.path,
         alvo.host,
         env!("CARGO_PKG_VERSION"),
     );
+    for (nome, valor) in &pedido.cabecalhos {
+        texto.push_str(&format!("{nome}: {valor}\r\n"));
+    }
+    match &pedido.corpo {
+        Some((tipo, corpo)) => texto.push_str(&format!(
+            "Content-Type: {tipo}\r\nContent-Length: {}\r\n",
+            corpo.len()
+        )),
+        None if pedido.metodo != "GET" => texto.push_str("Content-Length: 0\r\n"),
+        None => {}
+    }
+    texto.push_str("\r\n");
+    let mut bytes = texto.into_bytes();
+    if let Some((_, corpo)) = &pedido.corpo {
+        bytes.extend_from_slice(corpo);
+    }
 
     if alvo.tls {
         let nome = ServerName::try_from(alvo.host.clone())
@@ -251,13 +307,13 @@ fn buscar(alvo: &Target, teto: usize) -> Result<Buscado, FeedError> {
         let conexao = ClientConnection::new(tls_config(), nome)
             .map_err(|e| FeedError::Rede(e.to_string()))?;
         let mut tls = StreamOwned::new(conexao, stream);
-        tls.write_all(pedido.as_bytes())
+        tls.write_all(&bytes)
             .map_err(|e| FeedError::Rede(e.to_string()))?;
         ler(&mut tls, teto)
     } else {
         let mut plano = stream;
         plano
-            .write_all(pedido.as_bytes())
+            .write_all(&bytes)
             .map_err(|e| FeedError::Rede(e.to_string()))?;
         ler(&mut plano, teto)
     }
@@ -299,7 +355,7 @@ fn ler(stream: &mut impl Read, teto: usize) -> Result<Buscado, FeedError> {
     if (300..400).contains(&status)
         && let Some(destino) = header(&cabecalho, "location")
     {
-        return Ok(Buscado::Redireciona(destino));
+        return Ok(Buscado::Redireciona(destino, status));
     }
     if status == 429 || status == 418 {
         let espera = header(&cabecalho, "retry-after").and_then(|v| v.trim().parse().ok());
@@ -575,7 +631,7 @@ mod compressao_tests {
     fn ler_resposta(resposta: &[u8]) -> Result<Vec<u8>, FeedError> {
         match ler(&mut std::io::Cursor::new(resposta.to_vec()), MAX_BODY)? {
             Buscado::Corpo(r) => Ok(r.body),
-            Buscado::Redireciona(_) => panic!("não era para redirecionar"),
+            Buscado::Redireciona(..) => panic!("não era para redirecionar"),
         }
     }
 

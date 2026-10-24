@@ -32,6 +32,7 @@ pub mod stun;
 pub mod tail;
 pub mod tls;
 pub mod tunnel;
+pub mod visao;
 pub mod wol;
 pub mod x509;
 
@@ -465,6 +466,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(egress::EgressTool),
         Box::new(wol::WolTool),
         Box::new(sherlock::SherlockTool),
+        Box::new(visao::VisaoTool),
     ]
 }
 
@@ -833,6 +835,40 @@ pub struct Board {
     pub working: bool,
     /// When the last pass finished.
     pub updated: Option<Instant>,
+    /// Abrir já dentro do primeiro cartão, e sair dele direto para a lista. É o quadro
+    /// de um cartão só — uma visão, que é uma tabela e nada mais —, onde a grade seria
+    /// um passo a mais para chegar à única coisa que há para ver.
+    pub direto: bool,
+    /// As palavras do cabeçalho e do rodapé. O Sherlock *investiga*; uma visão
+    /// *executa*; e «investigado há 2s» em cima de um SELECT soa como outro programa.
+    pub rotulos: Rotulos,
+}
+
+/// O que a tela diz sobre uma passada, nas palavras da ferramenta dona do quadro.
+#[derive(Clone, Copy)]
+pub struct Rotulos {
+    /// Enquanto roda: «investigando…».
+    pub andamento: &'static str,
+    /// Particípio, para «{feito} há 2s»: «investigado».
+    pub feito: &'static str,
+    /// O convite do cabeçalho, depois de «Ctrl+R»: «investiga de novo».
+    pub pedir: &'static str,
+    /// O mesmo no rodapé, no infinitivo: «investigar de novo».
+    pub pedir_inf: &'static str,
+    /// Antes da primeira passada: «ainda não investigou nada».
+    pub nunca: &'static str,
+}
+
+impl Default for Rotulos {
+    fn default() -> Self {
+        Self {
+            andamento: "investigando…",
+            feito: "investigado",
+            pedir: "investiga de novo",
+            pedir_inf: "investigar de novo",
+            nunca: "ainda não investigou nada",
+        }
+    }
 }
 
 impl Board {
