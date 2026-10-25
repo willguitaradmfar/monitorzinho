@@ -1610,6 +1610,18 @@ pub struct BoardFocus {
     /// formulário, chamado de onde o resultado está à vista: muda-se a consulta, sai-se
     /// com Esc, e a tabela se refaz — sem passar pela lista, pelo 'e' e pela confirmação.
     pub editor: Option<BoardEditor>,
+    /// A linha selecionada aberta inteira (Enter), campo a campo na vertical, com o valor
+    /// completo que a tabela cortou em oitenta. Rolável, só leitura, Esc fecha.
+    pub linha: Option<LinhaModal>,
+}
+
+/// Uma linha de uma visão aberta por inteiro sobre a tabela — ver `BoardFocus::linha`.
+pub struct LinhaModal {
+    /// Qual linha, pelo índice na tabela. Guardado para o modal seguir a mesma linha se a
+    /// tabela se refizer por baixo dele.
+    pub row: usize,
+    pub scroll: Cell<usize>,
+    pub max_scroll: Cell<usize>,
 }
 
 /// A consulta de uma visão sendo editada em cima do próprio resultado.
@@ -4217,6 +4229,84 @@ impl App {
         }
     }
 
+    // --- a linha aberta inteira --------------------------------------------------------
+
+    /// Whether the full-row modal is open over a view.
+    pub fn board_row_open(&self) -> bool {
+        matches!(&self.focus, Focus::Board(board) if board.linha.is_some())
+    }
+
+    /// Enter numa visão: abre a linha sob o cursor campo a campo, com o valor inteiro.
+    pub fn board_open_row(&mut self) {
+        let Focus::Board(board) = &self.focus else {
+            return;
+        };
+        if board.editor.is_some() || board.linha.is_some() {
+            return;
+        }
+        let Some(card_idx) = board.card else {
+            return;
+        };
+        let exec_id = board.execution_id;
+        let row = {
+            let Some(execution) = self.tools.by_id(exec_id) else {
+                return;
+            };
+            let Some(quadro) = execution.board() else {
+                return;
+            };
+            let quadro = tools::lock_board(quadro);
+            if !quadro.direto {
+                return;
+            }
+            match quadro.cards.get(card_idx) {
+                Some(card) if card.rows() > 0 => card.row,
+                _ => return,
+            }
+        };
+        if let Focus::Board(board) = &mut self.focus {
+            board.linha = Some(LinhaModal {
+                row,
+                scroll: Cell::new(0),
+                max_scroll: Cell::new(0),
+            });
+        }
+    }
+
+    /// Esc (ou Enter de novo) fecha a linha e volta para a tabela.
+    pub fn board_row_close(&mut self) {
+        if let Focus::Board(board) = &mut self.focus {
+            board.linha = None;
+        }
+    }
+
+    /// Rola a linha aberta. O teto vem do desenho, que sabe quanto do conteúdo coube.
+    pub fn board_row_scroll(&mut self, delta: i32) {
+        if let Focus::Board(board) = &mut self.focus
+            && let Some(linha) = &board.linha
+        {
+            let max = linha.max_scroll.get() as i32;
+            let next = (linha.scroll.get() as i32)
+                .saturating_add(delta)
+                .clamp(0, max) as usize;
+            linha.scroll.set(next);
+        }
+    }
+
+    /// As teclas do modal da linha: rola, e sai.
+    pub fn board_row_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.board_row_close(),
+            KeyCode::Up => self.board_row_scroll(-1),
+            KeyCode::Down => self.board_row_scroll(1),
+            KeyCode::PageUp => self.board_row_scroll(-15),
+            KeyCode::PageDown => self.board_row_scroll(15),
+            KeyCode::Home => self.board_row_scroll(i32::MIN),
+            KeyCode::End => self.board_row_scroll(i32::MAX),
+            _ => {}
+        }
+    }
+
     pub fn board_editor_paste(&mut self, texto: &str) {
         if let Focus::Board(board) = &mut self.focus
             && let Some(editor) = &mut board.editor
@@ -4919,6 +5009,7 @@ impl App {
                 execution_id: execution.id,
                 card: direto.then_some(0),
                 editor: None,
+                linha: None,
             }));
             return;
         }
@@ -5774,6 +5865,28 @@ impl App {
         card.set_scroll(scroll);
     }
 
+    /// ←/→ numa visão: desliza a tabela para os lados, quando ela tem colunas demais para
+    /// caber na largura. Só nos quadros diretos — nos outros a tabela já reparte a tela.
+    pub fn board_scroll_col(&mut self, delta: i32) {
+        let Focus::Board(board) = &self.focus else {
+            return;
+        };
+        let (Some(index), Some(execution)) = (board.card, self.tools.by_id(board.execution_id))
+        else {
+            return;
+        };
+        let Some(quadro) = execution.board().cloned() else {
+            return;
+        };
+        let mut quadro = tools::lock_board(&quadro);
+        if !quadro.direto {
+            return;
+        }
+        if let Some(card) = quadro.cards.get_mut(index) {
+            card.scroll_col(delta);
+        }
+    }
+
     /// Tab no painel: o log da mesma execução, que é a investigação como narrativa.
     pub fn board_log(&mut self) {
         let Focus::Board(board) = &self.focus else {
@@ -5832,9 +5945,13 @@ impl App {
         for card in &tools::lock_board(&quadro).cards {
             linhas.push(String::new());
             linhas.push(format!("── {} ──", card.title));
+            // No modo «só acertos» o relatório copia o que está na tela — as linhas que a
+            // busca escondeu não voltam no texto. Fora dele, a tabela inteira.
+            let filtro =
+                (card.so_acertos && !card.query.is_empty()).then(|| card.query.to_lowercase());
             linhas.extend(
                 card.detail
-                    .como_texto()
+                    .como_texto_filtrado(filtro.as_deref())
                     .into_iter()
                     // O título do painel já foi escrito como cabeçalho da seção; repeti-lo
                     // em cada pedaço do arranjo seria escrever o nome três vezes.
@@ -5977,6 +6094,7 @@ impl App {
                         execution_id: id,
                         card: None,
                         editor: None,
+                        linha: None,
                     })),
                     false => Focus::None,
                 };

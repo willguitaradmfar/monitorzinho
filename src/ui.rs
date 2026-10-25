@@ -3819,7 +3819,7 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
         // Num quadro direto a tabela é a página: ela cresce até o fim e o detalhe da
         // linha sai de cena. Sobrava um filete embaixo que só repetia, em pares, a linha
         // que o cursor já marca na tabela — tirá-lo dá à tabela o espaço que faltava.
-        Some(card) if quadro.direto => render_corpo(frame, partes[1], &card.detail, &pintor),
+        Some(card) if quadro.direto => render_visao_tabela(frame, partes[1], card, &pintor),
         Some(card) => match card.row_detail() {
             Some(detalhe) => {
                 // Cada metade leva o que precisa para caber inteira, e o que sobrar fica
@@ -3903,7 +3903,7 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
     let rodape = match focus.card {
         Some(index) => match quadro.cards.get(index).map(|card| card.rows() > 0) {
             Some(true) if buscando => format!(
-                " ↑/↓ pular entre os {} acertos · linha {} de {} · Ctrl+F {} · {esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
+                " ↑/↓ pular entre os {} acertos · linha {} de {} · Enter abre a linha{setas} · Ctrl+F {} · {esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
                 quadro.cards[index].acertos(),
                 quadro.cards[index].row + 1,
                 quadro.cards[index].rows(),
@@ -3911,13 +3911,15 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
                     true => "mostrar todas",
                     false => "só acertos",
                 },
-                rotulos.pedir_inf
+                rotulos.pedir_inf,
+                setas = setas_colunas(quadro.direto, &quadro.cards[index]),
             ),
             Some(true) => format!(
-                " ↑/↓ andar pelas linhas ({} de {}) · {busca}{esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
+                " ↑/↓ andar pelas linhas ({} de {}) · Enter abre a linha{setas} · {busca}{esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
                 quadro.cards[index].row + 1,
                 quadro.cards[index].rows(),
-                rotulos.pedir_inf
+                rotulos.pedir_inf,
+                setas = setas_colunas(quadro.direto, &quadro.cards[index]),
             ),
             _ => format!(
                 " ↑/↓ e PgUp/PgDn rolar · {esc} · Ctrl+T relatório · Tab log · Ctrl+R {}",
@@ -3962,6 +3964,147 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
             editor.error.as_deref(),
         );
     }
+
+    // A linha aberta inteira (Enter), por cima da tabela como o editor: campo a campo na
+    // vertical, com o valor completo que a coluna cortou em oitenta. Só leitura, rolável.
+    if let Some(linha) = &focus.linha
+        && let Some(card) = aberto
+        && let Some(detalhe) = card.rows_detail.get(linha.row)
+    {
+        let pares = facts_pairs(detalhe);
+        render_linha_modal(
+            frame,
+            area,
+            &format!("linha {} de {}", linha.row + 1, card.rows()),
+            &pares,
+            &linha.scroll,
+            &linha.max_scroll,
+        );
+    }
+}
+
+/// A dica de rolagem lateral, só quando há mais de uma coluna numa visão — nas outras
+/// tabelas a seta não desliza nada, e prometê-la seria mentira.
+fn setas_colunas(direto: bool, card: &crate::tools::Card) -> &'static str {
+    match direto && card.colunas() > 1 {
+        true => " · ←/→ colunas",
+        false => "",
+    }
+}
+
+/// A tabela de uma visão: larguras justas ao conteúdo (até oitenta, sem espremer) e a
+/// coluna deslizada em `card.col` para o lado. Reaproveita o desenho das outras tabelas —
+/// cursor, busca realçada, faixa no acerto — só trocando como a largura é repartida.
+///
+/// Sem tabela (consulta sem colunas), cai no desenho genérico do arranjo.
+fn render_visao_tabela(frame: &mut Frame, area: Rect, card: &crate::tools::Card, pintor: &Pintor) {
+    use crate::painel::Pane;
+    match card.detail.primeira_tabela() {
+        Some(Pane::Table {
+            title,
+            headers,
+            rows,
+            selected,
+            query,
+            note,
+        }) => render_pane_table(
+            frame,
+            area,
+            pintor,
+            None,
+            &TabelaPane {
+                title,
+                headers,
+                rows,
+                selected: *selected,
+                query,
+                note: note.as_ref(),
+                off: card.col,
+                rolar: true,
+            },
+        ),
+        _ => render_corpo(frame, area, &card.detail, pintor),
+    }
+}
+
+/// Os pares coluna/valor de um detalhe de linha, de onde quer que estejam no arranjo.
+fn facts_pairs(no: &crate::painel::Layout) -> Vec<(String, String)> {
+    use crate::painel::{Layout as ML, Pane};
+    match no {
+        ML::Leaf(pane) => match &**pane {
+            Pane::Facts { rows, .. } => rows
+                .iter()
+                .map(|(rotulo, valor, _)| (rotulo.clone(), valor.clone()))
+                .collect(),
+            _ => Vec::new(),
+        },
+        ML::Rows(partes) | ML::Cols(partes) => partes
+            .iter()
+            .flat_map(|(_, filho)| facts_pairs(filho))
+            .collect(),
+    }
+}
+
+/// A linha de uma visão aberta por inteiro: uma caixa grande sobre a tabela, cada coluna
+/// com o nome em cima e o valor completo embaixo, quebrado para caber na largura. É o par
+/// do corte em oitenta da grade — ali o que cabe, aqui o que há.
+fn render_linha_modal(
+    frame: &mut Frame,
+    area: Rect,
+    titulo: &str,
+    pares: &[(String, String)],
+    scroll_guardado: &std::cell::Cell<usize>,
+    max_scroll: &std::cell::Cell<usize>,
+) {
+    // Menor que o editor: a linha é para ler, não para ocupar a tela. Fica em torno de
+    // dois terços, com um teto para não encostar nas bordas e um piso para caber.
+    let width = (area.width * 2 / 3).clamp(48.min(area.width), area.width.saturating_sub(8));
+    let height = (area.height * 2 / 3).clamp(8.min(area.height), area.height.saturating_sub(6));
+    let box_area = centered(area, width, height);
+    let rolavel = max_scroll.get() > 0;
+    let dica = match rolavel {
+        true => "↑/↓ PgUp/PgDn rolar · Home/End extremos · Esc fecha",
+        false => "Esc fecha",
+    };
+    let block = Block::default()
+        .title(format!(" {titulo} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette::PURPLE))
+        .title_bottom(hint_line(dica));
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+
+    let text_width = (inner.width as usize).saturating_sub(1).max(1);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (rotulo, valor) in pares {
+        lines.push(Line::styled(
+            rotulo.clone(),
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let valor = valor.trim();
+        if valor.is_empty() {
+            lines.push(Line::styled("  —", Style::default().fg(palette::DIM)));
+        } else {
+            for chunk in wrap(valor, text_width.saturating_sub(2)) {
+                lines.push(Line::styled(
+                    format!("  {chunk}"),
+                    Style::default().fg(palette::YELLOW),
+                ));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+
+    let altura = inner.height as usize;
+    let teto = lines.len().saturating_sub(altura);
+    max_scroll.set(teto);
+    let scroll = scroll_guardado.get().min(teto);
+    scroll_guardado.set(scroll);
+    let visiveis: Vec<Line> = lines.into_iter().skip(scroll).take(altura).collect();
+    frame.render_widget(Paragraph::new(visiveis), inner);
 }
 
 /// Works out where the viewport should sit this frame, and returns which match — as an
@@ -4418,6 +4561,8 @@ fn render_pane(
                 selected: *selected,
                 query,
                 note: note.as_ref(),
+                off: 0,
+                rolar: false,
             },
         ),
         Pane::Chart {
@@ -4520,6 +4665,13 @@ struct TabelaPane<'a> {
     selected: Option<usize>,
     query: &'a str,
     note: Option<&'a (String, crate::invest::module::Tone)>,
+    /// Quantas colunas foram roladas para fora pela esquerda (←/→ numa visão). As demais
+    /// tabelas não rolam e passam 0.
+    off: usize,
+    /// Larguras justas ao conteúdo (até oitenta), sem espremer para caber: o que não
+    /// couber sai pela direita e se alcança rolando. As tabelas da Invest passam `false`
+    /// e continuam repartindo a largura inteira.
+    rolar: bool,
 }
 
 fn render_pane_table(
@@ -4536,8 +4688,12 @@ fn render_pane_table(
         selected,
         query,
         note,
+        off,
+        rolar,
     } = pane;
-    let (selected, note) = (*selected, *note);
+    let (selected, note, rolar) = (*selected, *note, *rolar);
+    // Nunca esconde a última coluna: rolar até o fim ainda deixa uma à vista.
+    let off = (*off).min(headers.len().saturating_sub(1));
     use crate::invest::module::Tone;
 
     let mut titulo = title.to_string();
@@ -4605,11 +4761,26 @@ fn render_pane_table(
     // em outra, e sem a faixa o olho perde a linha no caminho.
     let realce_needle = pintor.realce().to_lowercase();
 
+    // As larguras das colunas à vista, e quantas são. Numa visão que rola, `larguras_de`
+    // devolve só as que cabem a partir de `off`; nas outras tabelas `off` é zero, `rolar`
+    // é falso, e voltam todas. `vis` corta as células e o cabeçalho no mesmo ponto.
+    let larguras_vis = larguras_de(
+        headers,
+        &visiveis,
+        dentro.width.saturating_sub(match marcada {
+            true => MARK_WIDTH,
+            false => 0,
+        }),
+        off,
+        rolar,
+    );
+    let vis = larguras_vis.len();
+
     let ui_rows: Vec<UiRow> = visiveis
         .iter()
         .zip(&marcas)
         .map(|(r, &marca)| {
-            let mut celulas: Vec<Cell> = Vec::with_capacity(r.cells.len() + 1);
+            let mut celulas: Vec<Cell> = Vec::with_capacity(vis + 1);
             if marcada {
                 celulas.push(match marca {
                     Some((cor, _)) => Cell::from(Span::styled(
@@ -4621,60 +4792,68 @@ fn render_pane_table(
                     None => Cell::from(" "),
                 });
             }
-            celulas.extend(r.cells.iter().enumerate().map(|(i, texto)| {
-                let texto = match (i, r.depth) {
-                    (0, d) if d > 0 => format!("{}{texto}", "  ".repeat(d)),
-                    _ => texto.clone(),
-                };
-                // O fim da célula pode ter tom próprio — a origem e a idade do preço,
-                // que avisam que o número é velho sem pintar o número. Ver `Row::rabicho`.
-                let rabicho = r
-                    .rabicho
-                    .as_ref()
-                    .filter(|(celula, _, _)| *celula == i)
-                    .and_then(|(_, sufixo, tom)| {
-                        texto
-                            .strip_suffix(sufixo.as_str())
-                            .map(|antes| (antes.to_string(), sufixo.clone(), tone_color(*tom)))
-                    });
-                // **A marca pinta uma coluna, não a linha.**
-                //
-                // Pintar tudo era o desenho anterior, e nesta aba ele custava caro: a
-                // cor de cada coluna já quer dizer alguma coisa — verde e vermelho pelo
-                // sinal em «Contra a leitura anterior», em «Var%», no P&L —, e a marca
-                // por cima apagava justamente o que se veio ler. Quem diz que a linha
-                // está marcada é a estrela na borda, que não disputa nada com ninguém.
-                let marcada_aqui = marca.filter(|(_, coluna)| *coluna == i);
-                let cor = match marcada_aqui {
-                    Some((cor, _)) => mark_color(cor),
-                    None => tone_color(r.cell_tones.get(i).copied().unwrap_or(r.tone)),
-                };
-                // Um acerto da busca é pintado **no trecho**, como no log: a linha fica
-                // onde está, e o que casou salta aos olhos dentro dela.
-                let realce = pintor.realce();
-                if !realce.is_empty() && format::contains_ci(&texto, realce) {
-                    return Cell::from(Line::from(highlight(
-                        &texto,
-                        realce,
-                        Style::default().fg(cor),
-                    )));
-                }
-                // A marca vence o rabicho **dentro da célula dela**: a origem do preço em
-                // amarelo colada no ticker marcado leria como uma segunda marca.
-                let Some((antes, sufixo, cor_rabicho)) = rabicho.filter(|_| marcada_aqui.is_none())
-                else {
-                    return Cell::from(match marcada_aqui.is_some() {
-                        true => com_seta(
-                            &texto,
-                            Style::default().fg(cor).add_modifier(Modifier::BOLD),
-                        ),
-                        false => com_seta(&texto, Style::default().fg(cor)),
-                    });
-                };
-                let mut spans = com_seta(&antes, Style::default().fg(cor)).spans;
-                spans.push(Span::styled(sufixo, Style::default().fg(cor_rabicho)));
-                Cell::from(Line::from(spans))
-            }));
+            celulas.extend(
+                r.cells
+                    .iter()
+                    .enumerate()
+                    .skip(off)
+                    .take(vis)
+                    .map(|(i, texto)| {
+                        let texto = match (i, r.depth) {
+                            (0, d) if d > 0 => format!("{}{texto}", "  ".repeat(d)),
+                            _ => texto.clone(),
+                        };
+                        // O fim da célula pode ter tom próprio — a origem e a idade do preço,
+                        // que avisam que o número é velho sem pintar o número. Ver `Row::rabicho`.
+                        let rabicho = r
+                            .rabicho
+                            .as_ref()
+                            .filter(|(celula, _, _)| *celula == i)
+                            .and_then(|(_, sufixo, tom)| {
+                                texto.strip_suffix(sufixo.as_str()).map(|antes| {
+                                    (antes.to_string(), sufixo.clone(), tone_color(*tom))
+                                })
+                            });
+                        // **A marca pinta uma coluna, não a linha.**
+                        //
+                        // Pintar tudo era o desenho anterior, e nesta aba ele custava caro: a
+                        // cor de cada coluna já quer dizer alguma coisa — verde e vermelho pelo
+                        // sinal em «Contra a leitura anterior», em «Var%», no P&L —, e a marca
+                        // por cima apagava justamente o que se veio ler. Quem diz que a linha
+                        // está marcada é a estrela na borda, que não disputa nada com ninguém.
+                        let marcada_aqui = marca.filter(|(_, coluna)| *coluna == i);
+                        let cor = match marcada_aqui {
+                            Some((cor, _)) => mark_color(cor),
+                            None => tone_color(r.cell_tones.get(i).copied().unwrap_or(r.tone)),
+                        };
+                        // Um acerto da busca é pintado **no trecho**, como no log: a linha fica
+                        // onde está, e o que casou salta aos olhos dentro dela.
+                        let realce = pintor.realce();
+                        if !realce.is_empty() && format::contains_ci(&texto, realce) {
+                            return Cell::from(Line::from(highlight(
+                                &texto,
+                                realce,
+                                Style::default().fg(cor),
+                            )));
+                        }
+                        // A marca vence o rabicho **dentro da célula dela**: a origem do preço em
+                        // amarelo colada no ticker marcado leria como uma segunda marca.
+                        let Some((antes, sufixo, cor_rabicho)) =
+                            rabicho.filter(|_| marcada_aqui.is_none())
+                        else {
+                            return Cell::from(match marcada_aqui.is_some() {
+                                true => com_seta(
+                                    &texto,
+                                    Style::default().fg(cor).add_modifier(Modifier::BOLD),
+                                ),
+                                false => com_seta(&texto, Style::default().fg(cor)),
+                            });
+                        };
+                        let mut spans = com_seta(&antes, Style::default().fg(cor)).spans;
+                        spans.push(Span::styled(sufixo, Style::default().fg(cor_rabicho)));
+                        Cell::from(Line::from(spans))
+                    }),
+            );
             let mut estilo = Style::default();
             if !realce_needle.is_empty() && r.matches(&realce_needle) {
                 estilo = estilo.bg(palette::REALCE_FUNDO);
@@ -4688,20 +4867,19 @@ fn render_pane_table(
 
     // A largura das colunas de conteúdo é calculada sobre o que sobra depois da estrela —
     // somar a coluna depois de repartir a largura empurraria a última para fora da borda.
-    let mut larguras = larguras_de(
-        headers,
-        &visiveis,
-        dentro.width.saturating_sub(match marcada {
-            true => MARK_WIDTH,
-            false => 0,
-        }),
-    );
-    let mut celulas_do_cabecalho: Vec<Cell> = Vec::with_capacity(headers.len() + 1);
+    let mut larguras = larguras_vis;
+    let mut celulas_do_cabecalho: Vec<Cell> = Vec::with_capacity(vis + 1);
     if marcada {
         larguras.insert(0, Constraint::Length(MARK_WIDTH));
         celulas_do_cabecalho.push(Cell::from(" "));
     }
-    celulas_do_cabecalho.extend(headers.iter().map(|h| Cell::from(h.clone())));
+    celulas_do_cabecalho.extend(
+        headers
+            .iter()
+            .skip(off)
+            .take(vis)
+            .map(|h| Cell::from(h.clone())),
+    );
 
     let tabela = Table::new(ui_rows, larguras)
         .header(
@@ -4734,17 +4912,52 @@ fn larguras_de(
     headers: &[String],
     rows: &[&crate::invest::module::Row],
     disponivel: u16,
+    off: usize,
+    rolar: bool,
 ) -> Vec<Constraint> {
     const ESPACO: usize = 2;
     const MINIMO: usize = 5;
-    let mut larguras: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    // O teto de uma coluna que rola: o mesmo oitenta em que a célula já foi cortada.
+    const MAXIMO: usize = 80;
+    // Só as colunas à vista entram — as roladas para fora não disputam largura.
+    let mut larguras: Vec<usize> = headers
+        .iter()
+        .skip(off)
+        .map(|h| h.chars().count())
+        .collect();
     for r in rows {
-        for (i, c) in r.cells.iter().enumerate().take(larguras.len()) {
-            larguras[i] = larguras[i].max(c.chars().count() + r.depth * 2);
+        for (i, c) in r.cells.iter().enumerate() {
+            if i < off {
+                continue;
+            }
+            let k = i - off;
+            if k < larguras.len() {
+                larguras[k] = larguras[k].max(c.chars().count() + r.depth * 2);
+            }
         }
     }
     if larguras.is_empty() || disponivel == 0 {
         return Vec::new();
+    }
+
+    if rolar {
+        // Cada coluna do tamanho justo do que carrega, até oitenta: uma de três
+        // caracteres ocupa três, uma longa para em oitenta — a largura saudável de quem
+        // trunca. Nada é espremido; em vez disso só as que couberem na largura são
+        // devolvidas, e as demais ficam para a seta ←/→ trazer à vista. Ao menos uma
+        // sempre volta, mesmo que sozinha estoure a largura.
+        let disp = disponivel as usize;
+        let mut saida = Vec::new();
+        let mut usado = 0;
+        for l in &larguras {
+            let w = l.min(&MAXIMO) + ESPACO;
+            if !saida.is_empty() && usado + w > disp {
+                break;
+            }
+            usado += w;
+            saida.push(Constraint::Length(w as u16));
+        }
+        return saida;
     }
 
     let pedido: usize = larguras.iter().map(|l| l + ESPACO).sum();

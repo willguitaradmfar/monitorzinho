@@ -944,6 +944,8 @@ impl Board {
             if card.rows() > 0 {
                 card.select(onde.min(card.rows() - 1));
             }
+            // O deslize lateral também sobrevive, preso ao número de colunas de agora.
+            card.col = self.cards[old].col.min(card.colunas().saturating_sub(1));
             self.cards[old] = card;
             return;
         }
@@ -981,6 +983,10 @@ pub struct Card {
     /// O outro modo da busca (Ctrl+F): em vez de realçar os acertos no meio das outras
     /// linhas, mostrar só eles. Um alterna para o outro e volta.
     pub so_acertos: bool,
+    /// Quantas colunas foram roladas para fora pela esquerda. Uma tabela com colunas
+    /// demais não cabe na largura; a seta ←/→ a desliza, e isto diz de onde ela começa.
+    /// Mora no cartão como o cursor e a busca, para sobreviver ao Ctrl+R.
+    pub col: usize,
     /// How many rows the card asks for in the grid, content only — the frame is added
     /// by whoever draws it.
     pub height: u16,
@@ -1012,8 +1018,23 @@ impl Card {
             row: 0,
             query: String::new(),
             so_acertos: false,
+            col: 0,
             tone: crate::painel::Tone::Normal,
         }
+    }
+
+    /// Quantas colunas a tabela do cartão tem — o teto do deslize lateral.
+    pub fn colunas(&self) -> usize {
+        match self.detail.primeira_tabela() {
+            Some(crate::painel::Pane::Table { headers, .. }) => headers.len(),
+            _ => 0,
+        }
+    }
+
+    /// Desliza a tabela para os lados, deixando ao menos uma coluna à vista.
+    pub fn scroll_col(&mut self, delta: i32) {
+        let teto = self.colunas().saturating_sub(1) as i32;
+        self.col = (self.col as i32 + delta).clamp(0, teto) as usize;
     }
 
     /// As linhas em que a busca acerta, pelo índice. Sem busca, nenhuma — não há o que

@@ -281,7 +281,10 @@ impl Pane {
     /// Sem moldura, sem cor e sem corte: uma tabela vira colunas alinhadas com espaço, um
     /// texto vira as linhas dele. É o mesmo conteúdo da tela, no formato que sobrevive a
     /// ser colado num chamado — que é onde um achado de banco de dados costuma terminar.
-    pub fn como_texto(&self) -> Vec<String> {
+    /// Com `needle`, só as linhas de tabela que casam saem — o relatório do modo «só
+    /// acertos» copia o que a tela mostra, e não a tabela inteira por baixo dela.
+    /// `None` traz tudo. O `needle` já vem em minúsculas, como `Row::matches` espera.
+    pub fn como_texto_filtrado(&self, needle: Option<&str>) -> Vec<String> {
         match self {
             Pane::Table {
                 title,
@@ -290,6 +293,10 @@ impl Pane {
                 note,
                 ..
             } => {
+                let rows: Vec<&Row> = match needle {
+                    Some(n) if !n.is_empty() => rows.iter().filter(|r| r.matches(n)).collect(),
+                    _ => rows.iter().collect(),
+                };
                 let mut linhas = vec![title.clone()];
                 // As larguras saem do conteúdo, não de um palpite: a coluna de query é a
                 // única larga, e dar a todas a largura dela seria uma tabela de espaços.
@@ -300,7 +307,7 @@ impl Pane {
                 for (i, header) in headers.iter().enumerate() {
                     larguras[i] = header.chars().count();
                 }
-                for row in rows {
+                for row in &rows {
                     for (i, cell) in row.cells.iter().enumerate() {
                         larguras[i] = larguras[i].max(cell.chars().count());
                     }
@@ -322,7 +329,7 @@ impl Pane {
                     linhas.push(alinhar(headers));
                     linhas.push("-".repeat(larguras.iter().sum::<usize>() + 2 * colunas));
                 }
-                for row in rows {
+                for row in &rows {
                     linhas.push(alinhar(&row.cells));
                 }
                 if let Some((nota, _)) = note {
@@ -388,13 +395,14 @@ impl Pane {
 }
 
 impl Layout {
-    /// O arranjo inteiro como texto, na ordem em que é desenhado.
-    pub fn como_texto(&self) -> Vec<String> {
+    /// O arranjo inteiro como texto, na ordem em que é desenhado; passa o filtro de
+    /// linhas (ver `Pane::como_texto_filtrado`) adiante para cada tabela do arranjo.
+    pub fn como_texto_filtrado(&self, needle: Option<&str>) -> Vec<String> {
         match self {
-            Layout::Leaf(pane) => pane.como_texto(),
+            Layout::Leaf(pane) => pane.como_texto_filtrado(needle),
             Layout::Rows(partes) | Layout::Cols(partes) => partes
                 .iter()
-                .flat_map(|(_, filho)| filho.como_texto())
+                .flat_map(|(_, filho)| filho.como_texto_filtrado(needle))
                 .collect(),
         }
     }

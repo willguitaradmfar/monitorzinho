@@ -384,6 +384,9 @@ fn run(
                     code if app.board_editor_open() => {
                         app.board_editor_key(code, key.modifiers.contains(KeyModifiers::CONTROL))
                     }
+                    // A linha aberta inteira é uma caixa só de leitura por cima da tabela:
+                    // toma todas as teclas enquanto está aberta — rola e sai.
+                    code if app.board_row_open() => app.board_row_key(code),
                     // Same reason: the hand-off picker sits over a log whose search box
                     // takes every letter, so it has to see the keys first.
                     code if app.handoff_open() => app.handoff_key(code),
@@ -409,6 +412,8 @@ fn run(
                         app.board_backspace();
                     }
                     KeyCode::Tab if matches!(app.focus, Focus::Board(_)) => app.board_log(),
+                    // Enter numa visão: a linha sob o cursor, inteira, campo a campo.
+                    KeyCode::Enter if matches!(app.focus, Focus::Board(_)) => app.board_open_row(),
                     // Ctrl+T de texto: a investigação inteira em texto corrido, para
                     // selecionar com o mouse e colar onde ela vai ser resolvida.
                     KeyCode::Char('t')
@@ -439,6 +444,13 @@ fn run(
                     }
                     KeyCode::Up if matches!(app.focus, Focus::Board(_)) => app.board_scroll(-1),
                     KeyCode::Down if matches!(app.focus, Focus::Board(_)) => app.board_scroll(1),
+                    // ←/→ deslizam a tabela de uma visão quando ela não cabe na largura.
+                    KeyCode::Left if matches!(app.focus, Focus::Board(_)) => {
+                        app.board_scroll_col(-1)
+                    }
+                    KeyCode::Right if matches!(app.focus, Focus::Board(_)) => {
+                        app.board_scroll_col(1)
+                    }
                     KeyCode::PageUp if matches!(app.focus, Focus::Board(_)) => {
                         app.board_scroll(-15);
                     }

@@ -3163,11 +3163,11 @@ mod tests {
         let quadro = crate::tools::lock_board(&board);
         for card in &quadro.cards {
             println!("\n══════ {} ══════", card.title);
-            for linha in card.summary.como_texto() {
+            for linha in card.summary.como_texto_filtrado(None) {
                 println!("{linha}");
             }
             println!("  ── detalhe ──");
-            for linha in card.detail.como_texto() {
+            for linha in card.detail.como_texto_filtrado(None) {
                 println!("  {linha}");
             }
         }

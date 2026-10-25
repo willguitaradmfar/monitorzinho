@@ -64,9 +64,13 @@ const COM_CREDENCIAL: &[&str] = &["Bearer", "Basic"];
 /// Quantas linhas a tela mostra. A query deveria ter o seu próprio `LIMIT`; isto é a rede
 /// embaixo de quem esqueceu, e a nota do rodapé diz quando ela segurou alguma coisa.
 pub const LINHAS_MAX: usize = 1000;
-/// Quanto cada célula carrega. Um documento inteiro numa célula não cabe em tabela
-/// nenhuma; o que cabe é o começo dele, e o detalhe da linha mostra o resto.
-const CELULA_MAX: usize = 200;
+/// Quanto cada célula guarda. É o valor inteiro, não o que a tabela mostra: a tabela
+/// corta em `GRID_MAX`, e o Enter abre a linha campo a campo com o que está aqui. O teto
+/// existe só para um documento de um megabyte numa célula não virar mil deles na memória.
+const CELULA_MAX: usize = 10_000;
+/// Quanto de uma célula a tabela desenha. Larga demais e a linha quebra e empurra tudo;
+/// cortada em oitenta, a grade se lê, e o conteúdo inteiro está a um Enter de distância.
+const GRID_MAX: usize = 80;
 /// O teto de tempo de uma consulta, e o do soquete. O mesmo do Sherlock, pelo mesmo
 /// motivo: uma visão que trava num servidor ocupado tem que desistir, não esperar.
 const TEMPO: Duration = Duration::from_secs(15);
@@ -504,13 +508,16 @@ fn cartao_de(res: &Resultado, titulo: String, nota: &str) -> Card {
         card.detail = Layout::one(vazio());
         return card;
     }
+    // A tabela leva as células cortadas em GRID_MAX — é o que cabe numa linha sem
+    // quebrá-la. A busca ainda acerta aí (o começo do valor), e a linha inteira, sem
+    // corte, está em `rows_detail`, que o Enter abre.
     let tabela = || Pane::Table {
         title: titulo.clone(),
         headers: res.colunas.clone(),
         rows: res
             .linhas
             .iter()
-            .map(|linha| Row::new(linha.clone()))
+            .map(|linha| Row::new(linha.iter().map(|c| clip(c, GRID_MAX)).collect()))
             .collect(),
         selected: None,
         query: String::new(),
@@ -1734,6 +1741,33 @@ mod tests {
 
     fn chave(s: &str) -> Passo {
         Passo::Chave(s.to_string())
+    }
+
+    #[test]
+    fn a_grade_corta_em_oitenta_e_o_detalhe_guarda_tudo() {
+        let longo = "a".repeat(500);
+        let res = Resultado {
+            colunas: vec!["texto".to_string()],
+            linhas: vec![vec![longo.clone()]],
+            truncado: false,
+            avisos: Vec::new(),
+        };
+        let card = cartao_de(&res, "t".to_string(), "1 linha");
+        // A célula da tabela cabe numa linha: GRID_MAX, com as reticências no fim.
+        let Pane::Table { rows, .. } = card.detail.primeira_tabela().unwrap() else {
+            panic!("a visão devia ter uma tabela");
+        };
+        let celula = &rows[0].cells[0];
+        assert_eq!(celula.chars().count(), GRID_MAX);
+        assert!(celula.ends_with('…'));
+        // O detalhe da linha tem o valor inteiro, sem corte.
+        let Layout::Leaf(pane) = &card.rows_detail[0] else {
+            panic!("o detalhe devia ser uma folha");
+        };
+        let Pane::Facts { rows, .. } = &**pane else {
+            panic!("o detalhe devia ser pares");
+        };
+        assert_eq!(rows[0].1, longo);
     }
 
     #[test]
