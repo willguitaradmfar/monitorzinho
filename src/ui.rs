@@ -3966,7 +3966,7 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
     }
 
     // A linha aberta inteira (Enter), por cima da tabela como o editor: campo a campo na
-    // vertical, com o valor completo que a coluna cortou em oitenta. Só leitura, rolável.
+    // vertical, com o valor completo que a coluna cortou. Só leitura, rolável.
     if let Some(linha) = &focus.linha
         && let Some(card) = aberto
         && let Some(detalhe) = card.rows_detail.get(linha.row)
@@ -3992,7 +3992,7 @@ fn setas_colunas(direto: bool, card: &crate::tools::Card) -> &'static str {
     }
 }
 
-/// A tabela de uma visão: larguras justas ao conteúdo (até oitenta, sem espremer) e a
+/// A tabela de uma visão: larguras justas ao conteúdo (até o teto da execução, sem espremer) e a
 /// coluna deslizada em `card.col` para o lado. Reaproveita o desenho das outras tabelas —
 /// cursor, busca realçada, faixa no acerto — só trocando como a largura é repartida.
 ///
@@ -4021,6 +4021,7 @@ fn render_visao_tabela(frame: &mut Frame, area: Rect, card: &crate::tools::Card,
                 note: note.as_ref(),
                 off: card.col,
                 rolar: true,
+                max_col: card.largura_max,
             },
         ),
         _ => render_corpo(frame, area, &card.detail, pintor),
@@ -4047,7 +4048,7 @@ fn facts_pairs(no: &crate::painel::Layout) -> Vec<(String, String)> {
 
 /// A linha de uma visão aberta por inteiro: uma caixa grande sobre a tabela, cada coluna
 /// com o nome em cima e o valor completo embaixo, quebrado para caber na largura. É o par
-/// do corte em oitenta da grade — ali o que cabe, aqui o que há.
+/// do corte da grade — ali o que cabe, aqui o que há.
 fn render_linha_modal(
     frame: &mut Frame,
     area: Rect,
@@ -4563,6 +4564,7 @@ fn render_pane(
                 note: note.as_ref(),
                 off: 0,
                 rolar: false,
+                max_col: 0,
             },
         ),
         Pane::Chart {
@@ -4668,10 +4670,12 @@ struct TabelaPane<'a> {
     /// Quantas colunas foram roladas para fora pela esquerda (←/→ numa visão). As demais
     /// tabelas não rolam e passam 0.
     off: usize,
-    /// Larguras justas ao conteúdo (até oitenta), sem espremer para caber: o que não
+    /// Larguras justas ao conteúdo (até `max_col`), sem espremer para caber: o que não
     /// couber sai pela direita e se alcança rolando. As tabelas da Invest passam `false`
     /// e continuam repartindo a largura inteira.
     rolar: bool,
+    /// O teto de largura de uma coluna ao rolar. 0 cai no padrão do desenho.
+    max_col: usize,
 }
 
 fn render_pane_table(
@@ -4690,8 +4694,9 @@ fn render_pane_table(
         note,
         off,
         rolar,
+        max_col,
     } = pane;
-    let (selected, note, rolar) = (*selected, *note, *rolar);
+    let (selected, note, rolar, max_col) = (*selected, *note, *rolar, *max_col);
     // Nunca esconde a última coluna: rolar até o fim ainda deixa uma à vista.
     let off = (*off).min(headers.len().saturating_sub(1));
     use crate::invest::module::Tone;
@@ -4773,6 +4778,7 @@ fn render_pane_table(
         }),
         off,
         rolar,
+        max_col,
     );
     let vis = larguras_vis.len();
 
@@ -4914,11 +4920,16 @@ fn larguras_de(
     disponivel: u16,
     off: usize,
     rolar: bool,
+    max_col: usize,
 ) -> Vec<Constraint> {
     const ESPACO: usize = 2;
     const MINIMO: usize = 5;
-    // O teto de uma coluna que rola: o mesmo oitenta em que a célula já foi cortada.
-    const MAXIMO: usize = 80;
+    // O teto de uma coluna que rola: o que a execução pediu (a célula já foi cortada aí),
+    // ou oitenta quando ela não disse.
+    let maximo = match max_col {
+        0 => 80,
+        n => n,
+    };
     // Só as colunas à vista entram — as roladas para fora não disputam largura.
     let mut larguras: Vec<usize> = headers
         .iter()
@@ -4941,8 +4952,8 @@ fn larguras_de(
     }
 
     if rolar {
-        // Cada coluna do tamanho justo do que carrega, até oitenta: uma de três
-        // caracteres ocupa três, uma longa para em oitenta — a largura saudável de quem
+        // Cada coluna do tamanho justo do que carrega, até o teto: uma de três
+        // caracteres ocupa três, uma longa para no teto — a largura saudável de quem
         // trunca. Nada é espremido; em vez disso só as que couberem na largura são
         // devolvidas, e as demais ficam para a seta ←/→ trazer à vista. Ao menos uma
         // sempre volta, mesmo que sozinha estoure a largura.
@@ -4950,7 +4961,7 @@ fn larguras_de(
         let mut saida = Vec::new();
         let mut usado = 0;
         for l in &larguras {
-            let w = l.min(&MAXIMO) + ESPACO;
+            let w = (*l).min(maximo) + ESPACO;
             if !saida.is_empty() && usado + w > disp {
                 break;
             }

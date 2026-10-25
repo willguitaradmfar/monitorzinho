@@ -1108,14 +1108,21 @@ row is the wrong size for forty lines of SQL. `Esc` returns to the form, which
 shows the first line and the line count as a preview.
 
 `Enter` on the execution opens straight onto the table — there is no card grid,
-because there is one card. `↑`/`↓` walk the rows and the row under the cursor
-appears underneath as field/value, which is what saves a table too wide to fit.
-Typing searches, the way the log is searched: every row stays, the text that
-matched is painted in place, and the arrows step from hit to hit. `Ctrl+F`
-switches to the other mode of the same search, only the rows that match, and
-back; `Esc` clears the search before it leaves. The screen shows at most a
-thousand rows and says so when it cut; the query should carry its own `LIMIT`.
-The row in the list shows how many rows came back and how long it took.
+because there is one card, and it fills the screen. `↑`/`↓` walk the rows;
+`Enter` on the row under the cursor opens it whole, field by field down a
+modal, with the full value the grid had to clip — which is what saves a row too
+wide to read across. Each column is sized to what it carries, up to a maximum
+of 60 characters (set per execution in the form, under **Largura máx. da
+coluna**); a column of three-character values takes three. The ones that don't
+fit the width wait off the right edge, and `←`/`→` slide the table to bring
+them in. Typing searches, the way the log is searched: every row stays, the
+text that matched is painted in place, and the arrows step from hit to hit.
+`Ctrl+F` switches to the other mode of the same search, only the rows that
+match, and back; `Esc` clears the search before it leaves. `Ctrl+T` copies the
+table as text — and in match-only mode, only the rows that matched. The screen
+shows at most a thousand rows and says so when it cut; the query should carry
+its own `LIMIT`. The row in the list shows how many rows came back and how long
+it took.
 
 ## Keys
 

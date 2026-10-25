@@ -987,6 +987,10 @@ pub struct Card {
     /// demais não cabe na largura; a seta ←/→ a desliza, e isto diz de onde ela começa.
     /// Mora no cartão como o cursor e a busca, para sobreviver ao Ctrl+R.
     pub col: usize,
+    /// O teto de largura de uma coluna, em caracteres — o mesmo em que as células já
+    /// foram cortadas. 0 deixa o desenho decidir. Vem da execução (a Visão deixa mudar no
+    /// formulário); as tabelas que repartem a tela inteira não o usam.
+    pub largura_max: usize,
     /// How many rows the card asks for in the grid, content only — the frame is added
     /// by whoever draws it.
     pub height: u16,
@@ -1019,6 +1023,7 @@ impl Card {
             query: String::new(),
             so_acertos: false,
             col: 0,
+            largura_max: 0,
             tone: crate::painel::Tone::Normal,
         }
     }

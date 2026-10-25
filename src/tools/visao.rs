@@ -65,12 +65,16 @@ const COM_CREDENCIAL: &[&str] = &["Bearer", "Basic"];
 /// embaixo de quem esqueceu, e a nota do rodapé diz quando ela segurou alguma coisa.
 pub const LINHAS_MAX: usize = 1000;
 /// Quanto cada célula guarda. É o valor inteiro, não o que a tabela mostra: a tabela
-/// corta em `GRID_MAX`, e o Enter abre a linha campo a campo com o que está aqui. O teto
-/// existe só para um documento de um megabyte numa célula não virar mil deles na memória.
+/// corta na largura da coluna, e o Enter abre a linha campo a campo com o que está aqui.
+/// O teto existe só para um documento de um megabyte numa célula não virar mil deles na
+/// memória.
 const CELULA_MAX: usize = 10_000;
-/// Quanto de uma célula a tabela desenha. Larga demais e a linha quebra e empurra tudo;
-/// cortada em oitenta, a grade se lê, e o conteúdo inteiro está a um Enter de distância.
-const GRID_MAX: usize = 80;
+/// Quanto de uma célula a tabela desenha, quando a execução não diz outra coisa. Larga
+/// demais e a linha quebra e empurra tudo; cortada em sessenta, a grade se lê, e o
+/// conteúdo inteiro está a um Enter de distância. O formulário pode mudar por execução.
+const LARGURA_PADRAO: usize = 60;
+/// O mínimo que a largura da coluna pode valer: abaixo disso não cabe nem um «…».
+const LARGURA_MIN: usize = 8;
 /// O teto de tempo de uma consulta, e o do soquete. O mesmo do Sherlock, pelo mesmo
 /// motivo: uma visão que trava num servidor ocupado tem que desistir, não esperar.
 const TEMPO: Duration = Duration::from_secs(15);
@@ -340,6 +344,12 @@ impl Tool for VisaoTool {
                 "Opcional, separadas por vírgula, cada uma um caminho dentro do item: .id, .name as nome, .address.city as cidade, .tags[0] as tag. Vazio mostra todas as chaves de primeiro nível",
             )
             .only_when("fonte", Fonte::HTTP),
+            ParamSpec::text(
+                "largura",
+                "Largura máx. da coluna",
+                "",
+                "Quantos caracteres cada coluna da tabela mostra, no máximo — o valor inteiro aparece no Enter. Vazio usa 60",
+            ),
         ]
     }
 
@@ -467,7 +477,7 @@ fn executar(plano: &Plano, rec: &Recorder, board: &Arc<Mutex<Board>>) {
                 false => String::new(),
             };
             let nota = format!("{n} linhas{corte} · {levou} ms");
-            quadro.put(cartao_de(&res, plano.titulo(), &nota));
+            quadro.put(cartao_de(&res, plano.titulo(), &nota, plano.largura));
             quadro.note = nota.clone();
             rec.report(format!("{n} linhas"), format!("{levou} ms"));
             rec.record(0, EventKind::Note(format!("executada: {nota}")));
@@ -497,8 +507,9 @@ fn cartao_inicial(titulo: String) -> Card {
 /// O cartão com a tabela. Cada linha tem o detalhe dela — os pares coluna/valor —, que é
 /// o que salva uma tabela larga demais para caber: a seta anda pelas linhas e a de baixo
 /// aparece inteira, com os valores que a coluna cortou.
-fn cartao_de(res: &Resultado, titulo: String, nota: &str) -> Card {
+fn cartao_de(res: &Resultado, titulo: String, nota: &str, largura: usize) -> Card {
     let mut card = Card::new("resultado", titulo.clone());
+    card.largura_max = largura;
     if res.colunas.is_empty() {
         let vazio = || Pane::Empty {
             title: titulo.clone(),
@@ -508,8 +519,8 @@ fn cartao_de(res: &Resultado, titulo: String, nota: &str) -> Card {
         card.detail = Layout::one(vazio());
         return card;
     }
-    // A tabela leva as células cortadas em GRID_MAX — é o que cabe numa linha sem
-    // quebrá-la. A busca ainda acerta aí (o começo do valor), e a linha inteira, sem
+    // A tabela leva as células cortadas na largura da coluna — é o que cabe numa linha
+    // sem quebrá-la. A busca ainda acerta aí (o começo do valor), e a linha inteira, sem
     // corte, está em `rows_detail`, que o Enter abre.
     let tabela = || Pane::Table {
         title: titulo.clone(),
@@ -517,7 +528,7 @@ fn cartao_de(res: &Resultado, titulo: String, nota: &str) -> Card {
         rows: res
             .linhas
             .iter()
-            .map(|linha| Row::new(linha.iter().map(|c| clip(c, GRID_MAX)).collect()))
+            .map(|linha| Row::new(linha.iter().map(|c| clip(c, largura)).collect()))
             .collect(),
         selected: None,
         query: String::new(),
@@ -591,6 +602,9 @@ pub struct Plano {
     caminho_texto: String,
     caminho: Vec<Passo>,
     colunas: Vec<Coluna>,
+    /// Quantos caracteres cada coluna da tabela mostra, no máximo. O resto do valor fica
+    /// guardado e aparece inteiro no Enter. Vale para toda fonte — é só desenho.
+    largura: usize,
 }
 
 impl Plano {
@@ -623,6 +637,17 @@ impl Plano {
             caminho_texto: String::new(),
             caminho: Vec::new(),
             colunas: Vec::new(),
+            largura: match get("largura").as_str() {
+                "" => LARGURA_PADRAO,
+                texto => match texto.parse::<usize>() {
+                    Ok(n) if n >= LARGURA_MIN => n.min(CELULA_MAX),
+                    _ => {
+                        return Err(format!(
+                            "largura inválida: «{texto}» (número, mínimo {LARGURA_MIN})"
+                        ));
+                    }
+                },
+            },
         };
         match fonte {
             Fonte::Postgres | Fonte::Mysql | Fonte::Mongo => {
@@ -1743,8 +1768,33 @@ mod tests {
         Passo::Chave(s.to_string())
     }
 
+    fn params_sqlite(largura: &str) -> HashMap<&'static str, String> {
+        // Um SQLite aponta para um arquivo que precisa existir; o /etc/hostname serve, é
+        // só leitura e está em toda máquina. O que se testa aqui é a largura, não o banco.
+        let mut p = HashMap::new();
+        p.insert("fonte", "SQLite".to_string());
+        p.insert("arquivo", "/etc/hostname".to_string());
+        p.insert("consulta", "select 1".to_string());
+        if !largura.is_empty() {
+            p.insert("largura", largura.to_string());
+        }
+        p
+    }
+
     #[test]
-    fn a_grade_corta_em_oitenta_e_o_detalhe_guarda_tudo() {
+    fn a_largura_vazia_vira_o_padrao_e_a_invalida_recusa() {
+        assert_eq!(
+            Plano::from(&params_sqlite("")).unwrap().largura,
+            LARGURA_PADRAO
+        );
+        assert_eq!(Plano::from(&params_sqlite("25")).unwrap().largura, 25);
+        // Abaixo do mínimo e não-número são recusados, com o nome do campo no erro.
+        assert!(Plano::from(&params_sqlite("3")).is_err());
+        assert!(Plano::from(&params_sqlite("abc")).is_err());
+    }
+
+    #[test]
+    fn a_grade_corta_na_largura_e_o_detalhe_guarda_tudo() {
         let longo = "a".repeat(500);
         let res = Resultado {
             colunas: vec!["texto".to_string()],
@@ -1752,13 +1802,15 @@ mod tests {
             truncado: false,
             avisos: Vec::new(),
         };
-        let card = cartao_de(&res, "t".to_string(), "1 linha");
-        // A célula da tabela cabe numa linha: GRID_MAX, com as reticências no fim.
+        let largura = 42;
+        let card = cartao_de(&res, "t".to_string(), "1 linha", largura);
+        assert_eq!(card.largura_max, largura);
+        // A célula da tabela cabe numa linha: a largura pedida, com as reticências no fim.
         let Pane::Table { rows, .. } = card.detail.primeira_tabela().unwrap() else {
             panic!("a visão devia ter uma tabela");
         };
         let celula = &rows[0].cells[0];
-        assert_eq!(celula.chars().count(), GRID_MAX);
+        assert_eq!(celula.chars().count(), largura);
         assert!(celula.ends_with('…'));
         // O detalhe da linha tem o valor inteiro, sem corte.
         let Layout::Leaf(pane) = &card.rows_detail[0] else {
