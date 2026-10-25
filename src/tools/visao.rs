@@ -35,7 +35,7 @@ use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -75,6 +75,9 @@ const CELULA_MAX: usize = 10_000;
 const LARGURA_PADRAO: usize = 60;
 /// O mínimo que a largura da coluna pode valer: abaixo disso não cabe nem um «…».
 const LARGURA_MIN: usize = 8;
+/// De quanto em quanto tempo a atualização automática repete a consulta, quando ligada e
+/// o formulário não diz outra coisa.
+const INTERVALO_PADRAO: u64 = 20;
 /// O teto de tempo de uma consulta, e o do soquete. O mesmo do Sherlock, pelo mesmo
 /// motivo: uma visão que trava num servidor ocupado tem que desistir, não esperar.
 const TEMPO: Duration = Duration::from_secs(15);
@@ -350,6 +353,19 @@ impl Tool for VisaoTool {
                 "",
                 "Quantos caracteres cada coluna da tabela mostra, no máximo — o valor inteiro aparece no Enter. Vazio usa 60",
             ),
+            ParamSpec::choice(
+                "auto",
+                "Atualização automática",
+                SIM_NAO,
+                "Ligada, a consulta se refaz sozinha enquanto a tela dela está aberta — o Ctrl+R automatizado. Desligada, só ao abrir e a cada Ctrl+R",
+            ),
+            ParamSpec::text(
+                "intervalo",
+                "A cada quantos segundos",
+                "",
+                "De quanto em quanto tempo refazer a consulta. Vazio usa 20. Entre 1 e 3600",
+            )
+            .only_when("auto", SIM),
         ]
     }
 
@@ -394,7 +410,13 @@ impl Tool for VisaoTool {
 
     /// Abrir executa **uma vez na vida da sessão**: na primeira abertura. Nas seguintes a
     /// tela mostra o retrato da última execução, e o Ctrl+R é quem renova.
+    ///
+    /// Com a atualização automática ligada, abrir não faz nada aqui: é o `set_watched`
+    /// que, no tique seguinte, põe o laço de pé e dispara a primeira consulta.
     fn open(&self, execution: &Execution, params: &HashMap<&'static str, String>) {
+        if matches!(Plano::from(params), Ok(plano) if plano.auto.is_some()) {
+            return;
+        }
         let Some(board) = execution.board() else {
             return;
         };
@@ -408,12 +430,153 @@ impl Tool for VisaoTool {
     }
 
     /// Ctrl+R, ou 'r' na lista: executa de novo, agora.
+    ///
+    /// Com o laço automático de pé, é um recado para ele — refaz já e reinicia a
+    /// contagem, sem abrir uma segunda consulta por cima da que ele faria. Sem laço
+    /// (desligada, ou fora da tela), é a consulta avulsa de sempre.
     fn rerun(&self, execution: &Execution, params: &HashMap<&'static str, String>) {
+        if let Some(driver) = drivers().get(&execution.id) {
+            driver.again.store(true, Ordering::Relaxed);
+            return;
+        }
         disparar(execution, params);
+    }
+
+    /// A tela é o interruptor da atualização automática: enquanto ela está aberta, o laço
+    /// refaz a consulta no intervalo pedido; quando ela sai, o laço para e nada mais é
+    /// perguntado. Desligada a opção, não há laço nenhum.
+    fn set_watched(
+        &self,
+        execution: &Execution,
+        params: &HashMap<&'static str, String>,
+        watched: bool,
+    ) {
+        if !watched {
+            stop_driver(execution.id);
+            return;
+        }
+        let Ok(plano) = Plano::from(params) else {
+            return;
+        };
+        let Some(intervalo) = plano.auto else {
+            return;
+        };
+        let (Some(board), false) = (execution.board().cloned(), execution.is_off()) else {
+            return;
+        };
+        let Some(driver) = claim_driver(execution.id) else {
+            // Já há um laço: voltar à mesma tela não abre um segundo contra o mesmo banco.
+            return;
+        };
+        let rec = execution.recorder();
+        let finished = execution.finish_flag();
+        finished.store(false, Ordering::Relaxed);
+        rec.record(
+            0,
+            EventKind::Note(format!(
+                "atualização automática a cada {}s enquanto esta tela estiver aberta",
+                intervalo.as_secs()
+            )),
+        );
+        thread::spawn(move || {
+            // Enquanto o laço vive, o cabeçalho conta para a próxima passada em vez de
+            // pedir Ctrl+R; ao fim, volta a pedir.
+            lock_board(&board).auto_cada = Some(intervalo);
+            conduzir(&plano, &rec, &board, &driver, intervalo);
+            lock_board(&board).auto_cada = None;
+            rec.ran();
+            finished.store(true, Ordering::Relaxed);
+            release_driver(&driver);
+        });
     }
 
     fn columns(&self, execution: &Execution) -> (String, String) {
         execution.outcome()
+    }
+}
+
+/// O que comanda o laço de atualização automática: a bandeira que o encerra quando a tela
+/// sai, e a que pede uma volta imediata (o Ctrl+R de dentro da tela).
+struct Driver {
+    stop: Arc<AtomicBool>,
+    again: Arc<AtomicBool>,
+}
+
+/// Os laços de atualização automática rodando agora, por execução — como o Sherlock, um
+/// `Tool` é um objeto só, e o que precisa ficar por execução é a alça que para o laço.
+static DRIVERS: LazyLock<Mutex<HashMap<u64, Driver>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn drivers() -> MutexGuard<'static, HashMap<u64, Driver>> {
+    DRIVERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn claim_driver(execution: u64) -> Option<Driver> {
+    let mut drivers = drivers();
+    if drivers.contains_key(&execution) {
+        return None;
+    }
+    let driver = Driver {
+        stop: Arc::new(AtomicBool::new(false)),
+        again: Arc::new(AtomicBool::new(false)),
+    };
+    drivers.insert(
+        execution,
+        Driver {
+            stop: Arc::clone(&driver.stop),
+            again: Arc::clone(&driver.again),
+        },
+    );
+    Some(driver)
+}
+
+fn stop_driver(execution: u64) {
+    if let Some(driver) = drivers().remove(&execution) {
+        driver.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Tira do mapa o registro de um laço que terminou, a menos que já tenha sido trocado por
+/// um mais novo — o `Arc` do `stop` é o mesmo só quando ninguém reabriu a tela no meio.
+fn release_driver(driver: &Driver) {
+    let mut drivers = drivers();
+    if let Some((&id, _)) = drivers
+        .iter()
+        .find(|(_, d)| Arc::ptr_eq(&d.stop, &driver.stop))
+    {
+        drivers.remove(&id);
+    }
+}
+
+/// O laço da atualização automática: consulta, espera o intervalo em fatias — atento ao
+/// Ctrl+R, que o encurta, e ao fechar da tela, que o encerra — e repete. Cada volta abre
+/// e fecha a conexão, como uma consulta avulsa; não há nada aberto entre uma e outra.
+fn conduzir(
+    plano: &Plano,
+    rec: &Recorder,
+    board: &Arc<Mutex<Board>>,
+    driver: &Driver,
+    intervalo: Duration,
+) {
+    const FATIA: Duration = Duration::from_millis(200);
+    loop {
+        if driver.stop.load(Ordering::Relaxed) || rec.stopping() {
+            return;
+        }
+        executar(plano, rec, board);
+        rec.ran();
+        let acordar = Instant::now() + intervalo;
+        while Instant::now() < acordar {
+            if driver.stop.load(Ordering::Relaxed) || rec.stopping() {
+                return;
+            }
+            if driver.again.swap(false, Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(FATIA.min(acordar - Instant::now()));
+        }
     }
 }
 
@@ -605,6 +768,9 @@ pub struct Plano {
     /// Quantos caracteres cada coluna da tabela mostra, no máximo. O resto do valor fica
     /// guardado e aparece inteiro no Enter. Vale para toda fonte — é só desenho.
     largura: usize,
+    /// Refazer a consulta sozinho enquanto a tela está aberta, e de quanto em quanto
+    /// tempo. `None` é o comportamento de sempre: só ao abrir e a cada Ctrl+R.
+    auto: Option<Duration>,
 }
 
 impl Plano {
@@ -647,6 +813,20 @@ impl Plano {
                         ));
                     }
                 },
+            },
+            auto: match get("auto") == "sim" {
+                false => None,
+                true => Some(Duration::from_secs(match get("intervalo").as_str() {
+                    "" => INTERVALO_PADRAO,
+                    texto => match texto.parse::<u64>() {
+                        Ok(n) if (1..=3600).contains(&n) => n,
+                        _ => {
+                            return Err(format!(
+                                "intervalo inválido: «{texto}» (segundos, entre 1 e 3600)"
+                            ));
+                        }
+                    },
+                })),
             },
         };
         match fonte {
@@ -1779,6 +1959,27 @@ mod tests {
             p.insert("largura", largura.to_string());
         }
         p
+    }
+
+    #[test]
+    fn a_atualizacao_automatica_liga_por_opcao_e_valida_o_intervalo() {
+        // Sem a opção, nada de laço.
+        assert!(Plano::from(&params_sqlite("")).unwrap().auto.is_none());
+        // Ligada e sem número, o padrão de vinte segundos.
+        let mut p = params_sqlite("");
+        p.insert("auto", "sim".to_string());
+        assert_eq!(
+            Plano::from(&p).unwrap().auto,
+            Some(Duration::from_secs(INTERVALO_PADRAO))
+        );
+        // Ligada com número, o número.
+        p.insert("intervalo", "5".to_string());
+        assert_eq!(Plano::from(&p).unwrap().auto, Some(Duration::from_secs(5)));
+        // Zero e fora de faixa são recusados ainda no formulário.
+        p.insert("intervalo", "0".to_string());
+        assert!(Plano::from(&p).is_err());
+        p.insert("intervalo", "99999".to_string());
+        assert!(Plano::from(&p).is_err());
     }
 
     #[test]

@@ -1124,6 +1124,14 @@ shows at most a thousand rows and says so when it cut; the query should carry
 its own `LIMIT`. The row in the list shows how many rows came back and how long
 it took.
 
+**Auto-refresh** is off by default and switched on in the form, with an
+interval (20 seconds unless you change it, 1 to 3600). On, it runs the query
+again on its own — but only while its screen is open, never in the background:
+the view is the switch, the same way a question against someone's database
+shouldn't be asked when nobody is looking at the answer. The header counts down
+to the next run (`executado há 2s · executa de novo em 1s`), and `Ctrl+R` still
+forces one now and restarts the clock.
+
 ## Keys
 
 | Key | Where | What |

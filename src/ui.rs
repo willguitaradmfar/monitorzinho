@@ -3770,12 +3770,23 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
     let rotulos = quadro.rotulos;
     let idade = match (quadro.working, quadro.updated) {
         (true, _) => rotulos.andamento.to_string(),
-        (false, Some(quando)) => format!(
-            "{} há {} · Ctrl+R {}",
-            rotulos.feito,
-            format::human_duration(quando.elapsed().as_secs()),
-            rotulos.pedir
-        ),
+        (false, Some(quando)) => {
+            let feito = format!(
+                "{} há {}",
+                rotulos.feito,
+                format::human_duration(quando.elapsed().as_secs())
+            );
+            // Com a atualização automática de pé, o cabeçalho conta para a próxima passada
+            // — o número cai a cada segundo até a consulta rodar de novo. Sem ela, o
+            // convite de sempre para o Ctrl+R.
+            match quadro.auto_cada {
+                Some(cada) => {
+                    let faltam = cada.saturating_sub(quando.elapsed()).as_secs();
+                    format!("{feito} · {} em {faltam}s", rotulos.pedir)
+                }
+                None => format!("{feito} · Ctrl+R {}", rotulos.pedir),
+            }
+        }
         (false, None) => rotulos.nunca.to_string(),
     };
     frame.render_widget(

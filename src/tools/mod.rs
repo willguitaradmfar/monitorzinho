@@ -890,6 +890,10 @@ pub struct Board {
     /// As palavras do cabeçalho e do rodapé. O Sherlock *investiga*; uma visão
     /// *executa*; e «investigado há 2s» em cima de um SELECT soa como outro programa.
     pub rotulos: Rotulos,
+    /// De quanto em quanto tempo uma atualização automática refaz a passada, enquanto o
+    /// laço dela está de pé. `None` quando não há laço — e aí o cabeçalho pede o Ctrl+R
+    /// em vez de contar para a próxima. Ver `visao::conduzir`.
+    pub auto_cada: Option<Duration>,
 }
 
 /// O que a tela diz sobre uma passada, nas palavras da ferramenta dona do quadro.
