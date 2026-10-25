@@ -3816,6 +3816,10 @@ fn render_board(frame: &mut Frame, area: Rect, app: &App, focus: &crate::app::Bo
         // Um cartão navegável mostra os dois: a tabela com o cursor em cima, e o que a
         // linha sob o cursor tem a dizer embaixo. Sem tecla para abrir e sem tecla para
         // fechar — a seta é a navegação inteira.
+        // Num quadro direto a tabela é a página: ela cresce até o fim e o detalhe da
+        // linha sai de cena. Sobrava um filete embaixo que só repetia, em pares, a linha
+        // que o cursor já marca na tabela — tirá-lo dá à tabela o espaço que faltava.
+        Some(card) if quadro.direto => render_corpo(frame, partes[1], &card.detail, &pintor),
         Some(card) => match card.row_detail() {
             Some(detalhe) => {
                 // Cada metade leva o que precisa para caber inteira, e o que sobrar fica
