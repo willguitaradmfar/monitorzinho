@@ -21,7 +21,8 @@ pergunta é sempre a mesma e o que muda é a resposta: «quantos pedidos presos 
 | Cliente MySQL | crate `mysql` (`minimal-rust` + `rustls-tls-ring`) | Os outros clientes são escritos à mão (Sherlock); o do MySQL entra como crate, sem `libz` nem OpenSSL, para o build musl continuar estático |
 | Credenciais | Campos separados: máquina, porta, usuário, senha, base | Pedido explícito; a string de conexão fica para o Sherlock |
 | Cache | **Só em memória** | Ao abrir pela primeira vez na sessão, executa; depois mostra o último resultado até alguém pedir `Ctrl+R`. Fechar o programa esquece |
-| Túnel SSH | Opcional, nas três fontes de banco | Banco fechado atrás de uma máquina de salto é o caso comum em produção. O `ssh` daqui abre um `-L` para o banco, a consulta passa por ele, o túnel fecha. Só chave (agente, chaves padrão ou arquivo) — nunca senha, porque o túnel não pode perguntar |
+| Túnel SSH | Opcional, nas três fontes de banco | Banco fechado atrás de uma máquina de salto é o caso comum em produção. O `ssh` daqui abre um `-L` para o banco e a consulta passa por ele. Só chave (agente, chaves padrão ou arquivo) — nunca senha, porque o túnel não pode perguntar |
+| Vida do túnel | De pé enquanto a tela está aberta | Fora da tela (Ctrl+R na lista) o túnel é efêmero: sobe, serve a consulta, cai. Com a tela aberta ele vira uma **sessão**: sobe uma vez e é reusado a cada refresh — só o banco reconecta. Abrir uma sessão SSH a cada atualização automática é o que estourava o limite de conexão do salto e caía em timeout; uma só, revalidada e reaberta se cair, resolve isso e deixa o refresh mais rápido (pula a autenticação) |
 | TLS | MySQL e Mongo: não / sim / sim sem validar | O Postgres negocia sozinho. «Sem validar» é para o certificado próprio e para o túnel, em que o servidor se apresenta como 127.0.0.1 |
 | Só leitura | **Sempre** | Postgres: `BEGIN READ ONLY` em volta da query e sessão endurecida; MySQL: `SET SESSION TRANSACTION READ ONLY`; SQLite: arquivo aberto read-only e `PRAGMA query_only`; Mongo: só comandos de uma lista fixa de leitores, e `aggregate` sem `$out`/`$merge` |
 | Teto de linhas | 1000 na tela | A query deveria ter o seu próprio `LIMIT`; a tela avisa quando cortou |
@@ -52,12 +53,22 @@ do `~/.ssh/config`), o usuário, a porta e a chave. A máquina e a porta do banc
 ser **as que a máquina de salto enxerga** — `localhost:5432` quando o banco mora nela.
 
 Por baixo é um `ssh -N -L 127.0.0.1:<porta livre>:<banco>:<porta> <salto>`, com
-`BatchMode=yes` (nunca pergunta), `ExitOnForwardFailure=yes` (falha alto) e
-`StrictHostKeyChecking=accept-new`. O `ssh` só abre a porta local depois de autenticado,
-então a porta aceitar conexão é a prova de que o túnel existe; se o `ssh` morrer antes,
-a última linha do que ele disse vira a mensagem de erro («Permission denied
-(publickey)»). O processo é amarrado ao programa pelo kernel (`PR_SET_PDEATHSIG`): um
-`kill -9` no monitorzinho derruba o túnel junto.
+`BatchMode=yes` (nunca pergunta), `ExitOnForwardFailure=yes` (falha alto),
+`StrictHostKeyChecking=accept-new` e, porque o túnel agora vive ocioso entre refreshes,
+`ServerAliveInterval=15`/`ServerAliveCountMax=3` (o mantém aberto e o faz sair se o salto
+o derrubar). O `ssh` só abre a porta local depois de autenticado, então a porta aceitar
+conexão é a prova de que o túnel existe; se o `ssh` morrer antes, a última linha do que
+ele disse vira a mensagem de erro («Permission denied (publickey)»). O processo é amarrado
+ao programa pelo kernel (`PR_SET_PDEATHSIG`): um `kill -9` no monitorzinho derruba o túnel
+junto.
+
+Enquanto a tela está aberta, esse túnel é guardado numa **sessão** por execução
+(`set_watched(true)` abre, `set_watched(false)` fecha e o `Drop` do túnel mata o `ssh`).
+Cada refresh — o Ctrl+R manual e o laço da atualização automática — pede à sessão a porta
+local em vez de abrir um túnel novo; a sessão revalida o que guarda (o `ssh` vivo e a
+porta aceitando conexão) e só reabre se tiver caído. Uma consulta em curso segura o túnel
+até terminar, então fechar a tela nunca o puxa debaixo de uma consulta. Fora da tela não
+há sessão e o túnel volta a ser efêmero.
 
 ### A consulta por fonte
 
@@ -129,7 +140,7 @@ tempo levou — ou `falhou` e o motivo.
 ## 4. Onde mora
 
 * `src/tools/visao.rs` — a ferramenta inteira: formulário, plano, as cinco fontes, a
-  DSL de caminho e os testes dela.
+  DSL de caminho, a sessão que mantém o túnel SSH vivo entre refreshes e os testes dela.
 * `src/invest/feed.rs` — o cliente HTTP ganhou método, cabeçalhos e corpo (`pedir`); o
   `get` de sempre continua sendo o caso de uma linha.
 * `src/tools/sherlock/{pg,mongo,bson}.rs` — reaproveitados como estão; só ficaram

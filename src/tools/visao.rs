@@ -453,15 +453,19 @@ impl Tool for VisaoTool {
     ) {
         if !watched {
             stop_driver(execution.id);
+            fechar_sessao(execution.id);
             return;
         }
         let Ok(plano) = Plano::from(params) else {
             return;
         };
-        let Some(intervalo) = plano.auto else {
+        let (Some(board), false) = (execution.board().cloned(), execution.is_off()) else {
             return;
         };
-        let (Some(board), false) = (execution.board().cloned(), execution.is_off()) else {
+        // O túnel SSH fica de pé enquanto a tela está aberta — com ou sem atualização
+        // automática, porque o Ctrl+R manual também reusa a conexão da sessão.
+        let sessao = abrir_sessao(execution.id);
+        let Some(intervalo) = plano.auto else {
             return;
         };
         let Some(driver) = claim_driver(execution.id) else {
@@ -482,7 +486,7 @@ impl Tool for VisaoTool {
             // Enquanto o laço vive, o cabeçalho conta para a próxima passada em vez de
             // pedir Ctrl+R; ao fim, volta a pedir.
             lock_board(&board).auto_cada = Some(intervalo);
-            conduzir(&plano, &rec, &board, &driver, intervalo);
+            conduzir(&plano, &rec, &board, &driver, intervalo, Some(&sessao));
             lock_board(&board).auto_cada = None;
             rec.ran();
             finished.store(true, Ordering::Relaxed);
@@ -559,13 +563,14 @@ fn conduzir(
     board: &Arc<Mutex<Board>>,
     driver: &Driver,
     intervalo: Duration,
+    sessao: Option<&Arc<Mutex<Sessao>>>,
 ) {
     const FATIA: Duration = Duration::from_millis(200);
     loop {
         if driver.stop.load(Ordering::Relaxed) || rec.stopping() {
             return;
         }
-        executar(plano, rec, board);
+        executar(plano, rec, board, sessao);
         rec.ran();
         let acordar = Instant::now() + intervalo;
         while Instant::now() < acordar {
@@ -607,8 +612,10 @@ fn disparar(execution: &Execution, params: &HashMap<&'static str, String>) {
     let rec = execution.recorder();
     let finished = execution.finish_flag();
     finished.store(false, Ordering::Relaxed);
+    // Com a tela aberta, reusa o túnel vivo da sessão; fora dela, consulta avulsa.
+    let sessao = sessoes().get(&id).cloned();
     thread::spawn(move || {
-        executar(&plano, &rec, &board);
+        executar(&plano, &rec, &board, sessao.as_ref());
         rec.ran();
         finished.store(true, Ordering::Relaxed);
         em_curso().remove(&id);
@@ -616,14 +623,19 @@ fn disparar(execution: &Execution, params: &HashMap<&'static str, String>) {
 }
 
 /// Consulta, e põe o que veio — ou o que deu errado — no cartão.
-fn executar(plano: &Plano, rec: &Recorder, board: &Arc<Mutex<Board>>) {
+fn executar(
+    plano: &Plano,
+    rec: &Recorder,
+    board: &Arc<Mutex<Board>>,
+    sessao: Option<&Arc<Mutex<Sessao>>>,
+) {
     lock_board(board).working = true;
     rec.record(
         0,
         EventKind::Note(format!("executando: {}", plano.titulo())),
     );
     let inicio = Instant::now();
-    let resultado = plano.consultar();
+    let resultado = plano.consultar(sessao);
     let levou = inicio.elapsed().as_millis();
 
     let mut quadro = lock_board(board);
@@ -954,29 +966,42 @@ impl Plano {
 
     /// Onde o banco é alcançado: direto, ou pela ponta de cá de um túnel que fica de pé
     /// enquanto o valor devolvido viver.
-    fn alcance(&self) -> Result<(String, u16, Option<Tunel>), String> {
-        match &self.salto {
-            Some(salto) => {
+    fn alcance(
+        &self,
+        sessao: Option<&Arc<Mutex<Sessao>>>,
+    ) -> Result<(String, u16, Option<Tunel>), String> {
+        let Some(salto) = &self.salto else {
+            return Ok((self.host.clone(), self.porta, None));
+        };
+        match sessao {
+            // Tela aberta: o túnel é da sessão e fica de pé entre um refresh e outro.
+            Some(sessao) => {
+                let porta = lock_sessao(sessao).porta(salto, &self.host, self.porta)?;
+                Ok(("127.0.0.1".to_string(), porta, None))
+            }
+            // Consulta avulsa (fora da tela): um túnel efêmero, que cai com esta consulta.
+            None => {
                 let tunel = Tunel::abrir(salto, &self.host, self.porta)?;
                 let porta = tunel.porta_local;
                 Ok(("127.0.0.1".to_string(), porta, Some(tunel)))
             }
-            None => Ok((self.host.clone(), self.porta, None)),
         }
     }
 
-    fn consultar(&self) -> Result<Resultado, String> {
+    fn consultar(&self, sessao: Option<&Arc<Mutex<Sessao>>>) -> Result<Resultado, String> {
         match self.fonte {
             Fonte::Postgres => {
-                let (host, porta, _tunel) = self.alcance()?;
+                let (host, porta, _tunel) = self.alcance(sessao)?;
                 self.consultar_pg(host, porta)
             }
             Fonte::Mysql => {
-                let (host, porta, tunel) = self.alcance()?;
-                self.consultar_mysql(host, porta, tunel.is_some())
+                let (host, porta, _tunel) = self.alcance(sessao)?;
+                // Pelo túnel o banco se apresenta como 127.0.0.1 — o salto é quem diz
+                // isso, não o `_tunel`, que a sessão retém quando é a dona dele.
+                self.consultar_mysql(host, porta, self.salto.is_some())
             }
             Fonte::Mongo => {
-                let (host, porta, _tunel) = self.alcance()?;
+                let (host, porta, _tunel) = self.alcance(sessao)?;
                 self.consultar_mongo(host, porta)
             }
             Fonte::Sqlite => self.consultar_sqlite(),
@@ -1300,6 +1325,12 @@ impl Salto {
             "ExitOnForwardFailure=yes".to_string(),
             "-o".to_string(),
             "ConnectTimeout=10".to_string(),
+            // O túnel fica de pé e ocioso entre um refresh e outro; o keepalive o mantém
+            // aberto e, se o salto o derrubar, faz o `ssh` perceber e sair em vez de pendurar.
+            "-o".to_string(),
+            "ServerAliveInterval=15".to_string(),
+            "-o".to_string(),
+            "ServerAliveCountMax=3".to_string(),
             "-o".to_string(),
             "StrictHostKeyChecking=accept-new".to_string(),
         ];
@@ -1377,12 +1408,82 @@ impl Tunel {
             thread::sleep(Duration::from_millis(150));
         }
     }
+
+    /// Ainda de pé? O `ssh` não saiu e a porta local ainda aceita conexão. Um túnel
+    /// guardado entre refreshes pode ter caído — o salto derruba encaminhamento ocioso —
+    /// e aí a sessão o reabre, em vez de consultar por uma porta morta.
+    fn vivo(&mut self) -> bool {
+        if !matches!(self.filho.try_wait(), Ok(None)) {
+            return false;
+        }
+        let endereco = std::net::SocketAddr::from(([127, 0, 0, 1], self.porta_local));
+        TcpStream::connect_timeout(&endereco, Duration::from_millis(300)).is_ok()
+    }
 }
 
 impl Drop for Tunel {
     fn drop(&mut self) {
         sshfwd::terminate(&mut self.filho);
     }
+}
+
+/// A conexão viva de uma tela aberta. Enquanto a Visão está no ar, o túnel SSH fica de pé
+/// e cada refresh passa por ele em vez de abrir um novo — é o que tira do salto o
+/// vai-e-vem de sessões SSH que fazia a atualização automática cair em timeout. O banco
+/// é reconectado a cada volta (barato, por `127.0.0.1`), então a conexão nunca envelhece.
+/// Ao fechar a tela a sessão é destruída e o `Drop` do `Tunel` mata o `ssh`; sem túnel
+/// (banco direto) não há o que guardar e a sessão fica vazia.
+#[derive(Default)]
+struct Sessao {
+    tunel: Option<Tunel>,
+}
+
+impl Sessao {
+    /// A porta local por onde alcançar o banco: a de um túnel vivo, reaberto se caiu.
+    fn porta(&mut self, salto: &Salto, destino: &str, porta: u16) -> Result<u16, String> {
+        if let Some(tunel) = &mut self.tunel
+            && tunel.vivo()
+        {
+            return Ok(tunel.porta_local);
+        }
+        let tunel = Tunel::abrir(salto, destino, porta)?;
+        let porta_local = tunel.porta_local;
+        self.tunel = Some(tunel);
+        Ok(porta_local)
+    }
+}
+
+/// As sessões das telas abertas agora, por execução — a dona do túnel vivo de cada uma.
+/// Nasce em `set_watched(true)` e morre em `set_watched(false)`, o liga-desliga da tela.
+static SESSOES: LazyLock<Mutex<HashMap<u64, Arc<Mutex<Sessao>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn sessoes() -> MutexGuard<'static, HashMap<u64, Arc<Mutex<Sessao>>>> {
+    SESSOES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_sessao(sessao: &Arc<Mutex<Sessao>>) -> MutexGuard<'_, Sessao> {
+    sessao
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A sessão desta execução, criada se ainda não havia. Reabrir a mesma tela reaproveita a
+/// que está lá — não empilha túnel sobre túnel.
+fn abrir_sessao(execution: u64) -> Arc<Mutex<Sessao>> {
+    Arc::clone(
+        sessoes()
+            .entry(execution)
+            .or_insert_with(|| Arc::new(Mutex::new(Sessao::default()))),
+    )
+}
+
+/// Tira a sessão do mapa ao fechar a tela. O túnel cai com o último `Arc`: uma consulta em
+/// curso segura o seu até terminar, e só então o `ssh` morre.
+fn fechar_sessao(execution: u64) {
+    sessoes().remove(&execution);
 }
 
 /// Uma porta que ninguém está usando agora, perguntada ao sistema. O `ssh` a toma logo
@@ -2244,7 +2345,7 @@ mod tests {
         let plano = Plano::from(&params).unwrap();
         println!("resumo: {}", plano.resumo());
         let inicio = Instant::now();
-        let res = plano.consultar().unwrap();
+        let res = plano.consultar(None).unwrap();
         println!(
             "{} linhas em {:?}; truncado={}; avisos={:?}",
             res.linhas.len(),
@@ -2258,6 +2359,57 @@ mod tests {
         }
     }
 
+    /// Enquanto a tela está aberta, uma sessão abre o túnel uma vez e o reusa: as voltas
+    /// seguintes devolvem a mesma porta local e o mesmo processo `ssh`. É o que tira do
+    /// salto o vai-e-vem de sessões. `VISAO_SSH='{"ssh_host":"127.0.0.1",...}'` com os
+    /// campos do formulário; o destino é a máquina/porta como o salto as enxerga.
+    #[test]
+    #[ignore]
+    fn a_sessao_reusa_o_tunel_e_a_consulta_avulsa_abre_um_novo() {
+        let texto = std::env::var("VISAO_SSH").expect("VISAO_SSH");
+        let dado: HashMap<String, String> = serde_json::from_str(&texto).unwrap();
+        let get = |k: &str| dado.get(k).cloned().unwrap_or_default();
+        let salto = Salto::from(&get).unwrap();
+        let destino = get("destino_host");
+        let destino = if destino.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            destino
+        };
+        let porta: u16 = get("destino_porta").parse().unwrap_or(3307);
+
+        let mut sessao = Sessao::default();
+        let p1 = sessao.porta(&salto, &destino, porta).unwrap();
+        let pid1 = sessao.tunel.as_ref().unwrap().filho.id();
+        let p2 = sessao.porta(&salto, &destino, porta).unwrap();
+        let pid2 = sessao.tunel.as_ref().unwrap().filho.id();
+        assert_eq!(p1, p2, "a sessão tem de reusar a mesma porta local");
+        assert_eq!(pid1, pid2, "a sessão não pode reabrir o ssh a cada volta");
+        println!("sessão: porta {p1}, ssh pid {pid1} reusado nos dois refreshes");
+
+        // Se o salto derruba o túnel ocioso, o refresh seguinte o reabre sozinho — em vez
+        // de consultar por uma porta morta e cair em timeout.
+        sshfwd::terminate(&mut sessao.tunel.as_mut().unwrap().filho);
+        let p3 = sessao.porta(&salto, &destino, porta).unwrap();
+        let pid3 = sessao.tunel.as_ref().unwrap().filho.id();
+        assert_ne!(
+            pid3, pid1,
+            "um túnel morto tem de ser reaberto, não reusado"
+        );
+        println!("reaberto: porta {p3}, ssh pid {pid3} (o anterior tinha caído)");
+
+        // A consulta avulsa (fora da tela) continua abrindo um túnel efêmero próprio.
+        let avulso = Tunel::abrir(&salto, &destino, porta).unwrap();
+        assert_ne!(
+            avulso.porta_local, p3,
+            "o túnel efêmero é outro, não o da sessão"
+        );
+        println!(
+            "avulso: porta {} (independente da sessão)",
+            avulso.porta_local
+        );
+    }
+
     // --- contra o servidor de brincadeira: `VISAO_TESTE_URL=http://127.0.0.1:8765` -----
 
     fn http(params: &[(&'static str, &str)]) -> Result<Resultado, String> {
@@ -2268,7 +2420,7 @@ mod tests {
             let v = v.replace("{base}", &base);
             mapa.insert(k, v);
         }
-        Plano::from(&mapa)?.consultar()
+        Plano::from(&mapa)?.consultar(None)
     }
 
     #[test]
